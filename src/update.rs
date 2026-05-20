@@ -256,11 +256,63 @@ pub fn print_update_banner(latest: &str, notes: &[(String, String)]) {
     eprintln!();
 }
 
+/// True when we can write a temp file alongside the running binary. Cheap
+/// up-front check so the user doesn't sit through a 5 MB download just to
+/// hit a Permission-Denied at the final move.
+fn install_dir_writable() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return true };
+    let Some(parent) = exe.parent() else { return true };
+    let probe = parent.join(format!(".httpxer-wcheck-{}", std::process::id()));
+    match fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Print actionable guidance when the install path isn't writable by the
+/// running user. Same message is used for both the up-front check and the
+/// post-download fallback path, so users always see the same explanation.
+fn print_perm_help() {
+    let path = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "/usr/local/bin/httpxer".into());
+    eprintln!();
+    eprintln!(
+        "\x1b[33m[!] cannot update in place — write permission denied at {}\x1b[0m",
+        path
+    );
+    eprintln!();
+    eprintln!("This binary is in a root-owned directory (typical when installed via the");
+    eprintln!("default `install.sh` / `install.ps1`). The unprivileged user that ran");
+    eprintln!("`httpxer -u` can't replace the file. Two clean fixes:");
+    eprintln!();
+    eprintln!("  \x1b[1m1. Re-run with sudo (one-time, every update):\x1b[0m");
+    eprintln!("       \x1b[1msudo httpxer -u\x1b[0m");
+    eprintln!();
+    eprintln!("  \x1b[1m2. Or relocate to a user-writable path (one-time, no sudo ever again):\x1b[0m");
+    eprintln!("       mkdir -p ~/.local/bin");
+    eprintln!("       sudo mv {} ~/.local/bin/", path);
+    eprintln!("       # macOS:  echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc && source ~/.zshrc");
+    eprintln!("       # Linux:  echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.bashrc && source ~/.bashrc");
+    eprintln!();
+    eprintln!("Future `httpxer -u` invocations from the relocated path will not need sudo.");
+}
+
 /// `httpxer -u` — replace the running binary with the latest release.
 pub async fn run_update() -> anyhow::Result<()> {
+    // Up-front writability check — saves a 5 MB download when the user
+    // would just hit a Permission-Denied at the final move step.
+    if !install_dir_writable() {
+        print_perm_help();
+        std::process::exit(2);
+    }
+
     let current = env!("CARGO_PKG_VERSION").to_string();
     println!("httpxer: checking GitHub releases for {}/{}…", REPO_OWNER, REPO_NAME);
-    let result = tokio::task::spawn_blocking(|| {
+    let join = tokio::task::spawn_blocking(|| {
         self_update::backends::github::Update::configure()
             .repo_owner(REPO_OWNER)
             .repo_name(REPO_NAME)
@@ -271,7 +323,25 @@ pub async fn run_update() -> anyhow::Result<()> {
             .build()?
             .update()
     })
-    .await??;
+    .await?;
+
+    let result = match join {
+        Ok(s) => s,
+        Err(e) => {
+            // Post-download fallback — defends against the race where the
+            // dir was writable at the up-front check but a directory ACL /
+            // mount option changed in between.
+            let msg = e.to_string();
+            if msg.contains("Permission denied")
+                || msg.contains("os error 13")
+                || msg.to_ascii_lowercase().contains("access is denied")
+            {
+                print_perm_help();
+                std::process::exit(2);
+            }
+            return Err(e.into());
+        }
+    };
 
     match result {
         self_update::Status::UpToDate(v) => println!("Already up to date: {}", v),
