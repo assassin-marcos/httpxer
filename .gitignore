@@ -6,3 +6,10 @@
 .idea/
 .vscode/
 release_notes.md
+
+# Update-check on-disk cache — written by the running binary, not source.
+.cache/
+# Stray copies of the binary from running the relocate-flow test with
+# HOME='' (the relocate logic lands a relative `./httpxer` in that case).
+/httpxer
+
