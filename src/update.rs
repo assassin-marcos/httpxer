@@ -378,34 +378,153 @@ pub async fn run_check_update() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `httpxer -X` — remove the running binary + cache. Detects which install
-/// path it came from (/usr/local/bin/httpxer or %USERPROFILE%\bin) and asks
-/// for confirmation unless `--yes`.
-pub fn run_uninstall(skip_prompt: bool) -> anyhow::Result<()> {
-    let bin = std::env::current_exe()?;
-    println!("Uninstall httpxer from: {}", bin.display());
-    if let Some(p) = update_cache_path() {
-        if let Some(parent) = p.parent() {
-            println!("                cache: {}", parent.display());
+/// Find all places `httpxer` could plausibly be installed on this host.
+/// Sweeps every standard binary-install location per OS (PATH, common
+/// user-local dirs, system-wide dirs, Homebrew, MacPorts, .cargo/bin,
+/// Windows %USERPROFILE%\bin, %LOCALAPPDATA%, %ProgramFiles%). Returns
+/// only paths that exist, deduped by canonical inode/path. Matches
+/// portwave's pattern verbatim so users with both tools installed get
+/// consistent uninstall behaviour.
+fn uninstall_collect_targets() -> (Vec<PathBuf>, Option<PathBuf>) {
+    #[cfg(unix)]
+    let home = std::env::var("HOME").ok();
+    #[cfg(not(unix))]
+    let home: Option<String> = None;
+    let _ = &home; // suppress unused warning on Windows targets
+
+    let mut bin_candidates: Vec<PathBuf> = Vec::new();
+
+    // First — the running binary itself (whatever the user typed `httpxer` to
+    // execute). Followed by its canonical form in case `httpxer` resolves
+    // through a symlink (Homebrew + Linuxbrew do this).
+    if let Ok(cur) = std::env::current_exe() {
+        bin_candidates.push(cur.clone());
+        if let Ok(canon) = cur.canonicalize() {
+            if canon != cur {
+                bin_candidates.push(canon);
+            }
         }
     }
+
+    #[cfg(unix)]
+    {
+        if let Some(h) = &home {
+            let h = PathBuf::from(h);
+            bin_candidates.push(h.join("bin/httpxer"));
+            bin_candidates.push(h.join(".local/bin/httpxer"));
+            bin_candidates.push(h.join(".cargo/bin/httpxer"));
+        }
+        bin_candidates.push(PathBuf::from("/usr/local/bin/httpxer"));
+        bin_candidates.push(PathBuf::from("/opt/homebrew/bin/httpxer"));
+        bin_candidates.push(PathBuf::from("/opt/local/bin/httpxer"));
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(up) = std::env::var("USERPROFILE") {
+            let up = PathBuf::from(up);
+            bin_candidates.push(up.join("bin\\httpxer.exe"));
+            bin_candidates.push(up.join(".local\\bin\\httpxer.exe"));
+            bin_candidates.push(up.join(".cargo\\bin\\httpxer.exe"));
+        }
+        if let Ok(la) = std::env::var("LOCALAPPDATA") {
+            bin_candidates.push(PathBuf::from(la).join("Programs\\httpxer\\httpxer.exe"));
+        }
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            bin_candidates.push(PathBuf::from(pf).join("httpxer\\httpxer.exe"));
+        }
+    }
+
+    // Keep only existing files; dedupe by canonical path so a binary that
+    // appears via both /usr/local/bin and a symlink doesn't get listed twice.
+    let mut bins: Vec<PathBuf> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for c in bin_candidates {
+        let canon = c.canonicalize().unwrap_or_else(|_| c.clone());
+        if c.is_file() && seen.insert(canon) {
+            bins.push(c);
+        }
+    }
+
+    let cache = update_cache_path()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .filter(|d| d.is_dir());
+
+    (bins, cache)
+}
+
+/// `httpxer -X` — remove every httpxer binary on disk plus the version
+/// cache. Shows a plan first, requires TTY-confirm unless `--yes` to avoid
+/// nuking a real install via accidental pipe / redirect.
+pub fn run_uninstall(skip_prompt: bool) -> anyhow::Result<()> {
+    let (bins, cache) = uninstall_collect_targets();
+
+    println!("httpxer uninstaller");
+    println!();
+
+    if bins.is_empty() && cache.is_none() {
+        eprintln!("[!] No httpxer installation found on this system.");
+        eprintln!(
+            "    Nothing to remove. If httpxer isn't installed yet, run install.sh \
+             (or install.ps1 on Windows) first."
+        );
+        return Ok(());
+    }
+
+    println!("About to REMOVE:");
+    for b in &bins {
+        println!("  binary  : {}", b.display());
+    }
+    if let Some(c) = &cache {
+        println!("  cache   : {}", c.display());
+    }
+    println!();
+
     if !skip_prompt {
-        eprint!("Continue? [y/N] ");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if !matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        // stdin TTY guard — prevents accidental uninstall via a pipe that
+        // happens to feed an empty stdin (would otherwise see "no input" as
+        // "decline", but we want a definitive y/n).
+        if !std::io::stdin().is_terminal() {
+            eprintln!("[!] stdin is not a TTY and --yes was not passed — aborting to be safe.");
+            eprintln!("    Re-run interactively, or add --yes (alias -y) to proceed.");
+            return Ok(());
+        }
+        eprint!("Proceed? [y/N] ");
+        use std::io::Write as _;
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let answer = line.trim();
+        if !answer.eq_ignore_ascii_case("y") && !answer.eq_ignore_ascii_case("yes") {
             println!("Cancelled.");
             return Ok(());
         }
     }
-    // Cache first (no perms issue), then the binary itself. Use self_update's
-    // helper for the binary so it handles the Windows-locked-file case.
-    if let Some(p) = update_cache_path() {
-        if let Some(parent) = p.parent() {
-            let _ = fs::remove_dir_all(parent);
+
+    let mut removed_bins = 0usize;
+    for b in &bins {
+        match fs::remove_file(b) {
+            Ok(_) => {
+                println!("removed {}", b.display());
+                removed_bins += 1;
+            }
+            Err(e) => eprintln!("could not remove {}: {} (check permissions)", b.display(), e),
         }
     }
-    self_update::self_replace::self_delete()?;
-    println!("Uninstalled.");
+    if let Some(c) = &cache {
+        match fs::remove_dir_all(c) {
+            Ok(_) => println!("removed {}", c.display()),
+            Err(e) => eprintln!("could not remove {}: {}", c.display(), e),
+        }
+    }
+
+    println!();
+    if removed_bins > 0 {
+        println!("Uninstalled. ({} binary file(s) removed)", removed_bins);
+    } else {
+        eprintln!(
+            "No binaries were removed — likely a permission issue. \
+             Try re-running with `sudo` (Linux/macOS) or as Administrator (Windows)."
+        );
+    }
     Ok(())
 }
