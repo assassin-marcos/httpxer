@@ -45,8 +45,9 @@ httpxer auto-detects which mode to run based on whether `-path / --paths` is set
 
 | Mode | Trigger | What it does | Output |
 |---|---|---|---|
-| **Enrich** *(default)* | no `-path` flag | One probe per host. Resolves DNS, tags CDN ranges, runs Wappalyzer tech-detect on the response, follows redirects. | `subdomain, ip, cname, cdn, status_code, content_length, server, title, tech, …` (httpx-compatible) |
-| **Fuzz** | `-path <wordlist>` | Host × wordlist Cartesian probe. Pre-flight wildcard fingerprint per host; auto-suppress identical-body false positives; per-request `Policy::none()` so 3xx is a finding, not chased. | `url, input, path, host, status_code, content_length, content_type, title, server, webserver, body_preview, is_wildcard, snippet_md5, tls_impersonation, …` (matches retroh4ck-prober v0.1.0) |
+| **Enrich** *(default)* | no `-path` flag | One probe per host. Resolves DNS, tags CDN ranges, runs Wappalyzer tech-detect on the response, follows redirects. | `subdomain, ip, cname, cdn, status_code, content_length, server, title, tech, …` |
+| **Enrich (httpx-compat)** | `--httpx-compat` | Same probe pipeline as enrich; output reshaped into ProjectDiscovery httpx's JSON field names + array forms (`input`, `a`, `aaaa`, `cname`, `tech` as arrays, plus `webserver` + `host_ip`). Drop-in for downstream consumers that already parse httpx JSON. | `input, a, aaaa, cname, host_ip, status_code, content_length, server, webserver, title, tech, …` |
+| **Fuzz** | `-path <wordlist>` | Host × wordlist Cartesian probe. Pre-flight wildcard fingerprint per host; auto-suppress identical-body false positives; per-request `Policy::none()` so 3xx is a finding, not chased. | `url, input, path, host, status_code, content_length, content_type, title, server, webserver, body_preview, is_wildcard, snippet_md5, tls_impersonation, …` |
 
 Both modes share the same 16-slot real-browser TLS impersonation pool — wreq + BoringSSL — and the same `-l` input + `-o` output path. `--proxy <URL>` (HTTP / HTTPS / SOCKS5) is honoured by every client in the pool.
 
@@ -72,6 +73,9 @@ httpxer -l internal-hosts.txt -o out.jsonl --no-impersonate
 
 # Skip tech-detect for max throughput
 httpxer -l huge-list.txt -o out.jsonl --no-tech -t 500
+
+# httpx-compatible JSON shape (drop-in for httpx-JSON consumers)
+httpxer -l hosts.txt -o out.jsonl --httpx-compat
 
 # Route every probe through an upstream proxy (http / https / socks5 / socks5h)
 httpxer -l hosts.txt -o out.jsonl --proxy http://127.0.0.1:8080
@@ -145,6 +149,25 @@ Stderr (TTY):
 | `via_proxy` | `true` when `--proxy <URL>` is set |
 | `body` | Response body (≤2 MiB) — only when `--with-body` |
 | `error` | DNS / HTTP failure reason, absent on success |
+
+### Enrich-mode record (httpx-compat shape, `--httpx-compat`)
+
+Same probe pipeline, reshaped into ProjectDiscovery httpx's JSON field names so existing httpx-JSON consumers can ingest the output unchanged:
+
+```json
+{"input":"https://target.com","a":["104.16.124.96"],"aaaa":[],"cname":[],"host_ip":"104.16.124.96","cdn":"cloudflare","status_code":200,"content_length":1371851,"word_count":173236,"server":"cloudflare","webserver":"cloudflare","title":"Some Page","tech":["Astro:5.18.1","Cloudflare","HSTS","HTTP/3"],"via_proxy":false}
+```
+
+| Field | Differs from default shape |
+|---|---|
+| `input` | URL with scheme — replaces `subdomain` |
+| `a`, `aaaa` | Arrays of A / AAAA records — replace the single `ip` string |
+| `cname` | Array form — `[]` when host is directly A |
+| `host_ip` | First A record (falls back to first AAAA when no A is present) |
+| `webserver` | Mirrors `server` — httpx emits both, some downstream parsers read either |
+| `tech` | String array (`["X","Y"]`) — split from the comma-joined default form |
+
+All other fields (`status_code`, `content_length`, `word_count`, `server`, `location`, `title`, `final_url`, `redirect_chain`, `cdn`, `via_proxy`, `body`, `error`, `domain`, `scan_id`, `source_tools`) are preserved unchanged.
 
 ### Fuzz-mode record (file)
 
@@ -226,6 +249,7 @@ Full list via `httpxer -h`. Most-used:
 | `--no-follow-redirects` | follow | Disable redirect chasing |
 | `--max-redirects <N>` | `10` | Hop cap when redirect chasing is on |
 | `--fingerprints <PATH>` | embedded | Load fresh Wappalyzer fingerprints |
+| `--httpx-compat` | off | Reshape output into ProjectDiscovery httpx's JSON field names (`input`, `a`, `aaaa`, `cname` + `tech` arrays, `webserver`, `host_ip`) |
 | **httpx-compat (no-ops, accepted)** | — | `-fr -sc -cl -wc -server -location -title -td -ip -cname -json -no-color -silent` |
 
 ### Fuzz-mode flags

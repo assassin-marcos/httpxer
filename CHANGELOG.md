@@ -2,6 +2,18 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.3.3] — 2026-05-20
+
+### Added
+- **`--httpx-compat`** — emit enrich-mode records in ProjectDiscovery httpx's JSON shape. `input` replaces `subdomain`; `a` / `aaaa` arrays replace the single `ip` string; `cname` and `tech` become arrays; `webserver` is added alongside `server`; `host_ip` is the first A record (falling back to first AAAA). Default httpxer shape is unchanged when the flag is off.
+
+### Changed
+- Version: 0.3.2 → **0.3.3**
+
+### Unchanged (compatibility)
+- Default enrich JSONL shape is unchanged when `--httpx-compat` is not set.
+- All v0.3.2 flags continue to work unchanged.
+
 ## [0.3.2] — 2026-05-20
 
 ### Added
