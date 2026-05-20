@@ -27,6 +27,7 @@ mod cdn;
 mod dns;
 mod probe;
 mod techdetect;
+mod update;
 
 /// Embedded Wappalyzer fingerprint snapshot — same JSON httpx uses. Refresh
 /// with `--fingerprints <path>` pointing at a freshly-downloaded copy from
@@ -41,12 +42,14 @@ const EMBEDDED_FINGERPRINTS: &str = include_str!("../fingerprints.json");
 )]
 struct Args {
     /// Input file (one hostname/URL per line, "-" for stdin)
-    #[arg(short = 'l', long, alias = "list")]
-    input: String,
+    #[arg(short = 'l', long, alias = "list",
+          required_unless_present_any = ["update", "check_update", "uninstall"])]
+    input: Option<String>,
 
     /// Output NDJSON file
-    #[arg(short = 'o', long, alias = "output")]
-    output: String,
+    #[arg(short = 'o', long, alias = "output",
+          required_unless_present_any = ["update", "check_update", "uninstall"])]
+    output: Option<String>,
 
     /// Concurrent HTTP probes (matches httpx -t default)
     #[arg(short = 't', long, default_value_t = 250)]
@@ -109,6 +112,31 @@ struct Args {
     /// keeps output files small.
     #[arg(long)]
     with_body: bool,
+
+    // ── Self-management ────────────────────────────────────────────────
+    /// Install the latest release (replaces this binary in place)
+    #[arg(short = 'u', long, help_heading = "Self-management")]
+    update: bool,
+
+    /// Check for updates and exit (no install)
+    #[arg(short = 'c', long, help_heading = "Self-management")]
+    check_update: bool,
+
+    /// Uninstall httpxer (deletes this binary + the version-check cache)
+    #[arg(short = 'X', long, help_heading = "Self-management")]
+    uninstall: bool,
+
+    /// Skip the uninstall confirmation prompt
+    #[arg(short = 'y', long, help_heading = "Self-management")]
+    yes: bool,
+
+    /// Suppress the "update available" startup banner
+    #[arg(long, help_heading = "Self-management")]
+    no_update_check: bool,
+
+    /// Quiet mode (alias for --no-update-check — useful when piping)
+    #[arg(short = 'q', long, help_heading = "Self-management")]
+    quiet: bool,
 
     // ── httpx compatibility no-ops ───────────────────────────────────────
     // These flags are accepted with the same single-dash spelling httpx uses
@@ -287,14 +315,50 @@ fn extract_host(input: &str) -> String {
 async fn main() -> Result<()> {
     let args = Args::parse_from(normalize_args(std::env::args()));
 
+    // Self-management early-exits — handle before we touch input files / DNS / network.
+    if args.update {
+        return update::run_update().await;
+    }
+    if args.check_update {
+        return update::run_check_update().await;
+    }
+    if args.uninstall {
+        return update::run_uninstall(args.yes);
+    }
+
+    // Auto-banner: warn on outdated install. Stderr-only so JSON output
+    // piped to a downstream tool stays clean. 24 h cache + 120 s skip
+    // means the common case is zero network at startup.
+    if !args.no_update_check && !args.quiet {
+        update::refresh_update_cache_best_effort().await;
+        if let Some(latest) = update::cached_latest_version() {
+            if update::version_is_newer(&latest, env!("CARGO_PKG_VERSION")) {
+                let notes = tokio::task::spawn_blocking({
+                    let cur = env!("CARGO_PKG_VERSION").to_string();
+                    move || update::fetch_release_notes_since(&cur)
+                })
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+                update::print_update_banner(&latest, &notes);
+            }
+        }
+    }
+
+    let input_path = args.input.as_deref()
+        .context("missing -l/--list input file")?;
+    let output_path = args.output.as_deref()
+        .context("missing -o/--output path")?;
+
     // 1. Read + dedupe input.
-    let mut hosts = read_hosts(&args.input)?;
+    let mut hosts = read_hosts(input_path)?;
     let initial = hosts.len();
     eprintln!("[+] input: {} unique hosts", initial);
 
     // 2. Resume: skip already-processed entries from the existing output file.
     if !args.no_resume {
-        let done = read_existing_subdomains(&args.output);
+        let done = read_existing_subdomains(output_path);
         if !done.is_empty() {
             hosts.retain(|h| !done.contains(&extract_host(h)));
             eprintln!(
@@ -304,7 +368,7 @@ async fn main() -> Result<()> {
             );
         }
     } else {
-        let _ = std::fs::remove_file(&args.output);
+        let _ = std::fs::remove_file(output_path);
     }
     if hosts.is_empty() {
         eprintln!("[+] nothing to do — exiting");
@@ -357,8 +421,8 @@ async fn main() -> Result<()> {
     let mut out_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&args.output)
-        .with_context(|| format!("open output {}", args.output))?;
+        .open(output_path)
+        .with_context(|| format!("open output {}", output_path))?;
 
     // 8. Fan out probes via Semaphore + FuturesUnordered + spawn_blocking.
     use futures::stream::{FuturesUnordered, StreamExt};
@@ -482,6 +546,6 @@ async fn main() -> Result<()> {
         }
     }
     out_file.flush()?;
-    eprintln!("[+] done: wrote {} records to {}", completed, args.output);
+    eprintln!("[+] done: wrote {} records to {}", completed, output_path);
     Ok(())
 }

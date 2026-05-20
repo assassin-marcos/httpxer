@@ -38,38 +38,45 @@ $ httpxer -l subs.txt -fr -sc -cl -wc -server -location -title -td -ip -cname -j
 
 ---
 
-## Install (prebuilt binary)
+## Install
 
-### Linux x86_64
-
-```bash
-curl -sL https://github.com/assassin-marcos/httpxer/releases/latest/download/httpxer-x86_64-unknown-linux-gnu.tar.gz | tar xz
-sudo mv httpxer /usr/local/bin/
-httpxer --help
-```
-
-### macOS Apple Silicon (M1/M2/M3/M4)
+### One-liner (Linux / macOS)
 
 ```bash
-curl -sL https://github.com/assassin-marcos/httpxer/releases/latest/download/httpxer-aarch64-apple-darwin.tar.gz | tar xz
-sudo mv httpxer /usr/local/bin/
+curl -sL https://raw.githubusercontent.com/assassin-marcos/httpxer/main/install.sh | bash
 ```
 
-### macOS Intel
+Detects host arch (`x86_64` / `arm64`), pulls the matching release asset, installs to `/usr/local/bin/httpxer` (sudo only if needed). Override with `INSTALL_DIR=~/bin bash`.
 
-```bash
-curl -sL https://github.com/assassin-marcos/httpxer/releases/latest/download/httpxer-x86_64-apple-darwin.tar.gz | tar xz
-sudo mv httpxer /usr/local/bin/
-```
-
-### Windows (PowerShell)
+### One-liner (Windows PowerShell)
 
 ```powershell
-Invoke-WebRequest -Uri https://github.com/assassin-marcos/httpxer/releases/latest/download/httpxer-x86_64-pc-windows-msvc.zip -OutFile httpxer.zip
-Expand-Archive .\httpxer.zip -DestinationPath .
-# Move httpxer.exe somewhere on PATH, e.g.:
-Move-Item .\httpxer.exe "$env:USERPROFILE\bin\httpxer.exe"
+irm https://raw.githubusercontent.com/assassin-marcos/httpxer/main/install.ps1 | iex
 ```
+
+Installs to `$env:USERPROFILE\bin\httpxer.exe` and adds that dir to the user `PATH` (override with `$env:INSTALL_DIR = "C:\tools"` first).
+
+### Self-management (after install)
+
+```bash
+httpxer -c          # check for updates (status only, doesn't install)
+httpxer -u          # install latest release in place
+httpxer -X          # uninstall (deletes binary + cache)
+httpxer -q ...      # quiet mode — suppresses the startup banner
+```
+
+A startup banner on **stderr** shows `[!] httpxer update available: <current> → <latest>` automatically whenever a newer version is published (24 h cache, 120 s skip-window so back-to-back invocations don't hit GitHub). Pipe-to-tool workflows aren't affected — the banner is stderr-only and `--no-update-check` / `-q` suppress it entirely.
+
+### Manual download (no script)
+
+Pick the asset for your platform from the [latest release](https://github.com/assassin-marcos/httpxer/releases/latest):
+
+| Platform | Asset |
+|---|---|
+| Linux x86_64 (glibc 2.35+) | `httpxer-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon (M1+) | `httpxer-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `httpxer-x86_64-apple-darwin.tar.gz` |
+| Windows x86_64 | `httpxer-x86_64-pc-windows-msvc.zip` |
 
 ---
 

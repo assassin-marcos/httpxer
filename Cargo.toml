@@ -1,6 +1,6 @@
 [package]
 name = "httpxer"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Native httpx-enrichment replacement with TLS impersonation (JA3/JA4 + HTTP/2 SETTINGS) — Wappalyzer tech-detect, CDN tagging, NDJSON output. One static binary."
 license = "MIT"
@@ -51,6 +51,17 @@ ipnetwork = "0.20"
 
 anyhow = "1"
 url    = "2"
+
+# Self-update: pulls prebuilt release binaries from GitHub on `httpxer -u`.
+# Uses rustls so it doesn't drag in another OpenSSL dep (we already have
+# BoringSSL via wreq — keeping the update path on a separate TLS stack
+# means an outage in one doesn't take out the other).
+self_update = { version = "0.41", default-features = false, features = ["rustls", "archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
+
+# Tiny blocking HTTP client for the GitHub tags API peek — used by
+# --check-update to spot the "tag pushed, release CI still building"
+# window where the Releases API doesn't show the new version yet.
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 
 [profile.release]
 lto = "thin"
