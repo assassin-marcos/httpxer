@@ -16,7 +16,7 @@ use tokio::sync::Semaphore;
 #[derive(Debug, Clone)]
 pub struct DnsRecord {
     pub host: String,
-    pub ips: Vec<IpAddr>,     // A + AAAA flattened
+    pub ips: Vec<IpAddr>,      // A + AAAA flattened
     pub cname: Option<String>, // first CNAME directly under `host`, if any
     pub error: Option<String>, // resolve error reason, if no records
 }
@@ -26,7 +26,10 @@ pub fn build_resolver(timeout_secs: u64) -> Arc<TokioAsyncResolver> {
     opts.timeout = Duration::from_secs(timeout_secs);
     opts.attempts = 2;
     opts.cache_size = 0; // per-run results — don't carry stale entries
-    Arc::new(TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), opts))
+    Arc::new(TokioAsyncResolver::tokio(
+        ResolverConfig::cloudflare(),
+        opts,
+    ))
 }
 
 async fn resolve_one(resolver: Arc<TokioAsyncResolver>, host: String) -> DnsRecord {
@@ -49,7 +52,11 @@ async fn resolve_one(resolver: Arc<TokioAsyncResolver>, host: String) -> DnsReco
             let ips: Vec<IpAddr> = lookup.iter().collect();
             DnsRecord {
                 host,
-                error: if ips.is_empty() { Some("no A/AAAA records".to_string()) } else { None },
+                error: if ips.is_empty() {
+                    Some("no A/AAAA records".to_string())
+                } else {
+                    None
+                },
                 ips,
                 cname,
             }

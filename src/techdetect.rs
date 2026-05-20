@@ -43,7 +43,10 @@ fn compile_pattern(raw: &str) -> Option<CompiledPattern> {
         }
     }
     if regex_str.is_empty() {
-        return Some(CompiledPattern { re: None, version_group });
+        return Some(CompiledPattern {
+            re: None,
+            version_group,
+        });
     }
     let re = regex::RegexBuilder::new(regex_str)
         .case_insensitive(true)
@@ -51,13 +54,19 @@ fn compile_pattern(raw: &str) -> Option<CompiledPattern> {
         .size_limit(10 * 1024 * 1024)
         .build()
         .ok()?;
-    Some(CompiledPattern { re: Some(re), version_group })
+    Some(CompiledPattern {
+        re: Some(re),
+        version_group,
+    })
 }
 
 fn pattern_strings(v: &Value) -> Vec<String> {
     match v {
         Value::String(s) => vec![s.clone()],
-        Value::Array(arr) => arr.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect(),
         _ => vec![],
     }
 }
@@ -185,7 +194,8 @@ impl TechEngine {
 
         Ok(Self {
             apps,
-            script_src_extract: Regex::new(r#"(?i)<script[^>]+src\s*=\s*["']([^"']+)["']"#).unwrap(),
+            script_src_extract: Regex::new(r#"(?i)<script[^>]+src\s*=\s*["']([^"']+)["']"#)
+                .unwrap(),
             meta_extract: Regex::new(
                 r#"(?i)<meta[^>]+name\s*=\s*["']([^"']+)["'][^>]*content\s*=\s*["']([^"']*)["']"#,
             )

@@ -169,7 +169,7 @@ pub fn read_words(path: &str) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let f = std::fs::File::open(path).with_context(|| format!("open wordlist {}", path))?;
-    for line in BufReader::new(f).lines().flatten() {
+    for line in BufReader::new(f).lines().map_while(Result::ok) {
         let normalised = normalize_path(&line);
         if normalised.is_empty() || normalised == "/" {
             // skip blank / pure-slash entries; the wildcard probe owns "/"
@@ -300,7 +300,7 @@ fn now_iso8601() -> String {
 fn short_err(s: &str) -> String {
     let mut buf: String = s.chars().take(120).collect();
     if buf.contains('\n') || buf.contains('\r') {
-        buf = buf.replace('\n', " ").replace('\r', " ");
+        buf = buf.replace(['\n', '\r'], " ");
     }
     buf
 }
@@ -387,8 +387,7 @@ async fn dispatch_one(
     url: &str,
     body_preview_bytes: usize,
 ) -> Result<(ParsedResp, &'static str, String), String> {
-    let slot = probe::pick_pool_slot()
-        .ok_or_else(|| "probe pool not initialised".to_string())?;
+    let slot = probe::pick_pool_slot().ok_or_else(|| "probe pool not initialised".to_string())?;
     let resp = slot
         .client
         .get(url)
@@ -527,10 +526,12 @@ fn ua_string(tag: &str) -> String {
         return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36".to_string();
     }
     if tag.starts_with("firefox-139") {
-        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:139.0) Gecko/20100101 Firefox/139.0".to_string();
+        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:139.0) Gecko/20100101 Firefox/139.0"
+            .to_string();
     }
     if tag.starts_with("firefox-136") {
-        return "Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0".to_string();
+        return "Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0"
+            .to_string();
     }
     if tag.starts_with("firefox-133") {
         return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0".to_string();
@@ -592,9 +593,7 @@ fn bare_host(s: &str) -> String {
     let stripped = s
         .trim_start_matches("https://")
         .trim_start_matches("http://");
-    let end = stripped
-        .find(|c| c == '/' || c == '?' || c == '#')
-        .unwrap_or(stripped.len());
+    let end = stripped.find(['/', '?', '#']).unwrap_or(stripped.len());
     stripped[..end].to_string()
 }
 
@@ -802,7 +801,11 @@ async fn run_probe(
                 return;
             }
 
-            let cf = cf_challenge(parsed.status, &parsed.server, &parsed.body_preview_for_output);
+            let cf = cf_challenge(
+                parsed.status,
+                &parsed.server,
+                &parsed.body_preview_for_output,
+            );
 
             let rec = FuzzRecord {
                 url: url.clone(),
@@ -931,7 +934,10 @@ mod tests {
         assert_eq!(host_to_input("target.com"), "https://target.com");
         assert_eq!(host_to_input("https://target.com"), "https://target.com");
         assert_eq!(host_to_input("https://target.com/"), "https://target.com");
-        assert_eq!(host_to_input("http://target.com:8080"), "http://target.com:8080");
+        assert_eq!(
+            host_to_input("http://target.com:8080"),
+            "http://target.com:8080"
+        );
     }
 
     #[test]

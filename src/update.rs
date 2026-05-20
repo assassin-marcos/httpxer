@@ -4,8 +4,7 @@
 //!   1. `httpxer -u` / `--update`        — install the latest release in place
 //!   2. `httpxer -c` / `--check-update`  — print version status and exit
 //!   3. Startup banner (stderr only)     — auto-detects outdated installs and
-//!                                          shows "What's new" notes since the
-//!                                          user's current version
+//!      shows "What's new" notes since the user's current version
 //!
 //! The banner uses a 24 h on-disk cache (`$XDG_CACHE_HOME/httpxer/last_check`
 //! or `%LOCALAPPDATA%\httpxer\last_check`) so the common case is zero network
@@ -89,7 +88,11 @@ pub fn cached_latest_version() -> Option<String> {
         return None;
     }
     let s = fs::read_to_string(&p).ok()?.trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// Eager non-blocking refresh of the update cache so the banner reflects
@@ -260,8 +263,12 @@ pub fn print_update_banner(latest: &str, notes: &[(String, String)]) {
 /// up-front check so the user doesn't sit through a 5 MB download just to
 /// hit a Permission-Denied at the final move.
 fn install_dir_writable() -> bool {
-    let Ok(exe) = std::env::current_exe() else { return true };
-    let Some(parent) = exe.parent() else { return true };
+    let Ok(exe) = std::env::current_exe() else {
+        return true;
+    };
+    let Some(parent) = exe.parent() else {
+        return true;
+    };
     let probe = parent.join(format!(".httpxer-wcheck-{}", std::process::id()));
     match fs::File::create(&probe) {
         Ok(_) => {
@@ -292,7 +299,9 @@ fn print_perm_help() {
     eprintln!("  \x1b[1m1. Re-run with sudo (one-time, every update):\x1b[0m");
     eprintln!("       \x1b[1msudo httpxer -u\x1b[0m");
     eprintln!();
-    eprintln!("  \x1b[1m2. Or relocate to a user-writable path (one-time, no sudo ever again):\x1b[0m");
+    eprintln!(
+        "  \x1b[1m2. Or relocate to a user-writable path (one-time, no sudo ever again):\x1b[0m"
+    );
     eprintln!("       mkdir -p ~/.local/bin");
     eprintln!("       sudo mv {} ~/.local/bin/", path);
     eprintln!("       # macOS:  echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc && source ~/.zshrc");
@@ -311,7 +320,10 @@ pub async fn run_update() -> anyhow::Result<()> {
     }
 
     let current = env!("CARGO_PKG_VERSION").to_string();
-    println!("httpxer: checking GitHub releases for {}/{}…", REPO_OWNER, REPO_NAME);
+    println!(
+        "httpxer: checking GitHub releases for {}/{}…",
+        REPO_OWNER, REPO_NAME
+    );
     let join = tokio::task::spawn_blocking(|| {
         self_update::backends::github::Update::configure()
             .repo_owner(REPO_OWNER)
@@ -396,8 +408,10 @@ pub async fn run_update() -> anyhow::Result<()> {
                         }
                     }
                     println!();
-                    println!("\x1b[2m    Full history: https://github.com/{}/{}/releases\x1b[0m",
-                        REPO_OWNER, REPO_NAME);
+                    println!(
+                        "\x1b[2m    Full history: https://github.com/{}/{}/releases\x1b[0m",
+                        REPO_OWNER, REPO_NAME
+                    );
                     println!();
                 }
             }
@@ -419,7 +433,11 @@ pub async fn run_check_update() -> anyhow::Result<()> {
     let tag = tag.ok().and_then(|r| r.ok()).flatten();
 
     let newest = match (&release, &tag) {
-        (Some(r), Some(t)) => Some(if version_is_newer(t, r) { t.clone() } else { r.clone() }),
+        (Some(r), Some(t)) => Some(if version_is_newer(t, r) {
+            t.clone()
+        } else {
+            r.clone()
+        }),
         (Some(v), None) | (None, Some(v)) => Some(v.clone()),
         (None, None) => None,
     };
@@ -577,7 +595,11 @@ pub fn run_uninstall(skip_prompt: bool) -> anyhow::Result<()> {
                 println!("removed {}", b.display());
                 removed_bins += 1;
             }
-            Err(e) => eprintln!("could not remove {}: {} (check permissions)", b.display(), e),
+            Err(e) => eprintln!(
+                "could not remove {}: {} (check permissions)",
+                b.display(),
+                e
+            ),
         }
     }
     if let Some(c) = &cache {

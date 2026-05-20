@@ -50,7 +50,9 @@ impl WildcardMap {
     /// recorded wildcard signature for this host.
     pub fn matches(&self, host: &str, cl: i64, ct: &str, md5: &str) -> bool {
         match self.inner.get(host) {
-            Some(sig) => sig.content_length == cl && sig.content_type == ct && sig.snippet_md5 == md5,
+            Some(sig) => {
+                sig.content_length == cl && sig.content_type == ct && sig.snippet_md5 == md5
+            }
             None => false,
         }
     }

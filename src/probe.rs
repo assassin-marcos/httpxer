@@ -30,7 +30,12 @@ use wreq_util::Emulation;
 
 /// Probe outcome. Body is preserved for the downstream tech-detector
 /// (which inspects `<script src>`, `<meta>`, and inline markers).
+///
+/// `status_line` + `via_https` are populated during probe but not consumed
+/// by the current output writers — kept on the struct because external
+/// scripts that import this crate use them. Clippy dead-code allowlisted.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct HttpProbeResult {
     pub status_code: u16,
     pub status_line: String,
@@ -123,28 +128,52 @@ pub fn init_pool(timeout_ms: u64, no_impersonate: bool) {
         // is roughly 50%; an all-desktop scan stands out.
         let profiles: &[(Emulation, &str, &str)] = &[
             // Desktop Chrome — broadest real-world share
-            (Emulation::Chrome137, "en-US,en;q=0.9",       "chrome-137"),
-            (Emulation::Chrome136, "en-US,en;q=0.9",       "chrome-136"),
-            (Emulation::Chrome135, "en-GB,en;q=0.9",       "chrome-135"),
-            (Emulation::Chrome133, "en-US,en;q=0.9,fr;q=0.8", "chrome-133"),
-            (Emulation::Chrome131, "en-US,en;q=0.9,es;q=0.8", "chrome-131"),
+            (Emulation::Chrome137, "en-US,en;q=0.9", "chrome-137"),
+            (Emulation::Chrome136, "en-US,en;q=0.9", "chrome-136"),
+            (Emulation::Chrome135, "en-GB,en;q=0.9", "chrome-135"),
+            (
+                Emulation::Chrome133,
+                "en-US,en;q=0.9,fr;q=0.8",
+                "chrome-133",
+            ),
+            (
+                Emulation::Chrome131,
+                "en-US,en;q=0.9,es;q=0.8",
+                "chrome-131",
+            ),
             // Desktop Firefox
-            (Emulation::Firefox139, "en-US,en;q=0.5",       "firefox-139"),
-            (Emulation::Firefox136, "en-US,en;q=0.5,de;q=0.3", "firefox-136"),
-            (Emulation::Firefox133, "en-US,en;q=0.5",       "firefox-133"),
+            (Emulation::Firefox139, "en-US,en;q=0.5", "firefox-139"),
+            (
+                Emulation::Firefox136,
+                "en-US,en;q=0.5,de;q=0.3",
+                "firefox-136",
+            ),
+            (Emulation::Firefox133, "en-US,en;q=0.5", "firefox-133"),
             // Desktop Safari (macOS)
-            (Emulation::Safari18_5,   "en-US,en;q=0.9", "safari-18.5"),
+            (Emulation::Safari18_5, "en-US,en;q=0.9", "safari-18.5"),
             (Emulation::Safari18_3_1, "en-US,en;q=0.9", "safari-18.3.1"),
-            (Emulation::Safari18_2,   "en-US,en;q=0.9", "safari-18.2"),
+            (Emulation::Safari18_2, "en-US,en;q=0.9", "safari-18.2"),
             // Desktop Edge (Chromium-based — distinct JA4 from Chrome because
             // of slightly different cipher suite ordering and HTTP-2 settings)
             (Emulation::Edge134, "en-US,en;q=0.9", "edge-134"),
             (Emulation::Edge131, "en-US,en;q=0.9", "edge-131"),
             // Mobile Safari (iOS)
-            (Emulation::SafariIos18_1_1, "en-US,en;q=0.9", "safari-ios-18.1.1"),
-            (Emulation::SafariIos17_4_1, "en-US,en;q=0.9", "safari-ios-17.4.1"),
+            (
+                Emulation::SafariIos18_1_1,
+                "en-US,en;q=0.9",
+                "safari-ios-18.1.1",
+            ),
+            (
+                Emulation::SafariIos17_4_1,
+                "en-US,en;q=0.9",
+                "safari-ios-17.4.1",
+            ),
             // Mobile Firefox (Android)
-            (Emulation::FirefoxAndroid135, "en-US,en;q=0.5", "firefox-android-135"),
+            (
+                Emulation::FirefoxAndroid135,
+                "en-US,en;q=0.5",
+                "firefox-android-135",
+            ),
         ];
         let mut pool: Vec<PoolSlot> = Vec::new();
         for (emul, lang, tag) in profiles {
@@ -289,14 +318,12 @@ pub async fn http_probe_once(url: &str, follow: bool) -> Option<HttpProbeResult>
         let word_count = body_str.split_whitespace().count();
 
         // Wire Content-Length wins; else body length when not capped; else None.
-        let content_length: Option<u64> = header_cl.or_else(|| {
-            if body_capped {
-                None
-            } else if body_len > 0 {
-                Some(body_len as u64)
-            } else {
-                None
-            }
+        let content_length: Option<u64> = header_cl.or(if body_capped {
+            None
+        } else if body_len > 0 {
+            Some(body_len as u64)
+        } else {
+            None
         });
 
         last = Some(Hop {

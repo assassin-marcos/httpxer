@@ -121,7 +121,12 @@ struct Args {
     // All flags below are inert in enrich mode.
     /// Wordlist file (one path per line) — when set, switches to fuzz mode
     /// (host × path probe). Empty paths and `#` comments are skipped.
-    #[arg(short = 'p', long = "paths", alias = "path", help_heading = "Fuzz mode")]
+    #[arg(
+        short = 'p',
+        long = "paths",
+        alias = "path",
+        help_heading = "Fuzz mode"
+    )]
     paths: Option<String>,
 
     /// (fuzz) Comma-separated status codes to emit
@@ -134,7 +139,11 @@ struct Args {
     match_codes: String,
 
     /// (fuzz) Body preview length in bytes (HTML-entity-encoded in output)
-    #[arg(long = "body-preview", default_value_t = 8192, help_heading = "Fuzz mode")]
+    #[arg(
+        long = "body-preview",
+        default_value_t = 8192,
+        help_heading = "Fuzz mode"
+    )]
     body_preview: usize,
 
     /// (fuzz) Wildcard suppression policy: strict|mark|off
@@ -334,12 +343,12 @@ fn read_hosts(path: &str) -> Result<Vec<String>> {
     };
     if path == "-" {
         let stdin = std::io::stdin();
-        for line in stdin.lock().lines().flatten() {
+        for line in stdin.lock().lines().map_while(Result::ok) {
             push(&mut lines, line);
         }
     } else {
         let f = std::fs::File::open(path).with_context(|| format!("open {}", path))?;
-        for line in BufReader::new(f).lines().flatten() {
+        for line in BufReader::new(f).lines().map_while(Result::ok) {
             push(&mut lines, line);
         }
     }
@@ -349,7 +358,9 @@ fn read_hosts(path: &str) -> Result<Vec<String>> {
 }
 
 fn read_existing_subdomains(path: &str) -> HashSet<String> {
-    let Ok(content) = std::fs::read_to_string(path) else { return HashSet::new() };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return HashSet::new();
+    };
     let mut out = HashSet::new();
     for line in content.lines() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
@@ -419,10 +430,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    let input_path = args.input.as_deref()
+    let input_path = args
+        .input
+        .as_deref()
         .context("missing -l/--list input file")?;
-    let output_path = args.output.as_deref()
-        .context("missing -o/--output path")?;
+    let output_path = args.output.as_deref().context("missing -o/--output path")?;
 
     // 1. Read + dedupe input.
     let mut hosts = read_hosts(input_path)?;
@@ -457,7 +469,10 @@ async fn main() -> Result<()> {
             .filter_map(|s| s.trim().parse::<u16>().ok())
             .collect();
         if match_codes.is_empty() {
-            anyhow::bail!("--match-codes parsed to zero codes (got '{}')", args.match_codes);
+            anyhow::bail!(
+                "--match-codes parsed to zero codes (got '{}')",
+                args.match_codes
+            );
         }
 
         let cfg = fuzz::FuzzCfg {
@@ -522,8 +537,10 @@ async fn main() -> Result<()> {
     let cdn_table = cdn_fut.await;
     eprintln!("[+] CDN table: {} ranges", cdn_table.len());
 
-    let dns_map: std::collections::HashMap<String, dns::DnsRecord> =
-        dns_results.into_iter().map(|r| (r.host.clone(), r)).collect();
+    let dns_map: std::collections::HashMap<String, dns::DnsRecord> = dns_results
+        .into_iter()
+        .map(|r| (r.host.clone(), r))
+        .collect();
 
     // 6. Init the impersonation client pool (one pre-built wreq::Client per
     //    Chrome/Firefox/Safari/Edge emulation profile). Each probe later
@@ -561,8 +578,7 @@ async fn main() -> Result<()> {
         args.threads
     );
 
-    let mut set: FuturesUnordered<tokio::task::JoinHandle<EnrichRecord>> =
-        FuturesUnordered::new();
+    let mut set: FuturesUnordered<tokio::task::JoinHandle<EnrichRecord>> = FuturesUnordered::new();
     let total = hosts.len();
 
     for input in hosts {
@@ -622,13 +638,12 @@ async fn main() -> Result<()> {
             }
 
             // wreq is async-only — no spawn_blocking. Just await directly.
-            let probe_res = if url_or_host.starts_with("http://")
-                || url_or_host.starts_with("https://")
-            {
-                probe::http_probe_with_retry(&url_or_host, follow).await
-            } else {
-                probe::probe_hostname(&url_or_host, follow).await
-            };
+            let probe_res =
+                if url_or_host.starts_with("http://") || url_or_host.starts_with("https://") {
+                    probe::http_probe_with_retry(&url_or_host, follow).await
+                } else {
+                    probe::probe_hostname(&url_or_host, follow).await
+                };
 
             match probe_res {
                 None => rec.error = Some("http: no response".into()),
