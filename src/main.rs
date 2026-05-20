@@ -322,15 +322,23 @@ struct EnrichRecord {
     ip: String,
     /// First CNAME under `subdomain`, or "" when host is directly A.
     cname: String,
-    /// CDN provider tag (cloudflare/cloudfront/fastly/google), or "" if none / unknown.
+    /// CDN provider tag (cloudflare/cloudfront/fastly/google/aws), or ""
+    /// if none / unknown.
     cdn: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     status_code: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content_length: Option<u64>,
+    /// Response Content-Type header (e.g. "text/html; charset=utf-8").
+    /// Absent when the response had no such header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     word_count: Option<usize>,
+    /// Body line count (httpx parity — emitted as `lines`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lines: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     server: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -345,6 +353,11 @@ struct EnrichRecord {
     /// Wappalyzer detection joined as `"Name:Version, Name, Name:Version"`.
     /// Empty string when --no-tech or zero matches.
     tech: String,
+
+    /// Wall-clock probe time as Go-formatted duration ("662.326051ms",
+    /// "1.5s"). Absent when the probe didn't complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time: Option<String>,
 
     /// True when `--proxy URL` was set — every probe in this record's
     /// scan family was routed through the configured upstream. Always
@@ -361,35 +374,71 @@ struct EnrichRecord {
 
     // ── Internal state for httpx-compat conversion ─────────────────────
     // These fields carry the raw DNS slice + the original input string
-    // (with scheme intact) so the `--httpx-compat` writer can reshape the
-    // record without losing information. They are `#[serde(skip)]` so the
-    // default JSONL shape is byte-identical to pre-v0.3.1 output.
+    // (with scheme intact) plus URL components broken out, so the
+    // `--httpx-compat` writer can reshape the record without losing
+    // information. They are `#[serde(skip)]` so the default JSONL shape
+    // is byte-compatible with pre-v0.3.1 output (modulo the new
+    // `content_type` / `lines` / `time` fields, which are omitted when
+    // absent thanks to `skip_serializing_if`).
     #[serde(skip)]
     raw_ipv4: Vec<String>,
     #[serde(skip)]
     raw_ipv6: Vec<String>,
     #[serde(skip)]
     raw_input: String,
+    #[serde(skip)]
+    raw_scheme: String,
+    #[serde(skip)]
+    raw_port: String,
+    #[serde(skip)]
+    raw_path: String,
 }
 
-/// ProjectDiscovery httpx-shaped enrich record. Selected when `--httpx-compat`
-/// is set. Field names + array shapes mirror what `httpx -fr -sc -cl -wc
-/// -server -location -title -td -ip -cname -json` emits, so existing httpx
-/// consumers can ingest httpxer output unchanged.
+/// ProjectDiscovery httpx-shaped enrich record. Selected when
+/// `--httpx-compat` is set. Field names + array shapes mirror what `httpx
+/// -fr -sc -cl -wc -server -location -title -td -ip -cname -json` emits,
+/// so existing httpx consumers (and ingest pipelines that key off `host`)
+/// can read httpxer output unchanged.
 ///
-/// Loadbearing differences vs `EnrichRecord`:
-///   - `input` (URL with scheme) replaces `subdomain`
-///   - `a` + `aaaa` arrays replace the single `ip` string (httpx keeps every
-///     A and AAAA record, not just the first)
-///   - `cname` becomes a string array (multiple CNAMEs possible in theory)
-///   - `tech` becomes a string array (httpx emits `["X","Y"]` not `"X, Y"`)
-///   - `webserver` is emitted alongside `server` (some downstream parsers
-///     read one, some read the other — httpx itself emits both)
-///   - `host_ip` is added (first A; first AAAA when no A is present)
+/// Loadbearing parity rules vs the default `EnrichRecord` shape:
+///   - `input` = BARE HOSTNAME (matches httpx) — `subdomain`'s value.
+///   - `host`  = bare hostname (NEW — was previously missing, broke DB
+///              ingest paths that keyed off `host`).
+///   - `url`   = full URL with scheme (NEW — what `input` used to hold).
+///   - `scheme`/`port`/`path` broken out (httpx emits each one).
+///   - `a` + `aaaa` arrays replace the single `ip` string.
+///   - `cname` becomes a string array.
+///   - `tech` becomes a string array (split from comma-joined form).
+///   - `webserver` is emitted alongside `server`.
+///   - `host_ip` = first A (or first AAAA when no A).
+///   - `cdn_name` / `cdn_type` replace the single `cdn` string
+///     (httpx categorizes provider names: cloudflare/cloudfront/fastly →
+///     `cdn`, aws/google → `cloud`).
+///   - `words` (httpx field name) replaces `word_count`; `lines`,
+///     `content_type`, `time`, `timestamp`, `method`, `failed` added.
 #[derive(Serialize, Debug)]
 struct HttpxCompatRecord {
-    /// URL with scheme (`https://target.com`). httpx's primary host key.
+    /// RFC3339 UTC capture timestamp. Set at record-construction time so
+    /// records that take longer in tech-detect still get a wall-clock
+    /// emission stamp.
+    timestamp: String,
+
+    /// Bare hostname — `httpx`'s `input` semantics. Renamed from the
+    /// pre-v0.3.5 URL-with-scheme value (which now lives under `url`).
     input: String,
+    /// Full URL with scheme — matches httpx's `url`.
+    url: String,
+    /// Bare hostname — same value as `input`. httpx emits both so DB
+    /// pipelines that key off `host` work without normalising upstream.
+    host: String,
+    scheme: String,
+    /// Port number as string — explicit value when the input URL carried
+    /// one, otherwise the scheme default ("443" / "80").
+    port: String,
+    /// Request path — `/` for bare-hostname inputs.
+    path: String,
+    /// HTTP method — always "GET" for enrich-mode probes.
+    method: &'static str,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     domain: Option<String>,
@@ -400,28 +449,36 @@ struct HttpxCompatRecord {
 
     /// IPv4 A records (httpx emits the full list, not just the first).
     a: Vec<String>,
-    /// IPv6 AAAA records (NEW — httpxer's default shape flattens these
-    /// into the `ip` string; httpx-compat splits them out).
+    /// IPv6 AAAA records.
     aaaa: Vec<String>,
     /// CNAME chain — array form to match httpx.
     cname: Vec<String>,
-    /// First A record, or first AAAA when there is no A. httpx's
-    /// convenience field — equivalent to `a[0]` when present.
+    /// First A record, or first AAAA when there is no A.
     host_ip: String,
-    /// CDN provider tag (cloudflare/cloudfront/fastly/google), or "" if none.
+    /// CDN provider tag (cloudflare/cloudfront/fastly/google/aws), or ""
+    /// if none. Kept for backwards compat with pre-v0.3.5 consumers.
     cdn: String,
+    /// Same value as `cdn` — httpx's field name.
+    cdn_name: String,
+    /// CDN category: `cdn` (cloudflare/cloudfront/fastly), `cloud`
+    /// (aws/google), or "" when unknown / no match.
+    cdn_type: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     status_code: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content_length: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Response Content-Type header (httpx parity field name).
+    content_type: String,
+    /// httpx's `words` field — renamed from `word_count`.
+    #[serde(rename = "words", skip_serializing_if = "Option::is_none")]
     word_count: Option<usize>,
-    /// `server` header — kept under the `server` key (matches httpx).
+    /// Body line count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lines: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     server: Option<String>,
-    /// `webserver` is httpx's preferred alias of `server`. We emit both
-    /// so consumers that read either key see the same value.
+    /// httpx alias of `server`. Emitted whenever `server` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     webserver: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -434,8 +491,16 @@ struct HttpxCompatRecord {
     redirect_chain: Vec<String>,
 
     /// `tech` as a string array — split from `EnrichRecord.tech`'s
-    /// comma-joined form on `", "` so `"X, Y, Z"` becomes `["X","Y","Z"]`.
+    /// comma-joined form on `", "`.
     tech: Vec<String>,
+
+    /// Wall-clock probe time as Go-formatted duration ("662.326051ms",
+    /// "1.5s"). Empty string when the probe didn't complete (so the
+    /// field is always emitted — httpx parity).
+    time: String,
+    /// True when no successful HTTP response was captured (DNS failure,
+    /// network error, etc.). Always emitted.
+    failed: bool,
 
     /// True when `--proxy URL` was set. Always emitted.
     via_proxy: bool,
@@ -446,10 +511,22 @@ struct HttpxCompatRecord {
     error: Option<String>,
 }
 
+/// httpx-style CDN category: ProjectDiscovery's cdncheck tags providers
+/// as `cdn` (Cloudflare / CloudFront / Fastly) or `cloud` (AWS / GCP /
+/// Azure). Returns "" for unknown / no-match.
+fn cdn_type_for(name: &str) -> &'static str {
+    match name {
+        "cloudflare" | "cloudfront" | "fastly" => "cdn",
+        "aws" | "google" => "cloud",
+        _ => "",
+    }
+}
+
 impl HttpxCompatRecord {
     /// Reshape a default `EnrichRecord` into the httpx-compatible record.
-    /// Drains the raw DNS slice + raw input that the EnrichRecord carries
-    /// on the side; everything else is a direct field map.
+    /// Drains the raw DNS slice + raw input + URL components the
+    /// EnrichRecord carries on the side; everything else is a direct
+    /// field map.
     fn from_enrich(rec: EnrichRecord) -> Self {
         let tech: Vec<String> = if rec.tech.is_empty() {
             Vec::new()
@@ -472,8 +549,23 @@ impl HttpxCompatRecord {
             .cloned()
             .or_else(|| rec.raw_ipv6.first().cloned())
             .unwrap_or_default();
+        let cdn_type = cdn_type_for(&rec.cdn).to_string();
+        let cdn_name = rec.cdn.clone();
+        let failed = rec.status_code.is_none();
+        let time = rec.time.clone().unwrap_or_default();
+        // Nanosecond-precision RFC3339 (matches httpx's
+        // `2026-05-20T15:46:41.082345879+08:00` format; we emit UTC `Z`).
+        let timestamp =
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         HttpxCompatRecord {
-            input: rec.raw_input,
+            timestamp,
+            input: rec.subdomain.clone(),
+            url: rec.raw_input,
+            host: rec.subdomain,
+            scheme: rec.raw_scheme,
+            port: rec.raw_port,
+            path: rec.raw_path,
+            method: "GET",
             domain: rec.domain,
             scan_id: rec.scan_id,
             source_tools: rec.source_tools,
@@ -482,9 +574,13 @@ impl HttpxCompatRecord {
             cname: cname_arr,
             host_ip,
             cdn: rec.cdn,
+            cdn_name,
+            cdn_type,
             status_code: rec.status_code,
             content_length: rec.content_length,
+            content_type: rec.content_type.unwrap_or_default(),
             word_count: rec.word_count,
+            lines: rec.lines,
             server: rec.server.clone(),
             webserver: rec.server,
             location: rec.location,
@@ -492,11 +588,32 @@ impl HttpxCompatRecord {
             final_url: rec.final_url,
             redirect_chain: rec.redirect_chain,
             tech,
+            time,
+            failed,
             via_proxy: rec.via_proxy,
             body: rec.body,
             error: rec.error,
         }
     }
+}
+
+/// Parse a URL into `(scheme, port, path)` strings. For bare hostnames or
+/// unparseable inputs, falls back to `("https", "443", "/")` since enrich
+/// mode defaults to `https://` for scheme-less list entries.
+fn parse_url_parts(url: &str) -> (String, String, String) {
+    if let Ok(u) = url::Url::parse(url) {
+        let scheme = u.scheme().to_string();
+        let port = u
+            .port_or_known_default()
+            .map(|p| p.to_string())
+            .unwrap_or_default();
+        let path = {
+            let p = u.path();
+            if p.is_empty() { "/" } else { p }.to_string()
+        };
+        return (scheme, port, path);
+    }
+    ("https".to_string(), "443".to_string(), "/".to_string())
 }
 
 fn read_hosts(path: &str) -> Result<Vec<String>> {
@@ -538,12 +655,15 @@ fn read_existing_subdomains(path: &str) -> HashSet<String> {
     out
 }
 
-/// Strip scheme + path so `https://foo.com/bar` becomes `foo.com`.
+/// Strip scheme + path/query/fragment so `https://foo.com/bar?x=1` becomes
+/// `foo.com`. Without stripping `?` and `#`, inputs like
+/// `https://foo.com?x=1` would resolve DNS as `foo.com?x=1` and silently
+/// fail — and the resume-skip cache would miss its own dedupe key.
 fn extract_host(input: &str) -> String {
     let s = input
         .trim_start_matches("https://")
         .trim_start_matches("http://");
-    let host_end = s.find('/').unwrap_or(s.len());
+    let host_end = s.find(['/', '?', '#']).unwrap_or(s.len());
     s[..host_end].to_string()
 }
 
@@ -802,15 +922,16 @@ async fn main() -> Result<()> {
                 }
                 None => (Vec::new(), Vec::new()),
             };
-            // `raw_input` mirrors httpx's `input` — scheme + host. When the
-            // user passed a bare hostname we default to `https://` (matches
-            // httpx's scheme-less list behaviour).
+            // `raw_input` mirrors httpx's `url` field — scheme + host. When
+            // the user passed a bare hostname we default to `https://`
+            // (matches httpx's scheme-less list behaviour).
             let raw_input =
                 if url_or_host.starts_with("http://") || url_or_host.starts_with("https://") {
                     url_or_host.trim_end_matches('/').to_string()
                 } else {
                     format!("https://{}", host)
                 };
+            let (raw_scheme, raw_port, raw_path) = parse_url_parts(&raw_input);
 
             let mut rec = EnrichRecord {
                 subdomain: host.clone(),
@@ -822,19 +943,25 @@ async fn main() -> Result<()> {
                 cdn,
                 status_code: None,
                 content_length: None,
+                content_type: None,
                 word_count: None,
+                lines: None,
                 server: None,
                 location: None,
                 title: None,
                 final_url: None,
                 redirect_chain: vec![],
                 tech: String::new(),
+                time: None,
                 via_proxy,
                 body: None,
                 error: None,
                 raw_ipv4,
                 raw_ipv6,
                 raw_input,
+                raw_scheme,
+                raw_port,
+                raw_path,
             };
 
             // No A/AAAA → record DNS failure, skip probe.
@@ -856,12 +983,25 @@ async fn main() -> Result<()> {
                 Some(r) => {
                     rec.status_code = Some(r.status_code);
                     rec.content_length = r.content_length;
+                    rec.content_type = r.content_type;
                     rec.word_count = Some(r.word_count);
+                    rec.lines = Some(r.line_count);
                     rec.server = r.server;
                     rec.location = r.location;
                     rec.title = r.title;
                     rec.final_url = r.final_url;
                     rec.redirect_chain = r.chain;
+                    rec.time = Some(probe::format_elapsed_go(r.elapsed));
+                    // If the final URL we settled on differs in scheme /
+                    // port / path from the input, surface the FINAL values
+                    // — that's what httpx does (`scheme`/`port`/`path`
+                    // reflect the URL whose response we're describing).
+                    if let Some(final_url) = rec.final_url.as_deref() {
+                        let (s, p, pth) = parse_url_parts(final_url);
+                        rec.raw_scheme = s;
+                        rec.raw_port = p;
+                        rec.raw_path = pth;
+                    }
                     if let Some(engine) = tech_engine.as_ref() {
                         let matches = engine.detect(&r.headers, &r.cookies, &r.body);
                         rec.tech = techdetect::render_tech(&matches);
@@ -881,16 +1021,24 @@ async fn main() -> Result<()> {
     let mut completed = 0usize;
     let httpx_compat = args.httpx_compat;
     while let Some(joined) = set.next().await {
-        if let Ok(rec) = joined {
-            let line = if httpx_compat {
-                serde_json::to_string(&HttpxCompatRecord::from_enrich(rec))?
-            } else {
-                serde_json::to_string(&rec)?
-            };
-            writeln!(out_file, "{}", line)?;
-            completed += 1;
-            if completed % 50 == 0 || completed == total {
-                eprintln!("  [{}/{}]", completed, total);
+        match joined {
+            Ok(rec) => {
+                let line = if httpx_compat {
+                    serde_json::to_string(&HttpxCompatRecord::from_enrich(rec))?
+                } else {
+                    serde_json::to_string(&rec)?
+                };
+                writeln!(out_file, "{}", line)?;
+                completed += 1;
+                if completed % 50 == 0 || completed == total {
+                    eprintln!("  [{}/{}]", completed, total);
+                }
+            }
+            // Surface panics + cancellations so probe tasks lost to
+            // tech-detect regex blowups / runtime aborts don't silently
+            // disappear from the output.
+            Err(e) => {
+                eprintln!("[!] probe task did not complete: {}", e);
             }
         }
     }
@@ -917,19 +1065,25 @@ mod tests {
             cdn: "cloudflare".into(),
             status_code: Some(200),
             content_length: Some(1234),
+            content_type: Some("text/html".into()),
             word_count: Some(56),
+            lines: Some(7),
             server: Some("nginx".into()),
             location: None,
             title: Some("Example".into()),
             final_url: Some("https://target.com/".into()),
             redirect_chain: vec!["https://target.com".into()],
             tech: "Nginx, HSTS, HTTP/3".into(),
+            time: Some("100ms".into()),
             via_proxy: true,
             body: None,
             error: None,
             raw_ipv4: vec!["1.2.3.4".into(), "1.2.3.5".into()],
             raw_ipv6: vec!["2001:db8::1".into()],
             raw_input: "https://target.com".into(),
+            raw_scheme: "https".into(),
+            raw_port: "443".into(),
+            raw_path: "/".into(),
         }
     }
 
@@ -956,18 +1110,29 @@ mod tests {
         assert!(v.get("raw_input").is_none());
     }
 
-    /// httpx-compat shape: `input` replaces `subdomain`, `a` + `aaaa` are
-    /// arrays, `cname` + `tech` are arrays, `webserver` mirrors `server`,
-    /// `host_ip` is the first A. All other fields preserved.
+    /// httpx-compat shape: `input` = bare hostname (parity with httpx),
+    /// `host` mirrors it, `url` carries the full URL, `scheme`/`port`/`path`
+    /// are broken out. `a` + `aaaa` arrays, `cname` + `tech` arrays,
+    /// `webserver` mirrors `server`, `host_ip` is the first A, `cdn_name` +
+    /// `cdn_type` accompany `cdn`. `words` replaces `word_count` (httpx
+    /// field name); `lines`, `content_type`, `time`, `timestamp`, `method`,
+    /// `failed` are present.
     #[test]
     fn compat_shape_matches_httpx_field_names() {
         let rec = sample_enrich();
         let compat = HttpxCompatRecord::from_enrich(rec);
         let s = serde_json::to_string(&compat).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        // Subdomain → input.
+        // Loadbearing DB-bug-fix invariants:
         assert!(v.get("subdomain").is_none());
-        assert_eq!(v["input"], "https://target.com");
+        assert_eq!(v["input"], "target.com", "input must be bare hostname");
+        assert_eq!(v["host"], "target.com", "host must be bare hostname");
+        assert_eq!(v["url"], "https://target.com", "url is the full URL");
+        // URL components broken out.
+        assert_eq!(v["scheme"], "https");
+        assert_eq!(v["port"], "443");
+        assert_eq!(v["path"], "/");
+        assert_eq!(v["method"], "GET");
         // ip → a / aaaa arrays.
         assert!(v.get("ip").is_none());
         assert_eq!(v["a"], serde_json::json!(["1.2.3.4", "1.2.3.5"]));
@@ -981,21 +1146,77 @@ mod tests {
         assert_eq!(v["webserver"], "nginx");
         // host_ip = first A.
         assert_eq!(v["host_ip"], "1.2.3.4");
-        // Other fields preserved.
+        // CDN trio.
+        assert_eq!(v["cdn"], "cloudflare");
+        assert_eq!(v["cdn_name"], "cloudflare");
+        assert_eq!(v["cdn_type"], "cdn");
+        // Response stats.
         assert_eq!(v["status_code"], 200);
         assert_eq!(v["content_length"], 1234);
-        assert_eq!(v["word_count"], 56);
+        assert_eq!(v["content_type"], "text/html");
+        // word_count → "words" rename.
+        assert_eq!(v["words"], 56);
+        assert!(v.get("word_count").is_none());
+        assert_eq!(v["lines"], 7);
+        // Title + final URL.
         assert_eq!(v["title"], "Example");
         assert_eq!(v["final_url"], "https://target.com/");
         assert_eq!(
             v["redirect_chain"],
             serde_json::json!(["https://target.com"])
         );
-        assert_eq!(v["cdn"], "cloudflare");
+        // Probe-status fields.
+        assert_eq!(v["time"], "100ms");
+        assert_eq!(v["failed"], false);
+        assert!(v["timestamp"].as_str().unwrap().contains("T"));
+        // Embedded metadata.
         assert_eq!(v["via_proxy"], true);
         assert_eq!(v["domain"], "target.com");
         assert_eq!(v["scan_id"], "scan_1");
         assert_eq!(v["source_tools"], "subfinder");
+    }
+
+    /// `cdn_type_for` maps the four provider names httpxer recognises onto
+    /// the `cdn` / `cloud` categories ProjectDiscovery's cdncheck uses.
+    #[test]
+    fn cdn_type_categories_match_httpx() {
+        assert_eq!(cdn_type_for("cloudflare"), "cdn");
+        assert_eq!(cdn_type_for("cloudfront"), "cdn");
+        assert_eq!(cdn_type_for("fastly"), "cdn");
+        assert_eq!(cdn_type_for("aws"), "cloud");
+        assert_eq!(cdn_type_for("google"), "cloud");
+        assert_eq!(cdn_type_for(""), "");
+        assert_eq!(cdn_type_for("unknown"), "");
+    }
+
+    /// `failed:true` records carry an empty `time` string but the field
+    /// must still be present (httpx parity — `failed` and `time` are
+    /// always emitted).
+    #[test]
+    fn compat_shape_marks_failed_records() {
+        let mut rec = sample_enrich();
+        rec.status_code = None;
+        rec.time = None;
+        rec.error = Some("dns: no records".into());
+        let compat = HttpxCompatRecord::from_enrich(rec);
+        let s = serde_json::to_string(&compat).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["failed"], true);
+        assert_eq!(v["time"], "");
+        assert_eq!(v["error"], "dns: no records");
+    }
+
+    /// extract_host must strip the path, the query, AND the fragment so
+    /// `https://foo.com?x=1` resolves DNS as `foo.com`. Regression for the
+    /// `'?'`/`'#'` cases that the original `.find('/')` missed.
+    #[test]
+    fn extract_host_strips_path_query_fragment() {
+        assert_eq!(extract_host("https://foo.com/bar"), "foo.com");
+        assert_eq!(extract_host("http://foo.com?x=1"), "foo.com");
+        assert_eq!(extract_host("https://foo.com#section"), "foo.com");
+        assert_eq!(extract_host("https://foo.com?x=1#section"), "foo.com");
+        assert_eq!(extract_host("https://foo.com:8080/bar"), "foo.com:8080");
+        assert_eq!(extract_host("foo.com"), "foo.com");
     }
 
     /// host_ip falls back to the first AAAA when no A record exists.

@@ -120,30 +120,37 @@ impl TechEngine {
             ] {
                 if let Some(obj) = def.get(field).and_then(|x| x.as_object()) {
                     for (k, p) in obj {
-                        let raw = match p {
-                            Value::String(s) => s.clone(),
-                            // Some entries are nested arrays {header: ["pat1","pat2"]} — flatten.
+                        // Wappalyzer headers/cookies/meta entries can be a
+                        // single pattern OR an array of independent
+                        // alternatives. Compile EACH array entry so the
+                        // alternatives past [0] aren't silently dropped.
+                        let raws: Vec<String> = match p {
+                            Value::String(s) => vec![s.clone()],
                             Value::Array(arr) => arr
                                 .iter()
-                                .filter_map(|x| x.as_str())
-                                .next()
-                                .unwrap_or("")
-                                .to_string(),
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect(),
                             _ => continue,
                         };
-                        match compile_pattern(&raw) {
-                            Some(c) => {
-                                let key = match target {
-                                    PatternTarget::Cookies => k.clone(),
-                                    _ => k.to_ascii_lowercase(),
-                                };
-                                match target {
-                                    PatternTarget::Headers => fp.headers.push((key, c)),
-                                    PatternTarget::Cookies => fp.cookies.push((key, c)),
-                                    PatternTarget::Meta => fp.meta.push((key, c)),
+                        for raw in raws {
+                            match compile_pattern(&raw) {
+                                Some(c) => {
+                                    let key = match target {
+                                        PatternTarget::Cookies => k.clone(),
+                                        _ => k.to_ascii_lowercase(),
+                                    };
+                                    match target {
+                                        PatternTarget::Headers => {
+                                            fp.headers.push((key, c))
+                                        }
+                                        PatternTarget::Cookies => {
+                                            fp.cookies.push((key, c))
+                                        }
+                                        PatternTarget::Meta => fp.meta.push((key, c)),
+                                    }
                                 }
+                                None => skipped_patterns += 1,
                             }
-                            None => skipped_patterns += 1,
                         }
                     }
                 }
@@ -374,6 +381,48 @@ enum PatternTarget {
     Headers,
     Cookies,
     Meta,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: header patterns supplied as a JSON array used to drop
+    /// every entry past `[0]`. Build a minimal fingerprint set with two
+    /// array-form alternatives and confirm BOTH are compiled and matchable.
+    #[test]
+    fn array_form_header_patterns_compile_every_entry() {
+        let json = r#"{
+            "apps": {
+                "DemoApp": {
+                    "headers": {
+                        "X-Demo": ["foo", "bar(?:/([\\d.]+))?\\;version:\\1"]
+                    }
+                }
+            }
+        }"#;
+        let engine = TechEngine::from_json(json).expect("engine builds");
+
+        // First alternative — bare `foo` matches.
+        let hits_foo =
+            engine.detect(&[("x-demo".into(), "foo".into())], &[], "");
+        assert!(
+            hits_foo.iter().any(|(n, _)| n == "DemoApp"),
+            "expected DemoApp to match the FIRST array pattern"
+        );
+
+        // Second alternative — the version-capturing one was previously
+        // dropped silently. It must now match AND extract the version.
+        let hits_bar =
+            engine.detect(&[("x-demo".into(), "bar/2.5".into())], &[], "");
+        let bar_hit = hits_bar.iter().find(|(n, _)| n == "DemoApp");
+        assert!(bar_hit.is_some(), "expected DemoApp to match the SECOND array pattern");
+        assert_eq!(
+            bar_hit.unwrap().1.as_deref(),
+            Some("2.5"),
+            "version capture from the second array pattern was lost"
+        );
+    }
 }
 
 /// Render matches as httpx-compatible `"Name:Version, Name, Name:Version"`.

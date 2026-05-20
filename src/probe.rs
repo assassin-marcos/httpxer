@@ -24,7 +24,7 @@
 //!    rotate egress IPs at a higher layer if they hit those.
 
 use once_cell::sync::OnceCell;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wreq::Client;
 use wreq_util::Emulation;
 
@@ -45,11 +45,61 @@ pub struct HttpProbeResult {
     pub via_https: bool,
     pub content_length: Option<u64>,
     pub word_count: usize,
+    /// Body line count (httpx parity — emitted as `lines`). Counts
+    /// `\n`-separated lines via `str::lines()`.
+    pub line_count: usize,
     pub server: Option<String>,
     pub location: Option<String>,
+    /// Response Content-Type header value (e.g. "text/html; charset=utf-8").
+    /// None when the response had no such header.
+    pub content_type: Option<String>,
     pub headers: Vec<(String, String)>,
     pub cookies: Vec<(String, String)>,
     pub body: String,
+    /// Wall-clock time from the moment `http_probe_once` started its first
+    /// `send()` to the moment the final response (terminal hop) finished
+    /// streaming. Includes every redirect-chase hop. Maps to httpx's
+    /// `time` field via `format_elapsed_go`.
+    pub elapsed: Duration,
+}
+
+/// Format a `Duration` the way Go's `time.Duration.String()` does — picks
+/// the largest reasonable unit (ns / µs / ms / s), prints with up to 9
+/// fractional digits, trims trailing zeros. Matches httpx's `time` field
+/// (e.g. "662.326051ms", "1.5s", "300µs").
+pub fn format_elapsed_go(d: Duration) -> String {
+    let nanos = d.as_nanos() as u64;
+    if nanos == 0 {
+        return "0s".to_string();
+    }
+    if nanos >= 1_000_000_000 {
+        let int_part = nanos / 1_000_000_000;
+        let frac = nanos % 1_000_000_000;
+        if frac == 0 {
+            return format!("{}s", int_part);
+        }
+        let s = format!("{}.{:09}", int_part, frac);
+        return format!("{}s", s.trim_end_matches('0'));
+    }
+    if nanos >= 1_000_000 {
+        let int_part = nanos / 1_000_000;
+        let frac = nanos % 1_000_000;
+        if frac == 0 {
+            return format!("{}ms", int_part);
+        }
+        let s = format!("{}.{:06}", int_part, frac);
+        return format!("{}ms", s.trim_end_matches('0'));
+    }
+    if nanos >= 1_000 {
+        let int_part = nanos / 1_000;
+        let frac = nanos % 1_000;
+        if frac == 0 {
+            return format!("{}µs", int_part);
+        }
+        let s = format!("{}.{:03}", int_part, frac);
+        return format!("{}µs", s.trim_end_matches('0'));
+    }
+    format!("{}ns", nanos)
 }
 
 /// Case-insensitive `<title>` extractor, whitespace-collapsed, ≤160 chars.
@@ -240,23 +290,33 @@ pub fn init_pool(
     Ok(())
 }
 
-/// Public accessor for the impersonation pool — the fuzz orchestrator needs
-/// direct access to the slot (client + accept_lang + tag) because it issues
-/// raw single-shot GETs with `redirect::Policy::none()` rather than going
-/// through `http_probe_once`'s manual hop-chasing loop.
-///
-/// `init_pool` MUST have been called before this — that's already done at the
-/// top of `main()` for both enrich and fuzz mode.
-pub fn pick_pool_slot() -> Option<&'static PoolSlot> {
-    pick_slot()
-}
-
 fn pick_slot() -> Option<&'static PoolSlot> {
     let pool = POOL.get()?;
     if pool.is_empty() {
         return None;
     }
     Some(&pool[fastrand::usize(0..pool.len())])
+}
+
+/// Deterministic per-host slot picker. Hashes `host_key` to one fixed slot in
+/// the pool, so every probe against the same host uses the same TLS/UA
+/// profile. Fuzz mode's wildcard fingerprint (CL, content-type, snippet_md5)
+/// is computed at pre-flight; if the matching probes used a different
+/// profile, a UA-varying server (mobile-vs-desktop layouts) would produce a
+/// different snippet and the wildcard would silently fail to suppress.
+///
+/// Across distinct hosts the hash still spreads load over the pool, so a
+/// multi-target scan keeps the per-host JA4 variety the enrich path gets.
+pub fn pick_pool_slot_for(host_key: &str) -> Option<&'static PoolSlot> {
+    let pool = POOL.get()?;
+    if pool.is_empty() {
+        return None;
+    }
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    host_key.hash(&mut hasher);
+    Some(&pool[(hasher.finish() as usize) % pool.len()])
 }
 
 /// One probe attempt — up to `max_redirects` hops, 2 MiB streamed body cap.
@@ -277,6 +337,12 @@ pub async fn http_probe_once(
     let mut current = url.to_string();
     let mut chain: Vec<String> = Vec::new();
     let mut last: Option<Hop> = None;
+    // `last_url` shadows `current` at every successful hop, so a mid-chain
+    // network failure (where `current` has already been advanced to the
+    // next-hop URL we couldn't fetch) doesn't leak that unreachable URL into
+    // the record's `final_url`. Always set together with `last`.
+    let mut last_url: Option<String> = None;
+    let probe_start = Instant::now();
     // The loop walks the start URL + up to max_redirects redirect hops.
     let last_hop_inclusive = max_redirects;
 
@@ -321,6 +387,11 @@ pub async fn http_probe_once(
             .get("server")
             .and_then(|v| v.to_str().ok())
             .map(String::from);
+        let content_type: Option<String> = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
 
         // Capture every header for tech-detect. Multi-value Set-Cookie is
         // split into individual (name, value) cookie pairs.
@@ -360,6 +431,7 @@ pub async fn http_probe_once(
         let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
         let title = extract_title(&body_str);
         let word_count = body_str.split_whitespace().count();
+        let line_count = body_str.lines().count();
 
         // Wire Content-Length wins; else body length when not capped; else None.
         let content_length: Option<u64> = header_cl.or(if body_capped {
@@ -376,12 +448,15 @@ pub async fn http_probe_once(
             title,
             content_length,
             word_count,
+            line_count,
             server,
             location: location.clone(),
+            content_type,
             headers: headers_out,
             cookies: cookies_out,
             body: body_str,
         });
+        last_url = Some(current.clone());
 
         let is_redirect = (300..400).contains(&status);
         if !follow || !is_redirect {
@@ -398,10 +473,13 @@ pub async fn http_probe_once(
     }
 
     let h = last?;
+    // `last_url` is always `Some` when `last` is — they're set together. The
+    // unwrap fallback to `current` is defensive only.
+    let last_hop_url = last_url.unwrap_or_else(|| current.clone());
     let final_url = if chain.is_empty() {
         None
     } else {
-        Some(current.clone())
+        Some(last_hop_url.clone())
     };
     Some(HttpProbeResult {
         status_code: h.status,
@@ -409,14 +487,17 @@ pub async fn http_probe_once(
         title: h.title,
         final_url,
         chain,
-        via_https: started_https || current.starts_with("https://"),
+        via_https: started_https || last_hop_url.starts_with("https://"),
         content_length: h.content_length,
         word_count: h.word_count,
+        line_count: h.line_count,
         server: h.server,
         location: h.location,
+        content_type: h.content_type,
         headers: h.headers,
         cookies: h.cookies,
         body: h.body,
+        elapsed: probe_start.elapsed(),
     })
 }
 
@@ -426,8 +507,10 @@ struct Hop {
     title: Option<String>,
     content_length: Option<u64>,
     word_count: usize,
+    line_count: usize,
     server: Option<String>,
     location: Option<String>,
+    content_type: Option<String>,
     headers: Vec<(String, String)>,
     cookies: Vec<(String, String)>,
     body: String,
@@ -448,13 +531,13 @@ pub async fn http_probe_with_retry(
         return Some(r);
     }
     // Scheme flip is useful on non-standard ports only — :80 / :443 rarely
-    // cross-speak in practice.
+    // cross-speak in practice. Use the real URL parser so paths that
+    // happen to contain `:` (e.g. `/a:80/b`) aren't mistaken for the port.
     let is_http = url.starts_with("http://");
     let is_https = url.starts_with("https://");
-    let non_standard_port = url
-        .rsplit_once(':')
-        .and_then(|(_, rest)| rest.split('/').next())
-        .and_then(|p| p.parse::<u16>().ok())
+    let non_standard_port = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.port_or_known_default())
         .map(|p| !matches!(p, 80 | 443))
         .unwrap_or(false);
     if !non_standard_port {
@@ -468,6 +551,70 @@ pub async fn http_probe_with_retry(
         return None;
     };
     http_probe_once(&alt, follow, max_redirects).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_redirect_url_absolute() {
+        assert_eq!(
+            resolve_redirect_url("https://a.com/x", "https://b.com/y"),
+            "https://b.com/y"
+        );
+    }
+
+    #[test]
+    fn resolve_redirect_url_root_relative() {
+        assert_eq!(
+            resolve_redirect_url("https://a.com/x/y", "/z"),
+            "https://a.com/z"
+        );
+    }
+
+    #[test]
+    fn resolve_redirect_url_relative() {
+        assert_eq!(
+            resolve_redirect_url("https://a.com/x/y", "z"),
+            "https://a.com/x/z"
+        );
+        assert_eq!(resolve_redirect_url("https://a.com", "z"), "https://a.com/z");
+    }
+
+    #[test]
+    fn format_elapsed_go_picks_correct_unit() {
+        use std::time::Duration;
+        assert_eq!(format_elapsed_go(Duration::ZERO), "0s");
+        assert_eq!(format_elapsed_go(Duration::from_nanos(500)), "500ns");
+        assert_eq!(format_elapsed_go(Duration::from_micros(300)), "300µs");
+        assert_eq!(format_elapsed_go(Duration::from_micros(1500)), "1.5ms");
+        assert_eq!(
+            format_elapsed_go(Duration::from_nanos(662_326_051)),
+            "662.326051ms",
+            "Go-style ms with µs precision"
+        );
+        assert_eq!(format_elapsed_go(Duration::from_secs(1)), "1s");
+        assert_eq!(
+            format_elapsed_go(Duration::from_nanos(1_500_000_000)),
+            "1.5s"
+        );
+        assert_eq!(
+            format_elapsed_go(Duration::from_nanos(1_001_000_000)),
+            "1.001s"
+        );
+    }
+
+    #[test]
+    fn extract_title_basic() {
+        assert_eq!(extract_title("<title>Hi</title>"), Some("Hi".to_string()));
+        assert_eq!(
+            extract_title("<TITLE>  multi  word  </TITLE>"),
+            Some("multi word".to_string())
+        );
+        assert_eq!(extract_title("<title></title>"), None);
+        assert_eq!(extract_title("no title here"), None);
+    }
 }
 
 /// Bare-hostname input: try https:// first, fall back to http://. Matches

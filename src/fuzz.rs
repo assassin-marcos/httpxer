@@ -29,6 +29,7 @@ use md5::{Digest, Md5};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
@@ -54,6 +55,11 @@ const TITLE_SCAN_CAP: usize = 64 * 1024;
 /// time so the output schema's `prober` field doesn't require an env lookup
 /// on every record.
 const PROBER_TAG: &str = concat!("httpxer/", env!("CARGO_PKG_VERSION"));
+
+/// One-shot guard for the JSONL writer error log — we surface the first
+/// `writeln!` failure to stderr so a disk-full scenario doesn't silently
+/// eat records, but stay quiet thereafter so the log isn't drowned.
+static WRITE_ERR_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// JSONL record emitted by fuzz mode. Field names + order match
 /// retroh4ck-prober v0.1.0 output so existing downstream parsers continue
@@ -319,6 +325,11 @@ struct ParsedResp {
 }
 
 /// Per-host rate limiter — wraps `governor`. Off when `rps == 0.0`.
+///
+/// Supports fractional rps (e.g. `--rate-limit 0.1` = one request every 10s)
+/// via `Quota::with_period`. The previous integer-rounded path silently
+/// promoted any 0 < rps < 0.5 to disabled and 0.5 ≤ rps < 1.5 to exactly
+/// 1 rps, which surprised users with sub-1 limits.
 mod ratelimit {
     use governor::{
         clock::DefaultClock,
@@ -328,47 +339,48 @@ mod ratelimit {
     use std::collections::HashMap;
     use std::num::NonZeroU32;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Mutex as TMutex;
 
     type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
     pub struct HostRateLimiter {
-        rps: u32,
+        quota: Option<Quota>,
         map: TMutex<HashMap<String, Arc<Limiter>>>,
     }
 
     impl HostRateLimiter {
         pub fn new(rps_f64: f64) -> Self {
-            // Round to nearest u32; clamp to a sane upper bound. 0.0 → 0
-            // → disabled.
-            let rps = if rps_f64 <= 0.0 {
-                0
+            let quota = if rps_f64 <= 0.0 {
+                None
+            } else if rps_f64 >= 1.0 {
+                let n = rps_f64.round().min(100_000.0) as u32;
+                NonZeroU32::new(n).map(Quota::per_second)
             } else {
-                rps_f64.round().clamp(1.0, 100_000.0) as u32
+                // Fractional rps — one token every (1/rps) seconds. Cap the
+                // period at 1 h so 0.0001-style inputs don't construct a
+                // multi-day quota by accident.
+                let period_secs = (1.0_f64 / rps_f64).min(3600.0);
+                Quota::with_period(Duration::from_secs_f64(period_secs))
             };
             Self {
-                rps,
+                quota,
                 map: TMutex::new(HashMap::new()),
             }
         }
 
         pub fn enabled(&self) -> bool {
-            self.rps > 0
+            self.quota.is_some()
         }
 
         pub async fn acquire(&self, host: &str) {
-            if !self.enabled() {
-                return;
-            }
+            let Some(quota) = self.quota else { return };
             let limiter = {
                 let mut map = self.map.lock().await;
                 if let Some(l) = map.get(host) {
                     l.clone()
                 } else {
-                    let q = Quota::per_second(
-                        NonZeroU32::new(self.rps).unwrap_or(NonZeroU32::new(1).unwrap()),
-                    );
-                    let l = Arc::new(RateLimiter::direct(q));
+                    let l = Arc::new(RateLimiter::direct(quota));
                     map.insert(host.to_string(), l.clone());
                     l
                 }
@@ -385,9 +397,15 @@ mod ratelimit {
 /// connection.
 async fn dispatch_one(
     url: &str,
+    host_key: &str,
     body_preview_bytes: usize,
 ) -> Result<(ParsedResp, &'static str, String), String> {
-    let slot = probe::pick_pool_slot().ok_or_else(|| "probe pool not initialised".to_string())?;
+    // Pin one TLS profile per host so the wildcard fingerprint computed at
+    // pre-flight (snippet_md5 etc.) matches what the actual fuzz probes
+    // against the same host see — random per-request rotation made the
+    // signatures diverge on UA-varying servers.
+    let slot = probe::pick_pool_slot_for(host_key)
+        .ok_or_else(|| "probe pool not initialised".to_string())?;
     let resp = slot
         .client
         .get(url)
@@ -411,7 +429,6 @@ async fn dispatch_one(
     let mut header_cl: Option<i64> = None;
     let mut location = String::new();
     let mut server = String::new();
-    let mut ua_echo = String::new(); // not actually echoed — we set it below
     for (k, v) in resp.headers().iter() {
         let lk = k.as_str().to_ascii_lowercase();
         let vs = match v.to_str() {
@@ -430,7 +447,6 @@ async fn dispatch_one(
             _ => {}
         }
     }
-    let _ = &mut ua_echo; // silence unused-but-set warning if the compiler complains
 
     // Body — streamed, capped at BODY_READ_CAP.
     let mut body_bytes: Vec<u8> = Vec::with_capacity(16 * 1024);
@@ -462,6 +478,7 @@ async fn dispatch_one(
     let preview_raw = String::from_utf8_lossy(&body_bytes[..preview_end]).into_owned();
     let body_preview_for_output = html_escape_body_preview(&preview_raw);
 
+    let ua = ua_string(slot.tag);
     Ok((
         ParsedResp {
             status,
@@ -474,7 +491,7 @@ async fn dispatch_one(
             snippet_md5,
         },
         slot.tag,
-        ua_string(slot.tag),
+        ua,
     ))
 }
 
@@ -482,7 +499,7 @@ async fn dispatch_one(
 /// wildcard pre-flight probe.
 async fn wildcard_preflight(host_input: &str, body_preview_bytes: usize) -> Option<WildcardSig> {
     let url = format!("{}{}", host_input, random_hex_path(32));
-    let (parsed, _tag, _ua) = match dispatch_one(&url, body_preview_bytes).await {
+    let (parsed, _tag, _ua) = match dispatch_one(&url, host_input, body_preview_bytes).await {
         Ok(v) => v,
         Err(_) => return None,
     };
@@ -651,7 +668,12 @@ pub async fn run(
                     "  [wildcard] {} cl={} md5={}",
                     host, sig.content_length, sig.snippet_md5
                 );
-                wildcard_map.insert(host, sig);
+                // Key by the FULL `host_to_input` form (scheme + host + any
+                // path prefix), not bare host. Two inputs that share a
+                // hostname but differ in path-prefix (`https://x/api` vs
+                // `https://x/admin`) used to collide and the second wildcard
+                // probe silently overwrote the first.
+                wildcard_map.insert(input, sig);
             }
         }
         if wildcard_map.is_empty() {
@@ -755,7 +777,7 @@ async fn run_probe(
 
     while attempts < max_attempts {
         attempts += 1;
-        match dispatch_one(&url, cfg.body_preview_bytes).await {
+        match dispatch_one(&url, &item.host_input, cfg.body_preview_bytes).await {
             Ok((parsed, tag, ua)) => {
                 parsed_opt = Some(parsed);
                 tls_tag = tag;
@@ -778,11 +800,12 @@ async fn run_probe(
 
     match parsed_opt {
         Some(parsed) => {
-            // Wildcard check before status filter.
+            // Wildcard check before status filter. Key matches the
+            // pre-flight insertion above: full host_input, not bare host.
             let mut is_wildcard = false;
             if !matches!(wildcard_policy, WildcardPolicy::Off)
                 && wildcards.matches(
-                    &item.host,
+                    &item.host_input,
                     parsed.content_length,
                     &parsed.content_type,
                     &parsed.snippet_md5,
@@ -880,7 +903,14 @@ async fn write_record(out_file: &Arc<Mutex<std::fs::File>>, rec: &FuzzRecord) {
         Err(_) => return,
     };
     let mut f = out_file.lock().await;
-    let _ = writeln!(*f, "{}", line);
+    if let Err(e) = writeln!(*f, "{}", line) {
+        if !WRITE_ERR_LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[!] fuzz: output write failed: {} (further write errors will be silent)",
+                e
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1001,6 +1031,20 @@ mod tests {
         assert!(s.contains("\"server\":\"nginx\""));
         assert!(s.contains("\"tls_impersonation\":\"chrome-131\""));
         assert!(s.contains("\"prober\":\"httpxer/"));
+    }
+
+    /// Regression: `--rate-limit 0.1` used to round to 0, then clamp to 1
+    /// rps. The new fractional-rps path must report enabled() = true so the
+    /// user's intent is honored.
+    #[test]
+    fn host_rate_limiter_supports_fractional_rps() {
+        use super::ratelimit::HostRateLimiter;
+        assert!(!HostRateLimiter::new(0.0).enabled(), "0.0 = disabled");
+        assert!(!HostRateLimiter::new(-1.0).enabled(), "negative = disabled");
+        assert!(HostRateLimiter::new(0.1).enabled(), "0.1 rps must enable");
+        assert!(HostRateLimiter::new(0.5).enabled(), "0.5 rps must enable");
+        assert!(HostRateLimiter::new(1.0).enabled(), "1 rps must enable");
+        assert!(HostRateLimiter::new(50.0).enabled(), "50 rps must enable");
     }
 
     #[test]

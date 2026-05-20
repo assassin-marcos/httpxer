@@ -73,6 +73,36 @@ impl WildcardMap {
 mod tests {
     use super::*;
 
+    /// Regression: keying by bare hostname caused two inputs that share a
+    /// host but differ in path prefix to collide — the second wildcard
+    /// preflight silently overwrote the first. Fuzz now keys by the full
+    /// host_to_input string, so the two coexist.
+    #[test]
+    fn map_keys_dont_collide_across_path_prefixes() {
+        let mut m = WildcardMap::new();
+        m.insert(
+            "https://x.com/api".into(),
+            WildcardSig {
+                content_length: 100,
+                content_type: "text/html".into(),
+                snippet_md5: "aaa".into(),
+            },
+        );
+        m.insert(
+            "https://x.com/admin".into(),
+            WildcardSig {
+                content_length: 200,
+                content_type: "text/html".into(),
+                snippet_md5: "bbb".into(),
+            },
+        );
+        assert_eq!(m.len(), 2, "different path-prefixes must stay distinct");
+        assert!(m.matches("https://x.com/api", 100, "text/html", "aaa"));
+        assert!(m.matches("https://x.com/admin", 200, "text/html", "bbb"));
+        // No cross-contamination.
+        assert!(!m.matches("https://x.com/api", 200, "text/html", "bbb"));
+    }
+
     #[test]
     fn match_only_when_all_three_align() {
         let mut m = WildcardMap::new();

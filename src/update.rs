@@ -174,10 +174,17 @@ pub fn fetch_latest_tag() -> anyhow::Result<Option<String>> {
     if let Some(arr) = tags.as_array() {
         for t in arr {
             if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
+                // Skip pre-release tags (e.g. `v1.2.3-rc1`, `v1.2.3-beta.2`).
+                // A dot-separated suffix like `-rc.1` would otherwise expand
+                // into an extra numeric component and rank ABOVE the
+                // matching release, so `-c` reported pre-releases as the
+                // newest installable version.
+                if name.contains('-') {
+                    continue;
+                }
                 let stripped = name.trim_start_matches('v').to_string();
                 let parts: Vec<u32> = stripped
                     .split('.')
-                    .map(|p| p.split('-').next().unwrap_or(""))
                     .filter_map(|p| p.parse::<u32>().ok())
                     .collect();
                 if parts.is_empty() {

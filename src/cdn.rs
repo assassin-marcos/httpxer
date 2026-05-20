@@ -99,29 +99,43 @@ async fn fetch_cloudflare() -> Vec<(IpNetwork, String)> {
     out
 }
 
-async fn fetch_cloudfront() -> Vec<(IpNetwork, String)> {
+/// Fetch the AWS IP-ranges feed ONCE and split it into:
+///   - `cloudfront` prefixes (httpx categorizes these as `cdn`)
+///   - all other AWS prefixes (httpx categorizes these as `cloud`/`aws`)
+///
+/// The split lets `load_cdn_table` push CLOUDFRONT entries FIRST in the
+/// linear-scan vector so a CLOUDFRONT-specific lookup beats the
+/// generic-AWS catch-all when prefixes overlap. Matches httpx's
+/// behaviour against e.g. `3.78.154.254` (EC2 EU-Central — non-CloudFront
+/// AWS IP that previously showed `cdn:""` in httpxer output but
+/// `cdn_name:aws cdn_type:cloud` in httpx).
+async fn fetch_aws_all() -> (Vec<(IpNetwork, String)>, Vec<(IpNetwork, String)>) {
     let Some(body) = fetch_text("https://ip-ranges.amazonaws.com/ip-ranges.json").await else {
-        return vec![];
+        return (vec![], vec![]);
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
-        return vec![];
+        return (vec![], vec![]);
     };
-    let mut out = Vec::new();
+    let mut cloudfront = Vec::new();
+    let mut aws = Vec::new();
     for (arr_key, cidr_key) in &[("prefixes", "ip_prefix"), ("ipv6_prefixes", "ipv6_prefix")] {
         if let Some(arr) = v.get(*arr_key).and_then(|p| p.as_array()) {
             for p in arr {
-                if p.get("service").and_then(|s| s.as_str()) != Some("CLOUDFRONT") {
-                    continue;
-                }
+                let is_cf =
+                    p.get("service").and_then(|s| s.as_str()) == Some("CLOUDFRONT");
                 if let Some(c) = p.get(*cidr_key).and_then(|s| s.as_str()) {
                     if let Ok(n) = c.parse::<IpNetwork>() {
-                        out.push((n, "cloudfront".to_string()));
+                        if is_cf {
+                            cloudfront.push((n, "cloudfront".to_string()));
+                        } else {
+                            aws.push((n, "aws".to_string()));
+                        }
                     }
                 }
             }
         }
     }
-    out
+    (cloudfront, aws)
 }
 
 async fn fetch_fastly() -> Vec<(IpNetwork, String)> {
@@ -176,17 +190,23 @@ pub async fn load_cdn_table(skip_fetch: bool) -> CdnTable {
     if skip_fetch {
         return CdnTable::default();
     }
-    let (cf, cfr, fa, gc) = tokio::join!(
+    let (cf, (cfr, aws), fa, gc) = tokio::join!(
         fetch_cloudflare(),
-        fetch_cloudfront(),
+        fetch_aws_all(),
         fetch_fastly(),
         fetch_google_cloud(),
     );
-    let mut entries = Vec::with_capacity(cf.len() + cfr.len() + fa.len() + gc.len());
+    let mut entries =
+        Vec::with_capacity(cf.len() + cfr.len() + aws.len() + fa.len() + gc.len());
+    // Order matters — `lookup()` returns the FIRST matching prefix. Push
+    // narrower / higher-priority providers (CDNs) before broader ones
+    // (generic AWS) so an IP that's both CLOUDFRONT and generic-AWS tags
+    // as `cloudfront`, not `aws`.
     entries.extend(cf);
     entries.extend(cfr);
     entries.extend(fa);
     entries.extend(gc);
+    entries.extend(aws);
     if entries.is_empty() {
         // All providers failed → fall back to disk cache.
         if let Ok(s) = std::fs::read_to_string(cache_path()) {
