@@ -134,9 +134,14 @@ struct Args {
     #[arg(long, help_heading = "Self-management")]
     no_update_check: bool,
 
-    /// Quiet mode (alias for --no-update-check — useful when piping)
+    /// Quiet mode (alias for --no-update-check + --no-art — useful when piping)
     #[arg(short = 'q', long, help_heading = "Self-management")]
     quiet: bool,
+
+    /// Suppress the ASCII-art startup banner (banner is always skipped when
+    /// stderr is not a TTY, so piped output is never polluted regardless)
+    #[arg(long, help_heading = "Self-management")]
+    no_art: bool,
 
     // ── httpx compatibility no-ops ───────────────────────────────────────
     // These flags are accepted with the same single-dash spelling httpx uses
@@ -326,11 +331,25 @@ async fn main() -> Result<()> {
         return update::run_uninstall(args.yes);
     }
 
-    // Auto-banner: warn on outdated install. Stderr-only so JSON output
-    // piped to a downstream tool stays clean. 24 h cache + 120 s skip
-    // means the common case is zero network at startup.
+    // Refresh the update-check cache BEFORE the banner renders, so the
+    // inline (outdated)/(latest) tag reflects the current GitHub state
+    // rather than a value from hours ago. 120 s skip-window means the
+    // common case is zero network here.
     if !args.no_update_check && !args.quiet {
         update::refresh_update_cache_best_effort().await;
+    }
+
+    // ASCII-art startup banner (TTY-only, opt-out via --no-art / --quiet).
+    let show_art = !args.quiet && !args.no_art && update::stderr_is_tty();
+    if show_art {
+        update::print_banner();
+    }
+
+    // Yellow "[!] update available" stderr alert with What's-new notes —
+    // shown in addition to the banner's inline (outdated) tag because
+    // (a) the inline tag is muted/easy to miss and (b) users who piped
+    // through `tee` or scrollback need the notes to know what changed.
+    if !args.no_update_check && !args.quiet {
         if let Some(latest) = update::cached_latest_version() {
             if update::version_is_newer(&latest, env!("CARGO_PKG_VERSION")) {
                 let notes = tokio::task::spawn_blocking({

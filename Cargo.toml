@@ -1,6 +1,6 @@
 [package]
 name = "httpxer"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Native httpx-enrichment replacement with TLS impersonation (JA3/JA4 + HTTP/2 SETTINGS) — Wappalyzer tech-detect, CDN tagging, NDJSON output. One static binary."
 license = "MIT"

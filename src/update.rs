@@ -18,11 +18,50 @@
 //! minutes after every tag.
 
 use std::fs;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 
 pub const REPO_OWNER: &str = "assassin-marcos";
 pub const REPO_NAME: &str = "httpxer";
+
+/// True when stderr is attached to a real terminal — gates the ASCII-art
+/// banner so piped invocations (`httpxer ... | jq ...`) don't get noise.
+pub fn stderr_is_tty() -> bool {
+    std::io::stderr().is_terminal()
+}
+
+/// Figlet "Standard" font of "httpxer" — renders cleanly at 80-col width,
+/// pure ASCII (no Unicode boxchars) so it survives the cmd.exe / minimal
+/// terminals users sometimes scan from.
+const BANNER_ART: &str = r"
+ _     _   _
+| |__ | |_| |_ _ ____  _____ _ __
+| '_ \| __| __| '_ \ \/ / _ \ '__|
+| | | | |_| |_| |_) >  <  __/ |
+|_| |_|\__|\__| .__/_/\_\___|_|
+              |_|                  ";
+
+/// Startup banner — cyan figlet art + bold version line with inline
+/// `(outdated → vX.Y.Z)` / `(latest)` tag pulled from the 24 h update
+/// cache (zero network hit at print-time; cache is populated separately
+/// by `refresh_update_cache_best_effort`).
+pub fn print_banner() {
+    eprintln!("\x1b[36m{}\x1b[0m", BANNER_ART);
+    let current = env!("CARGO_PKG_VERSION");
+    let tag = match cached_latest_version() {
+        Some(latest) if version_is_newer(&latest, current) => {
+            format!("  \x1b[31m(outdated → v{})\x1b[0m", latest)
+        }
+        Some(_) => "  \x1b[32m(latest)\x1b[0m".to_string(),
+        None => String::new(),
+    };
+    eprintln!(
+        "        \x1b[1mhttpxer {}\x1b[0m{}  \x1b[2m·\x1b[0m  \x1b[2mby assassin_marcos\x1b[0m  \x1b[2m·\x1b[0m  \x1b[2mgithub.com/assassin-marcos/httpxer\x1b[0m",
+        current, tag
+    );
+    eprintln!();
+}
 
 fn update_cache_path() -> Option<PathBuf> {
     #[cfg(windows)]
