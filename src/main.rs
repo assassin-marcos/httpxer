@@ -61,9 +61,18 @@ struct Args {
     #[arg(long, default_value_t = 5000)]
     timeout_ms: u64,
 
-    /// Don't follow redirects (default: follow up to 3 hops, matches httpx -fr)
+    /// Don't follow redirects (default: follow up to --max-redirects hops, matches httpx -fr)
     #[arg(long)]
     no_follow_redirects: bool,
+
+    /// Maximum redirect hops to follow when redirect-following is on.
+    /// Matches httpx's `-mr` default of 10. Multi-hop SSO flows
+    /// (corporate-managed Google → Okta SAML, etc.) commonly need 4-6 hops
+    /// before the final auth page resolves — the previous default of 3 was
+    /// stopping at the IdP-handoff page and missing the destination tech
+    /// stack (e.g. `Okta:x.y.z`, `Nginx` on okta.com).
+    #[arg(long, default_value_t = 10)]
+    max_redirects: usize,
 
     /// Concurrent DNS lookups
     #[arg(long, default_value_t = 100)]
@@ -553,6 +562,7 @@ async fn main() -> Result<()> {
         eprintln!("[+] TLS impersonation: DISABLED (--no-impersonate)");
     }
     let follow = !args.no_follow_redirects;
+    let max_redirects = args.max_redirects;
 
     // 7. Append-open output (resume-safe).
     let mut out_file = std::fs::OpenOptions::new()
@@ -640,9 +650,9 @@ async fn main() -> Result<()> {
             // wreq is async-only — no spawn_blocking. Just await directly.
             let probe_res =
                 if url_or_host.starts_with("http://") || url_or_host.starts_with("https://") {
-                    probe::http_probe_with_retry(&url_or_host, follow).await
+                    probe::http_probe_with_retry(&url_or_host, follow, max_redirects).await
                 } else {
-                    probe::probe_hostname(&url_or_host, follow).await
+                    probe::probe_hostname(&url_or_host, follow, max_redirects).await
                 };
 
             match probe_res {

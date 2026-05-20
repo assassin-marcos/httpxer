@@ -226,17 +226,28 @@ fn pick_slot() -> Option<&'static PoolSlot> {
     Some(&pool[fastrand::usize(0..pool.len())])
 }
 
-/// One probe attempt — up to 4 redirect hops, 2 MiB streamed body cap.
+/// One probe attempt — up to `max_redirects` hops, 2 MiB streamed body cap.
 /// Returns None on first-hop network failure (caller may retry).
-pub async fn http_probe_once(url: &str, follow: bool) -> Option<HttpProbeResult> {
+///
+/// `max_redirects` is the maximum number of REDIRECT hops to chase after
+/// the initial URL — total URLs probed is `1 + max_redirects` when every
+/// hop returns a 3xx. Set to 0 to mimic `--no-follow-redirects` from this
+/// path. Default at call site is 10 (matches httpx `-mr 10`).
+pub async fn http_probe_once(
+    url: &str,
+    follow: bool,
+    max_redirects: usize,
+) -> Option<HttpProbeResult> {
     let slot = pick_slot()?;
     let client = &slot.client;
     let started_https = url.starts_with("https://");
     let mut current = url.to_string();
     let mut chain: Vec<String> = Vec::new();
     let mut last: Option<Hop> = None;
+    // The loop walks the start URL + up to max_redirects redirect hops.
+    let last_hop_inclusive = max_redirects;
 
-    for hop in 0..=3 {
+    for hop in 0..=last_hop_inclusive {
         // The emulation profile already sets a matching UA, Accept-Encoding,
         // sec-ch-ua etc. — we just add Accept-Language for variety and a
         // browser-like Accept header for HTML targets (httpx-style).
@@ -391,12 +402,16 @@ struct Hop {
 
 /// Retry-once + scheme-flip wrapper. Async (no spawn_blocking needed because
 /// wreq is already async).
-pub async fn http_probe_with_retry(url: &str, follow: bool) -> Option<HttpProbeResult> {
-    if let Some(r) = http_probe_once(url, follow).await {
+pub async fn http_probe_with_retry(
+    url: &str,
+    follow: bool,
+    max_redirects: usize,
+) -> Option<HttpProbeResult> {
+    if let Some(r) = http_probe_once(url, follow, max_redirects).await {
         return Some(r);
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
-    if let Some(r) = http_probe_once(url, follow).await {
+    if let Some(r) = http_probe_once(url, follow, max_redirects).await {
         return Some(r);
     }
     // Scheme flip is useful on non-standard ports only — :80 / :443 rarely
@@ -419,16 +434,20 @@ pub async fn http_probe_with_retry(url: &str, follow: bool) -> Option<HttpProbeR
     } else {
         return None;
     };
-    http_probe_once(&alt, follow).await
+    http_probe_once(&alt, follow, max_redirects).await
 }
 
 /// Bare-hostname input: try https:// first, fall back to http://. Matches
 /// httpx's default behaviour for scheme-less list entries.
-pub async fn probe_hostname(host: &str, follow: bool) -> Option<HttpProbeResult> {
+pub async fn probe_hostname(
+    host: &str,
+    follow: bool,
+    max_redirects: usize,
+) -> Option<HttpProbeResult> {
     let https = format!("https://{}", host);
-    if let Some(r) = http_probe_with_retry(&https, follow).await {
+    if let Some(r) = http_probe_with_retry(&https, follow, max_redirects).await {
         return Some(r);
     }
     let http = format!("http://{}", host);
-    http_probe_with_retry(&http, follow).await
+    http_probe_with_retry(&http, follow, max_redirects).await
 }
