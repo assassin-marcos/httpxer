@@ -1,6 +1,6 @@
 [package]
 name = "httpxer"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "Native httpx-replacement: enrichment + path-fuzz with browser-grade TLS impersonation, wildcard auto-suppress, Wappalyzer tech-detect. One static binary."
 license = "MIT"
@@ -18,7 +18,15 @@ path = "src/main.rs"
 # regardless of User-Agent. BoringSSL is the same TLS stack Chrome uses, so
 # the ClientHello bytes are byte-identical to a real browser of the chosen
 # version. Required for any kind of usable bug-bounty recon in 2026.
-wreq      = { version = "5.3", features = ["json", "cookies", "socks"] }
+# Compression features (gzip/brotli/deflate/zstd) are mandatory: real-browser
+# Emulation profiles advertise `Accept-Encoding: gzip, deflate, br, zstd` in
+# the request headers. Without the matching client-side decoders, the server
+# responds with a compressed body and we hand back raw bytes — which look like
+# binary garbage to downstream parsers and trip pattern-loose validators by
+# accident (the JU3= / H$2= byte sequences inside gzip output match e.g. the
+# `.env`-file regex `^[A-Za-z_][A-Za-z0-9_]*=`). v0.3.4 fix.
+wreq      = { version = "5.3", features = ["json", "cookies", "socks",
+                                             "gzip", "brotli", "deflate", "zstd"] }
 wreq-util = { version = "2"  }    # the 100+ browser emulation profiles
 
 # Async runtime — wreq is async-only (no blocking module), so the

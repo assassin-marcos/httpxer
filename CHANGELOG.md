@@ -2,6 +2,15 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.3.4] — 2026-05-20
+
+### Fixed
+- **HTTP response decompression now enabled.** Added `gzip`, `brotli`, `deflate`, `zstd` features to the `wreq` dependency. Real-browser TLS impersonation profiles advertise `Accept-Encoding: gzip, deflate, br, zstd` in request headers (matching real Chrome/Firefox), so servers respond with compressed bodies. Without the matching client-side decoders the body was returned as raw bytes — which looked like binary garbage to downstream parsers and tripped pattern-loose regex validators by accident (the `JU3=` / `H$2=` byte sequences inside gzip output match e.g. `.env`-file detection regex `^[A-Za-z_][A-Za-z0-9_]*=`). Smoke probe against a gzip-serving target now returns clean readable HTML (0 non-printable chars in first 200 bytes, was 100% binary garbage before).
+
+### Changed
+- Version: 0.3.3 → **0.3.4**
+- Binary size: +~200 KB for the four decompression decoders (net 16 MB → 16.2 MB on Linux x86_64)
+
 ## [0.3.3] — 2026-05-20
 
 ### Added
