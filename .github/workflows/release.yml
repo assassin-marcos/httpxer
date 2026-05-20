@@ -1,0 +1,144 @@
+# Build cross-platform httpxer release binaries on every `vX.Y.Z` tag push
+# and attach them to the matching GitHub Release.
+#
+# Why each platform needs special setup:
+#   httpxer depends on `wreq` → `boring-sys2` → BoringSSL (Chrome's TLS stack,
+#   for JA3/JA4 impersonation). boring-sys2 uses `bindgen` to generate the
+#   Rust→C FFI, which requires libclang at build time. Each OS gets it
+#   differently:
+#     Linux:   apt-get libclang-dev      (one package)
+#     macOS:   Apple Clang in Xcode CLT  (pre-installed on runners)
+#     Windows: LLVM via KyleMayes/install-llvm-action
+#   Windows also needs NASM for BoringSSL's assembly-optimised crypto kernels.
+#
+# The resulting binaries are statically linked — end users do NOT need
+# libclang / LLVM / NASM at runtime, only `httpxer` itself.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    # Pinned to 22.04 so the binary links against GLIBC 2.35 — the lowest
+    # version that covers Ubuntu 22.04 LTS, Debian 12, RHEL 9, and every
+    # newer distro. `ubuntu-latest` drifts to 24.04 (GLIBC 2.39) which
+    # breaks downloads on LTS hosts that haven't rolled forward yet.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with: { key: linux-x86_64 }
+
+      - name: Install libclang for boring-sys bindgen
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+
+      - run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Package
+        run: |
+          cd target/x86_64-unknown-linux-gnu/release
+          tar czf ../../../httpxer-x86_64-unknown-linux-gnu.tar.gz httpxer
+
+      - name: Extract release notes from commit body
+        run: |
+          # Use everything after the first blank line of the HEAD commit
+          # message as the release body (matches portwave's release flow).
+          # Fallback to the tag annotation when the commit had no body.
+          git log -1 --pretty=format:'%b' HEAD > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > release_notes.md
+          fi
+          echo '--- release_notes.md ---'
+          cat release_notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: httpxer-x86_64-unknown-linux-gnu.tar.gz
+          body_path: release_notes.md
+
+  macos:
+    # macos-14 = Apple Silicon. Native aarch64 build + x86_64 cross-build
+    # from the same job. Apple Clang ships with the runner, so no extra
+    # libclang install is needed — boring-sys finds it via xcrun.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with: { key: macos-multi }
+
+      - name: Build aarch64
+        run: cargo build --release --target aarch64-apple-darwin
+      - name: Build x86_64 (cross from ARM)
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Package both
+        run: |
+          cd target/aarch64-apple-darwin/release && tar czf ../../../httpxer-aarch64-apple-darwin.tar.gz httpxer && cd -
+          cd target/x86_64-apple-darwin/release  && tar czf ../../../httpxer-x86_64-apple-darwin.tar.gz  httpxer && cd -
+          ls -la httpxer-*.tar.gz
+
+      - name: Extract release notes from commit body
+        run: |
+          git log -1 --pretty=format:'%b' HEAD > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > release_notes.md
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            httpxer-aarch64-apple-darwin.tar.gz
+            httpxer-x86_64-apple-darwin.tar.gz
+          body_path: release_notes.md
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with: { key: windows-x86_64 }
+
+      - name: Install LLVM (libclang for boring-sys bindgen)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18"
+
+      - name: Install NASM (for BoringSSL assembly kernels)
+        uses: ilammy/setup-nasm@v1
+
+      - run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/x86_64-pc-windows-msvc/release/httpxer.exe `
+                           -DestinationPath httpxer-x86_64-pc-windows-msvc.zip
+
+      - name: Extract release notes from commit body
+        shell: bash
+        run: |
+          git log -1 --pretty=format:'%b' HEAD > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > release_notes.md
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: httpxer-x86_64-pc-windows-msvc.zip
+          body_path: release_notes.md

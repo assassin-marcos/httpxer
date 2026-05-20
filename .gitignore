@@ -1,0 +1,8 @@
+/target
+*.bak
+*.bak.*
+*.swp
+.DS_Store
+.idea/
+.vscode/
+release_notes.md

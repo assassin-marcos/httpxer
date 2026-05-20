@@ -1,0 +1,58 @@
+[package]
+name = "httpxer"
+version = "0.2.0"
+edition = "2021"
+description = "Native httpx-enrichment replacement with TLS impersonation (JA3/JA4 + HTTP/2 SETTINGS) — Wappalyzer tech-detect, CDN tagging, NDJSON output. One static binary."
+license = "MIT"
+authors = ["assassin-marcos"]
+rust-version = "1.75"
+
+[[bin]]
+name = "httpxer"
+path = "src/main.rs"
+
+[dependencies]
+# wreq = reqwest fork built on BoringSSL with preconfigured browser
+# JA3/JA4/HTTP-2-SETTINGS profiles. Why we switched off reqwest+native-tls:
+# Cloudflare/Akamai/Imperva/Datadome rule-block known scanner TLS fingerprints
+# regardless of User-Agent. BoringSSL is the same TLS stack Chrome uses, so
+# the ClientHello bytes are byte-identical to a real browser of the chosen
+# version. Required for any kind of usable bug-bounty recon in 2026.
+wreq      = { version = "5.3", features = ["json", "cookies"] }
+wreq-util = { version = "2"  }    # the 100+ browser emulation profiles
+
+# Async runtime — wreq is async-only (no blocking module), so the
+# orchestration drops tokio::spawn_blocking and uses tokio::spawn directly.
+tokio   = { version = "1", features = ["full"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+
+# Pure-Rust DNS so we don't depend on the system resolver. Cloudflare upstream,
+# no /etc/hosts interference.
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "system-config"] }
+
+# CLI.
+clap = { version = "4.4", features = ["derive"] }
+
+# JSON output + Wappalyzer fingerprint parse.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Regex for tech-detect.
+regex = "1"
+
+# Once-init for shared client pool + compiled fingerprints.
+once_cell = "1"
+
+# Fast non-cryptographic RNG for per-probe profile rotation (no thread_rng setup cost).
+fastrand = "2"
+
+# CIDR matching for CDN tagging.
+ipnetwork = "0.20"
+
+anyhow = "1"
+url    = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
