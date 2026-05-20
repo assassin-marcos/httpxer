@@ -54,7 +54,7 @@ url    = "2"
 
 # ── Fuzz-mode deps (v0.3.0+) ────────────────────────────────────────────────
 # md-5: per-(host,path) snippet_md5 used by the wildcard detector to flag
-#       identical-body responses (e.g. CrowdRiff catch-all 404 pages).
+#       identical-body responses (CDN / SaaS catch-all 404 pages, etc.).
 # hex:  lowercase hex encoding for snippet_md5 (matches retroh4ck-prober v0.1.0
 #       output format so downstream parsers don't have to switch case).
 # governor: token-bucket rate limiter for the per-host `--rate-limit` knob.

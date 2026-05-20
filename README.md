@@ -81,8 +81,8 @@ All enrich-mode defaults are tuned for real recon — concurrency 250, follow-re
 Pass `-path <wordlist>` to switch from one-probe-per-host enrichment to host × path Cartesian fuzzing.
 
 ```bash
-# Basic fuzz — 5 hosts × 433 paths, wildcard auto-suppress, default match-codes
-httpxer -l hosts.txt -path wordlists/backup_paths.txt -o fuzz.jsonl
+# Basic fuzz — host × path Cartesian, wildcard auto-suppress, default match-codes
+httpxer -l hosts.txt -path paths.txt -o fuzz.jsonl
 
 # Tune concurrency, retry, status filter
 httpxer -l hosts.txt -p paths.txt -o fuzz.jsonl \
@@ -183,9 +183,11 @@ Each profile sets the exact cipher-suite ordering, TLS extensions, signature alg
 
 **Verify it works:**
 ```bash
-printf 'https://tls.peet.ws/api/all?n=%s\n' 1 2 3 4 5 6 7 8 9 10 > /tmp/c.txt
-httpxer -l /tmp/c.txt -o /tmp/o.jsonl --no-tech --with-body -t 4
-python3 -c "import json; [print(json.loads(l)['body'] and json.loads(json.loads(l)['body'])['tls']['ja4']) for l in open('/tmp/o.jsonl')]"
+# Probe a JA3/JA4 echo service multiple times; each request hits a different
+# pool slot and reports its real-browser TLS fingerprint.
+printf 'https://tls.peet.ws/api/all?n=%s\n' 1 2 3 4 5 6 7 8 9 10 > urls.txt
+httpxer -l urls.txt -o out.jsonl --no-tech --with-body -t 4
+python3 -c "import json; [print(json.loads(json.loads(l)['body'])['tls']['ja4']) for l in open('out.jsonl') if json.loads(l).get('body')]"
 ```
 With impersonation: 5+ unique JA4s, all real-browser families. With `--no-impersonate`: 1 static non-browser JA4.
 

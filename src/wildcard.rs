@@ -5,10 +5,11 @@
 //! `(content_length, content_type, snippet_md5)` and use it as a fingerprint —
 //! any subsequent fuzz hit with the SAME triple is flagged `is_wildcard:true`.
 //!
-//! Verified by the kayak.com smoke test (2026-05-20):
-//! - `rights.kayak.com` returns identical 555-byte CrowdRiff 404 HTML for
-//!   every path — without this, ffuf flags `debug.log`, `error.log`,
-//!   `errors.log`, `terraform.tfvars` as false positives.
+//! Common real-world case: a host returns an identical small HTML 404
+//! page for every path. Without per-host wildcard suppression, every
+//! fuzzer hit on that host scores as a finding even though nothing
+//! exists — debug.log, error.log, terraform.tfvars all look "200 OK"
+//! to a basic status-code filter.
 //!
 //! The map key is the bare hostname (no scheme) — that's the unit httpxer's
 //! input pipeline normalises everything to via `extract_host()`.

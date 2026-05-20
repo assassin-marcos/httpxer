@@ -27,9 +27,9 @@ All notable changes to **httpxer** are recorded here. Format loosely follows [Ke
 - Single static binary — no new runtime dependencies
 
 ### Performance / verification
-- 5 kayak.com hosts × 433 backup-paths wordlist (2165 probes total)
-  - With default `strict` wildcard suppression: **416 records emitted in 10.27 s (~211 rps)**
-  - With `--no-wildcard`: 1732 records — confirming ~76% catch-all noise reduction
+- 5-host CDN-fronted cohort × 433-path backup wordlist (2165 probes total)
+  - With default `strict` wildcard suppression: ~420 records emitted in ~10 s (~210 rps)
+  - With `--no-wildcard`: ~1730 records — confirming ~75% catch-all noise reduction
 - Schema parity vs retroh4ck-prober v0.1.0: 100% field-name match (25 / 25), zero missing, zero extra
 - Binary size: 16 MB (unchanged from v0.2.4 — new deps are small)
 
