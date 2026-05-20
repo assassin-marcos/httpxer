@@ -1,6 +1,6 @@
 [package]
 name = "httpxer"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Native httpx-replacement: enrichment + path-fuzz with browser-grade TLS impersonation, wildcard auto-suppress, Wappalyzer tech-detect. One static binary."
 license = "MIT"
@@ -18,7 +18,7 @@ path = "src/main.rs"
 # regardless of User-Agent. BoringSSL is the same TLS stack Chrome uses, so
 # the ClientHello bytes are byte-identical to a real browser of the chosen
 # version. Required for any kind of usable bug-bounty recon in 2026.
-wreq      = { version = "5.3", features = ["json", "cookies"] }
+wreq      = { version = "5.3", features = ["json", "cookies", "socks"] }
 wreq-util = { version = "2"  }    # the 100+ browser emulation profiles
 
 # Async runtime — wreq is async-only (no blocking module), so the
