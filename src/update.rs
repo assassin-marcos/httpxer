@@ -18,7 +18,7 @@
 
 use std::fs;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const REPO_OWNER: &str = "assassin-marcos";
@@ -279,44 +279,259 @@ fn install_dir_writable() -> bool {
     }
 }
 
-/// Print actionable guidance when the install path isn't writable by the
-/// running user. Same message is used for both the up-front check and the
-/// post-download fallback path, so users always see the same explanation.
-fn print_perm_help() {
-    let path = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "/usr/local/bin/httpxer".into());
+/// Find the highest-priority user-writable bin dir for auto-relocate.
+/// Tries the standard candidates in order; the first that's either already
+/// writable, or successfully created and writable, wins. Returns the
+/// resolved `<dir>/httpxer` install path so callers can hand it directly to
+/// `self_update::UpdateBuilder::bin_install_path`.
+fn find_writable_install_path() -> Option<PathBuf> {
+    // Empty env vars are not the same as unset — `HOME=''` ≠ `HOME` unset.
+    // Filter both to skip degenerate paths that would resolve relative to
+    // the current working dir (a Bash-style misconfig some CI runners ship).
+    let nonempty = |v: std::ffi::OsString| {
+        if v.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(v))
+        }
+    };
+    let home = std::env::var_os("HOME").and_then(nonempty);
+    let xdg = std::env::var_os("XDG_BIN_HOME").and_then(nonempty);
+    let candidates: Vec<PathBuf> = [
+        xdg,
+        home.as_ref().map(|h| h.join(".local").join("bin")),
+        home.as_ref().map(|h| h.join("bin")),
+    ]
+    .into_iter()
+    .flatten()
+    // Reject any path that isn't absolute — a relative path would resolve
+    // against $PWD, which is almost never what the user wants for an
+    // install target.
+    .filter(|p| p.is_absolute())
+    .collect();
+
+    for dir in candidates {
+        let _ = fs::create_dir_all(&dir);
+        let probe = dir.join(format!(".httpxer-wprobe-{}", std::process::id()));
+        if fs::File::create(&probe).is_ok() {
+            let _ = fs::remove_file(&probe);
+            return Some(dir.join("httpxer"));
+        }
+    }
+    None
+}
+
+/// Warn (to stderr) when the relocated dir isn't on the caller's $PATH —
+/// the binary works but `httpxer` won't resolve until the user fixes PATH.
+fn warn_if_not_on_path(dir: &Path) {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let split = std::env::split_paths(&path);
+    if split.into_iter().any(|p| p == dir) {
+        return;
+    }
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let rc = if shell.ends_with("/zsh") {
+        "~/.zshrc"
+    } else if shell.ends_with("/fish") {
+        "~/.config/fish/config.fish"
+    } else {
+        "~/.bashrc"
+    };
     eprintln!();
     eprintln!(
-        "\x1b[33m[!] cannot update in place — write permission denied at {}\x1b[0m",
-        path
+        "\x1b[33m[!] {} is not on your $PATH — `httpxer` won't resolve until you add it.\x1b[0m",
+        dir.display()
     );
-    eprintln!();
-    eprintln!("This binary is in a root-owned directory (typical when installed via the");
-    eprintln!("default `install.sh` / `install.ps1`). The unprivileged user that ran");
-    eprintln!("`httpxer -u` can't replace the file. Two clean fixes:");
-    eprintln!();
-    eprintln!("  \x1b[1m1. Re-run with sudo (one-time, every update):\x1b[0m");
-    eprintln!("       \x1b[1msudo httpxer -u\x1b[0m");
+    eprintln!(
+        "    Add and reload:  \x1b[1mecho 'export PATH=\"{}:$PATH\"' >> {} && source {}\x1b[0m",
+        dir.display(),
+        rc,
+        rc
+    );
+}
+
+/// Best-effort cleanup of the root-owned old binary after a successful
+/// relocate. Tries passwordless sudo first (silent if no sudoers entry);
+/// if that fails, leaves the file alone and prints a one-liner with the
+/// manual command. Never blocks the update flow on cleanup.
+fn cleanup_old_binary(old: &Path) {
+    if !old.exists() {
+        return;
+    }
+    // Try non-interactive sudo first — silent if not allowed
+    let sudo_ok = std::process::Command::new("sudo")
+        .args(["-n", "rm", "-f"])
+        .arg(old)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if sudo_ok && !old.exists() {
+        eprintln!("    \x1b[2mremoved old binary: {}\x1b[0m", old.display());
+        return;
+    }
     eprintln!();
     eprintln!(
-        "  \x1b[1m2. Or relocate to a user-writable path (one-time, no sudo ever again):\x1b[0m"
+        "\x1b[2m[i] note: the old root-owned binary at {} is still on disk.\x1b[0m",
+        old.display()
     );
-    eprintln!("       mkdir -p ~/.local/bin");
-    eprintln!("       sudo mv {} ~/.local/bin/", path);
-    eprintln!("       # macOS:  echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc && source ~/.zshrc");
-    eprintln!("       # Linux:  echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.bashrc && source ~/.bashrc");
+    eprintln!(
+        "    \x1b[2mremove it manually when convenient:  sudo rm {}\x1b[0m",
+        old.display()
+    );
+}
+
+/// Re-exec the current binary under `sudo`, preserving argv. Used as the
+/// last-resort path when no user-writable fallback dir is available
+/// (e.g. read-only `$HOME`, missing `$HOME`, or user explicitly chose to
+/// stay in `/usr/local/bin`). Returns Ok only if the sudo invocation
+/// itself completes — the child process replaces us via exit().
+fn reexec_with_sudo() -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let argv: Vec<String> = std::env::args().skip(1).collect();
     eprintln!();
-    eprintln!("Future `httpxer -u` invocations from the relocated path will not need sudo.");
+    eprintln!(
+        "\x1b[33m[!] no user-writable fallback found. Re-executing as: sudo {} {}\x1b[0m",
+        exe.display(),
+        argv.join(" ")
+    );
+    eprintln!("    \x1b[2m(sudo will prompt for your password)\x1b[0m");
+    let mut cmd = std::process::Command::new("sudo");
+    cmd.arg(&exe);
+    cmd.args(&argv);
+    let status = cmd.status()?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Auto-relocate flow — called when the running binary lives in a path
+/// the current user can't write. Picks a user-writable destination
+/// (`~/.local/bin/`, `~/bin/`, `$XDG_BIN_HOME`), copies the running
+/// binary there, best-effort sudo-removes the root-owned original, then
+/// `exec()`'s the new copy with `-u` so the standard `self_update`
+/// in-place path runs against a directory the current user owns.
+///
+/// Why copy + exec instead of pointing `self_update::bin_install_path`
+/// at the new path directly: `self_update 0.41` stages its temp file
+/// next to `std::env::current_exe()` rather than next to the configured
+/// install path. With a root-owned current_exe that staging write
+/// fails with EACCES even when bin_install_path is on tmpfs. Replacing
+/// the process via `exec` shifts current_exe() to the writable copy
+/// and sidesteps the bug entirely.
+///
+/// Falls back to sudo re-exec when no writable destination is
+/// available (read-only $HOME, missing $HOME, etc.).
+async fn relocate_and_update() -> anyhow::Result<()> {
+    let old_path = std::env::current_exe()?;
+    let Some(new_install_path) = find_writable_install_path() else {
+        return reexec_with_sudo();
+    };
+    let new_parent = new_install_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+
+    eprintln!();
+    eprintln!(
+        "\x1b[33m[!] {} is in a non-writable directory — relocating to {} (one-time; no sudo for future updates).\x1b[0m",
+        old_path.display(),
+        new_install_path.display()
+    );
+
+    // 1. Copy the running binary to the new user-writable path
+    fs::create_dir_all(&new_parent)?;
+    fs::copy(&old_path, &new_install_path).map_err(|e| {
+        anyhow::anyhow!(
+            "copy {} → {} failed: {}",
+            old_path.display(),
+            new_install_path.display(),
+            e
+        )
+    })?;
+    // 2. chmod 0755 — preserve the executable bit explicitly (POSIX-only;
+    //    Windows handles this differently and never hits this code path
+    //    because the perm-denied case there manifests on the user's own
+    //    %USERPROFILE%\bin which is always writable).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(&new_install_path, perms)?;
+    }
+
+    eprintln!(
+        "    \x1b[2mcopied binary to {}\x1b[0m",
+        new_install_path.display()
+    );
+
+    // 3. Best-effort cleanup of the root-owned original (non-interactive
+    //    sudo only — silent if not allowed).
+    cleanup_old_binary(&old_path);
+
+    // 4. Warn if the new dir isn't on $PATH (binary works but the
+    //    `httpxer` command won't resolve until $PATH is fixed).
+    warn_if_not_on_path(&new_parent);
+
+    // 5. Refresh the update-check cache with the current version so the
+    //    re-exec's startup banner is consistent.
+    if let Some(p) = update_cache_path() {
+        if let Some(parent) = p.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&p, env!("CARGO_PKG_VERSION"));
+    }
+
+    // 6. Re-exec the COPY with `-u`. The copy's `install_dir_writable()`
+    //    will return true (its parent is owned by the current user), so
+    //    the normal `self_update` flow runs against a writable path and
+    //    the binary gets replaced atomically with the latest release.
+    //
+    //    `--no-update-check` suppresses the banner on the inner invocation
+    //    since the outer one already showed it.
+    eprintln!();
+    eprintln!(
+        "\x1b[2m    handing off to {} -u (will fetch latest release into {})...\x1b[0m",
+        new_install_path.display(),
+        new_parent.display()
+    );
+    eprintln!();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&new_install_path)
+            .args(["-u", "--no-update-check"])
+            .exec();
+        // exec only returns on error
+        Err(anyhow::anyhow!(
+            "exec {} -u failed: {}",
+            new_install_path.display(),
+            err
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = std::process::Command::new(&new_install_path)
+            .args(["-u", "--no-update-check"])
+            .status()?;
+        std::process::exit(status.code().unwrap_or(0));
+    }
 }
 
 /// `httpxer -u` — replace the running binary with the latest release.
+/// When the install path is root-owned and the running user can't write
+/// to it, AUTO-RELOCATE the binary to a user-writable path
+/// (`~/.local/bin/` / `~/bin/` / `$XDG_BIN_HOME`) instead of failing with
+/// a "use sudo" message. Falls back to sudo re-exec only when no
+/// user-writable destination exists.
 pub async fn run_update() -> anyhow::Result<()> {
-    // Up-front writability check — saves a 5 MB download when the user
-    // would just hit a Permission-Denied at the final move step.
+    // Up-front writability check. When false, switch to auto-relocate
+    // (which calls self_update with bin_install_path set to a
+    // user-writable destination) so the user never has to think about
+    // sudo or PATH after their first install.
     if !install_dir_writable() {
-        print_perm_help();
-        std::process::exit(2);
+        return relocate_and_update().await;
     }
 
     let current = env!("CARGO_PKG_VERSION").to_string();
@@ -342,14 +557,14 @@ pub async fn run_update() -> anyhow::Result<()> {
         Err(e) => {
             // Post-download fallback — defends against the race where the
             // dir was writable at the up-front check but a directory ACL /
-            // mount option changed in between.
+            // mount option changed in between. Auto-relocate kicks in here
+            // too so the user still gets a working install without sudo.
             let msg = e.to_string();
             if msg.contains("Permission denied")
                 || msg.contains("os error 13")
                 || msg.to_ascii_lowercase().contains("access is denied")
             {
-                print_perm_help();
-                std::process::exit(2);
+                return relocate_and_update().await;
             }
             return Err(e.into());
         }
