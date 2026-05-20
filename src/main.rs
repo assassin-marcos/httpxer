@@ -124,17 +124,6 @@ struct Args {
     #[arg(long)]
     with_body: bool,
 
-    /// Emit enrich-mode records in ProjectDiscovery httpx's JSON shape
-    /// instead of the default httpxer shape. Differences in compat mode:
-    /// `input` (URL with scheme) replaces `subdomain`; `a` / `aaaa` arrays
-    /// replace the single `ip` string; `cname` becomes an array; `tech`
-    /// becomes a string array (split from the comma-joined form);
-    /// `webserver` is emitted alongside `server`; `host_ip` is added as
-    /// the first A record (or first AAAA when no A is present).
-    /// Inert in fuzz mode (the fuzz schema is already httpx-shaped).
-    #[arg(long = "httpx-compat")]
-    httpx_compat: bool,
-
     // ── Fuzz-mode flags (v0.3.0+) ──────────────────────────────────────
     // Presence of `-path / --paths` switches the binary from enrich mode
     // (1 probe per host) into fuzz mode (host × wordlist Cartesian probe).
@@ -358,145 +347,6 @@ struct EnrichRecord {
     /// Reason this record didn't enrich (dns / http). Absent on success.
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
-
-    // ── Internal state for httpx-compat conversion ─────────────────────
-    // These fields carry the raw DNS slice + the original input string
-    // (with scheme intact) so the `--httpx-compat` writer can reshape the
-    // record without losing information. They are `#[serde(skip)]` so the
-    // default JSONL shape is byte-identical to pre-v0.3.1 output.
-    #[serde(skip)]
-    raw_ipv4: Vec<String>,
-    #[serde(skip)]
-    raw_ipv6: Vec<String>,
-    #[serde(skip)]
-    raw_input: String,
-}
-
-/// ProjectDiscovery httpx-shaped enrich record. Selected when `--httpx-compat`
-/// is set. Field names + array shapes mirror what `httpx -fr -sc -cl -wc
-/// -server -location -title -td -ip -cname -json` emits, so existing httpx
-/// consumers can ingest httpxer output unchanged.
-///
-/// Loadbearing differences vs `EnrichRecord`:
-///   - `input` (URL with scheme) replaces `subdomain`
-///   - `a` + `aaaa` arrays replace the single `ip` string (httpx keeps every
-///     A and AAAA record, not just the first)
-///   - `cname` becomes a string array (multiple CNAMEs possible in theory)
-///   - `tech` becomes a string array (httpx emits `["X","Y"]` not `"X, Y"`)
-///   - `webserver` is emitted alongside `server` (some downstream parsers
-///     read one, some read the other — httpx itself emits both)
-///   - `host_ip` is added (first A; first AAAA when no A is present)
-#[derive(Serialize, Debug)]
-struct HttpxCompatRecord {
-    /// URL with scheme (`https://target.com`). httpx's primary host key.
-    input: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    domain: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scan_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_tools: Option<String>,
-
-    /// IPv4 A records (httpx emits the full list, not just the first).
-    a: Vec<String>,
-    /// IPv6 AAAA records (NEW — httpxer's default shape flattens these
-    /// into the `ip` string; httpx-compat splits them out).
-    aaaa: Vec<String>,
-    /// CNAME chain — array form to match httpx.
-    cname: Vec<String>,
-    /// First A record, or first AAAA when there is no A. httpx's
-    /// convenience field — equivalent to `a[0]` when present.
-    host_ip: String,
-    /// CDN provider tag (cloudflare/cloudfront/fastly/google), or "" if none.
-    cdn: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    status_code: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content_length: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    word_count: Option<usize>,
-    /// `server` header — kept under the `server` key (matches httpx).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    server: Option<String>,
-    /// `webserver` is httpx's preferred alias of `server`. We emit both
-    /// so consumers that read either key see the same value.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    webserver: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    location: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    final_url: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    redirect_chain: Vec<String>,
-
-    /// `tech` as a string array — split from `EnrichRecord.tech`'s
-    /// comma-joined form on `", "` so `"X, Y, Z"` becomes `["X","Y","Z"]`.
-    tech: Vec<String>,
-
-    /// True when `--proxy URL` was set. Always emitted.
-    via_proxy: bool,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    body: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-impl HttpxCompatRecord {
-    /// Reshape a default `EnrichRecord` into the httpx-compatible record.
-    /// Drains the raw DNS slice + raw input that the EnrichRecord carries
-    /// on the side; everything else is a direct field map.
-    fn from_enrich(rec: EnrichRecord) -> Self {
-        let tech: Vec<String> = if rec.tech.is_empty() {
-            Vec::new()
-        } else {
-            rec.tech
-                .split(", ")
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        };
-        let cname_arr: Vec<String> = if rec.cname.is_empty() {
-            Vec::new()
-        } else {
-            vec![rec.cname]
-        };
-        // host_ip: first A, falling back to first AAAA when no A exists.
-        let host_ip = rec
-            .raw_ipv4
-            .first()
-            .cloned()
-            .or_else(|| rec.raw_ipv6.first().cloned())
-            .unwrap_or_default();
-        HttpxCompatRecord {
-            input: rec.raw_input,
-            domain: rec.domain,
-            scan_id: rec.scan_id,
-            source_tools: rec.source_tools,
-            a: rec.raw_ipv4,
-            aaaa: rec.raw_ipv6,
-            cname: cname_arr,
-            host_ip,
-            cdn: rec.cdn,
-            status_code: rec.status_code,
-            content_length: rec.content_length,
-            word_count: rec.word_count,
-            server: rec.server.clone(),
-            webserver: rec.server,
-            location: rec.location,
-            title: rec.title,
-            final_url: rec.final_url,
-            redirect_chain: rec.redirect_chain,
-            tech,
-            via_proxy: rec.via_proxy,
-            body: rec.body,
-            error: rec.error,
-        }
-    }
 }
 
 fn read_hosts(path: &str) -> Result<Vec<String>> {
@@ -785,33 +635,6 @@ async fn main() -> Result<()> {
                 .unwrap_or_default();
             let dns_error = dns_rec.as_ref().and_then(|r| r.error.clone());
 
-            // Split the DNS slice into IPv4/IPv6 for the `--httpx-compat`
-            // path. Stored on the record as `#[serde(skip)]` so the default
-            // shape is unaffected; converted at writer time.
-            let (raw_ipv4, raw_ipv6): (Vec<String>, Vec<String>) = match dns_rec.as_ref() {
-                Some(r) => {
-                    let mut v4 = Vec::new();
-                    let mut v6 = Vec::new();
-                    for ip in r.ips.iter() {
-                        match ip {
-                            std::net::IpAddr::V4(a) => v4.push(a.to_string()),
-                            std::net::IpAddr::V6(a) => v6.push(a.to_string()),
-                        }
-                    }
-                    (v4, v6)
-                }
-                None => (Vec::new(), Vec::new()),
-            };
-            // `raw_input` mirrors httpx's `input` — scheme + host. When the
-            // user passed a bare hostname we default to `https://` (matches
-            // httpx's scheme-less list behaviour).
-            let raw_input =
-                if url_or_host.starts_with("http://") || url_or_host.starts_with("https://") {
-                    url_or_host.trim_end_matches('/').to_string()
-                } else {
-                    format!("https://{}", host)
-                };
-
             let mut rec = EnrichRecord {
                 subdomain: host.clone(),
                 domain: (*domain).clone(),
@@ -832,9 +655,6 @@ async fn main() -> Result<()> {
                 via_proxy,
                 body: None,
                 error: None,
-                raw_ipv4,
-                raw_ipv6,
-                raw_input,
             };
 
             // No A/AAAA → record DNS failure, skip probe.
@@ -876,18 +696,10 @@ async fn main() -> Result<()> {
     }
 
     // 9. Drain — write NDJSON as each completes (crash-safe, no buffered tail).
-    //    When `--httpx-compat` is set, every record is reshaped from the
-    //    default EnrichRecord into HttpxCompatRecord just before serialise.
     let mut completed = 0usize;
-    let httpx_compat = args.httpx_compat;
     while let Some(joined) = set.next().await {
         if let Ok(rec) = joined {
-            let line = if httpx_compat {
-                serde_json::to_string(&HttpxCompatRecord::from_enrich(rec))?
-            } else {
-                serde_json::to_string(&rec)?
-            };
-            writeln!(out_file, "{}", line)?;
+            writeln!(out_file, "{}", serde_json::to_string(&rec)?)?;
             completed += 1;
             if completed % 50 == 0 || completed == total {
                 eprintln!("  [{}/{}]", completed, total);
@@ -897,125 +709,4 @@ async fn main() -> Result<()> {
     out_file.flush()?;
     eprintln!("[+] done: wrote {} records to {}", completed, output_path);
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Build a synthetic EnrichRecord with both IPv4 and IPv6 in the raw
-    /// DNS slice, plus a comma-joined tech list — enough to exercise every
-    /// field the httpx-compat conversion reshapes.
-    fn sample_enrich() -> EnrichRecord {
-        EnrichRecord {
-            subdomain: "target.com".into(),
-            domain: Some("target.com".into()),
-            scan_id: Some("scan_1".into()),
-            source_tools: Some("subfinder".into()),
-            ip: "1.2.3.4".into(),
-            cname: "alias.example.com".into(),
-            cdn: "cloudflare".into(),
-            status_code: Some(200),
-            content_length: Some(1234),
-            word_count: Some(56),
-            server: Some("nginx".into()),
-            location: None,
-            title: Some("Example".into()),
-            final_url: Some("https://target.com/".into()),
-            redirect_chain: vec!["https://target.com".into()],
-            tech: "Nginx, HSTS, HTTP/3".into(),
-            via_proxy: true,
-            body: None,
-            error: None,
-            raw_ipv4: vec!["1.2.3.4".into(), "1.2.3.5".into()],
-            raw_ipv6: vec!["2001:db8::1".into()],
-            raw_input: "https://target.com".into(),
-        }
-    }
-
-    /// Default enrich shape: `subdomain` present, `tech` is a string,
-    /// `ip` is the singular first-resolved IP. No httpx-only fields leak.
-    #[test]
-    fn enrich_default_shape_has_subdomain_and_string_tech() {
-        let rec = sample_enrich();
-        let s = serde_json::to_string(&rec).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["subdomain"], "target.com");
-        assert_eq!(v["ip"], "1.2.3.4");
-        assert_eq!(v["cname"], "alias.example.com");
-        assert_eq!(v["tech"], "Nginx, HSTS, HTTP/3");
-        // No httpx-only fields in the default shape.
-        assert!(v.get("input").is_none());
-        assert!(v.get("a").is_none());
-        assert!(v.get("aaaa").is_none());
-        assert!(v.get("host_ip").is_none());
-        assert!(v.get("webserver").is_none());
-        // The `#[serde(skip)]` internals must not leak either.
-        assert!(v.get("raw_ipv4").is_none());
-        assert!(v.get("raw_ipv6").is_none());
-        assert!(v.get("raw_input").is_none());
-    }
-
-    /// httpx-compat shape: `input` replaces `subdomain`, `a` + `aaaa` are
-    /// arrays, `cname` + `tech` are arrays, `webserver` mirrors `server`,
-    /// `host_ip` is the first A. All other fields preserved.
-    #[test]
-    fn compat_shape_matches_httpx_field_names() {
-        let rec = sample_enrich();
-        let compat = HttpxCompatRecord::from_enrich(rec);
-        let s = serde_json::to_string(&compat).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        // Subdomain → input.
-        assert!(v.get("subdomain").is_none());
-        assert_eq!(v["input"], "https://target.com");
-        // ip → a / aaaa arrays.
-        assert!(v.get("ip").is_none());
-        assert_eq!(v["a"], serde_json::json!(["1.2.3.4", "1.2.3.5"]));
-        assert_eq!(v["aaaa"], serde_json::json!(["2001:db8::1"]));
-        // cname → array.
-        assert_eq!(v["cname"], serde_json::json!(["alias.example.com"]));
-        // tech → array (split on `, `).
-        assert_eq!(v["tech"], serde_json::json!(["Nginx", "HSTS", "HTTP/3"]));
-        // webserver + server both present, same value.
-        assert_eq!(v["server"], "nginx");
-        assert_eq!(v["webserver"], "nginx");
-        // host_ip = first A.
-        assert_eq!(v["host_ip"], "1.2.3.4");
-        // Other fields preserved.
-        assert_eq!(v["status_code"], 200);
-        assert_eq!(v["content_length"], 1234);
-        assert_eq!(v["word_count"], 56);
-        assert_eq!(v["title"], "Example");
-        assert_eq!(v["final_url"], "https://target.com/");
-        assert_eq!(
-            v["redirect_chain"],
-            serde_json::json!(["https://target.com"])
-        );
-        assert_eq!(v["cdn"], "cloudflare");
-        assert_eq!(v["via_proxy"], true);
-        assert_eq!(v["domain"], "target.com");
-        assert_eq!(v["scan_id"], "scan_1");
-        assert_eq!(v["source_tools"], "subfinder");
-    }
-
-    /// host_ip falls back to the first AAAA when no A record exists.
-    /// Empty tech maps to `[]`, not `[""]`. Empty cname maps to `[]`.
-    #[test]
-    fn compat_shape_handles_edge_cases() {
-        let mut rec = sample_enrich();
-        rec.raw_ipv4.clear();
-        rec.tech.clear();
-        rec.cname.clear();
-        let compat = HttpxCompatRecord::from_enrich(rec);
-        let s = serde_json::to_string(&compat).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        // host_ip falls back to first AAAA.
-        assert_eq!(v["host_ip"], "2001:db8::1");
-        assert_eq!(v["a"], serde_json::json!([]));
-        assert_eq!(v["aaaa"], serde_json::json!(["2001:db8::1"]));
-        // Empty tech → empty array, not `[""]`.
-        assert_eq!(v["tech"], serde_json::json!([]));
-        // Empty cname → empty array.
-        assert_eq!(v["cname"], serde_json::json!([]));
-    }
 }

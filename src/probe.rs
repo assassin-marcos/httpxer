@@ -118,7 +118,31 @@ static POOL: OnceCell<Vec<PoolSlot>> = OnceCell::new();
 ///
 /// Profile pool kept ~10 entries: enough variety to defeat single-profile
 /// rule-blocks, small enough that all client builds finish in ms.
-pub fn init_pool(timeout_ms: u64, no_impersonate: bool) {
+///
+/// When `proxy_url` is `Some`, EVERY client in the pool is built with
+/// `.proxy(wreq::Proxy::all(url)?)` so all egress traffic — enrich-mode
+/// chase-the-chain GETs AND fuzz-mode single-shot GETs — goes through the
+/// configured proxy. Supports `http://`, `https://`, and `socks5://` /
+/// `socks5h://` URLs (BoringSSL handles all three under the hood). An
+/// invalid URL returns the wreq error wrapped in `anyhow` so the caller
+/// can fail loudly at startup before the banner renders.
+pub fn init_pool(
+    timeout_ms: u64,
+    no_impersonate: bool,
+    proxy_url: Option<&str>,
+) -> anyhow::Result<()> {
+    // Pre-validate the proxy URL once, outside the OnceCell init closure,
+    // so we can surface the error to the caller as a normal Result rather
+    // than panicking inside `get_or_init`. The closure then clones the
+    // already-validated `Proxy` per slot.
+    let proxy_proto: Option<wreq::Proxy> = match proxy_url {
+        Some(u) => Some(
+            wreq::Proxy::all(u)
+                .map_err(|e| anyhow::anyhow!("invalid --proxy URL '{}': {}", u, e))?,
+        ),
+        None => None,
+    };
+
     POOL.get_or_init(|| {
         let timeout = Duration::from_millis(timeout_ms);
         // 16-slot pool — wide-enough variety that a WAF watching one scanning
@@ -184,6 +208,9 @@ pub fn init_pool(timeout_ms: u64, no_impersonate: bool) {
             if !no_impersonate {
                 b = b.emulation(*emul);
             }
+            if let Some(p) = proxy_proto.as_ref() {
+                b = b.proxy(p.clone());
+            }
             if let Ok(c) = b.build() {
                 pool.push(PoolSlot {
                     client: c,
@@ -194,8 +221,13 @@ pub fn init_pool(timeout_ms: u64, no_impersonate: bool) {
         }
         if pool.is_empty() {
             // Final safety net — at minimum one plain client so probes don't
-            // all silently no-op if every profile build fails.
-            if let Ok(c) = Client::builder().timeout(timeout).build() {
+            // all silently no-op if every profile build fails. The proxy is
+            // still applied here so the fallback honours `--proxy`.
+            let mut b = Client::builder().timeout(timeout);
+            if let Some(p) = proxy_proto.as_ref() {
+                b = b.proxy(p.clone());
+            }
+            if let Ok(c) = b.build() {
                 pool.push(PoolSlot {
                     client: c,
                     accept_lang: "en-US,en;q=0.9",
@@ -205,6 +237,7 @@ pub fn init_pool(timeout_ms: u64, no_impersonate: bool) {
         }
         pool
     });
+    Ok(())
 }
 
 /// Public accessor for the impersonation pool — the fuzz orchestrator needs

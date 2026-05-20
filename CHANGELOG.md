@@ -2,6 +2,23 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.3.2] — 2026-05-20
+
+### Added
+- **`--proxy <URL>` is now fully wired** — every client in the 16-slot impersonation pool is built with `.proxy(wreq::Proxy::all(url)?)` so both enrich and fuzz modes route all egress through the configured upstream. Accepts `http://`, `https://`, `socks5://`, and `socks5h://`. Invalid URLs fail loudly at startup before the banner renders.
+- **`via_proxy` field on every enrich record** — boolean flag set whenever `--proxy` is in effect. Mirrors the existing fuzz-mode `via_proxy` so both schemas advertise proxy routing consistently.
+
+### Changed
+- Version: 0.3.0 → **0.3.2**
+- `wreq` feature set now includes `"socks"` — required for SOCKS5 proxy URLs to parse. Adds the `tokio-socks` transitive dep (~50 KB).
+
+### Fixed
+- Redirect-cap default raised from 3 to 10 hops + new `--max-redirects` flag — already shipped earlier on `main`; rolled into this release for completeness.
+
+### Unchanged (compatibility)
+- Default enrich JSONL shape is byte-compatible with v0.3.0 when `--proxy` is not set (the only new field is `via_proxy:false`, which downstream parsers should ignore by virtue of not reading unknown keys).
+- All v0.3.0 fuzz-mode flags continue to work unchanged.
+
 ## [0.3.0] — 2026-05-20
 
 ### Added

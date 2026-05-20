@@ -48,7 +48,7 @@ httpxer auto-detects which mode to run based on whether `-path / --paths` is set
 | **Enrich** *(default)* | no `-path` flag | One probe per host. Resolves DNS, tags CDN ranges, runs Wappalyzer tech-detect on the response, follows redirects. | `subdomain, ip, cname, cdn, status_code, content_length, server, title, tech, …` (httpx-compatible) |
 | **Fuzz** | `-path <wordlist>` | Host × wordlist Cartesian probe. Pre-flight wildcard fingerprint per host; auto-suppress identical-body false positives; per-request `Policy::none()` so 3xx is a finding, not chased. | `url, input, path, host, status_code, content_length, content_type, title, server, webserver, body_preview, is_wildcard, snippet_md5, tls_impersonation, …` (matches retroh4ck-prober v0.1.0) |
 
-Both modes share the same 16-slot real-browser TLS impersonation pool — wreq + BoringSSL — and the same `-l` input + `-o` output path.
+Both modes share the same 16-slot real-browser TLS impersonation pool — wreq + BoringSSL — and the same `-l` input + `-o` output path. `--proxy <URL>` (HTTP / HTTPS / SOCKS5) is honoured by every client in the pool.
 
 ---
 
@@ -72,6 +72,10 @@ httpxer -l internal-hosts.txt -o out.jsonl --no-impersonate
 
 # Skip tech-detect for max throughput
 httpxer -l huge-list.txt -o out.jsonl --no-tech -t 500
+
+# Route every probe through an upstream proxy (http / https / socks5 / socks5h)
+httpxer -l hosts.txt -o out.jsonl --proxy http://127.0.0.1:8080
+httpxer -l hosts.txt -o out.jsonl --proxy socks5://127.0.0.1:1080
 ```
 
 All enrich-mode defaults are tuned for real recon — concurrency 250, follow-redirects 3 hops, 5 s probe timeout, 2 MiB streaming body cap, auto-resume on `-o` file.
@@ -138,6 +142,7 @@ Stderr (TTY):
 | `status_code`, `content_length`, `word_count`, `server`, `location`, `title` | Matches httpx `-sc -cl -wc -server -location -title` |
 | `final_url`, `redirect_chain` | Set only when redirects were followed |
 | `tech` | `"Name:Version, Name, Name:Version"` — 7524 Wappalyzer fingerprints, same set httpx uses |
+| `via_proxy` | `true` when `--proxy <URL>` is set |
 | `body` | Response body (≤2 MiB) — only when `--with-body` |
 | `error` | DNS / HTTP failure reason, absent on success |
 
@@ -207,6 +212,7 @@ Full list via `httpxer -h`. Most-used:
 | `--timeout-ms` | 5000 | Per-probe HTTP timeout |
 | `--no-impersonate` | off | Skip TLS-fingerprint rotation (faster on un-fronted targets) |
 | `--no-resume` | resume | Overwrite output file (enrich); always truncate (fuzz) |
+| `--proxy <URL>` | — | HTTP / HTTPS / SOCKS5 / SOCKS5h proxy applied to every pool client; invalid URLs fail at startup |
 | `-u` / `-c` / `-X` | — | Self-update / check / uninstall |
 | `--no-art` / `--no-update-check` / `-q` | — | Suppress banner / update-check / both |
 
@@ -217,7 +223,8 @@ Full list via `httpxer -h`. Most-used:
 | `--scan-id`, `--domain`, `--source-tools` | — | Metadata embedded in every record |
 | `--no-tech` / `--no-cdn` | both on | Skip Wappalyzer / CDN-range fetch |
 | `--with-body` | off | Include response body (≤2 MiB) in JSON |
-| `--no-follow-redirects` | follow | Disable 3-hop redirect chain |
+| `--no-follow-redirects` | follow | Disable redirect chasing |
+| `--max-redirects <N>` | `10` | Hop cap when redirect chasing is on |
 | `--fingerprints <PATH>` | embedded | Load fresh Wappalyzer fingerprints |
 | **httpx-compat (no-ops, accepted)** | — | `-fr -sc -cl -wc -server -location -title -td -ip -cname -json -no-color -silent` |
 
@@ -235,7 +242,6 @@ Setting `-path <wordlist>` switches to fuzz mode. All flags below are inert when
 | `--rate-limit <RPS>` | `0` (off) | Per-host requests/sec ceiling |
 | `--retries <N>` | `1` | Retry count on network error |
 | `--include-errors` | off | Emit `status_code:0` records for failed probes |
-| `--proxy <URL>` | — | HTTP/SOCKS5 proxy (reserved — see CHANGELOG for status) |
 
 ---
 
