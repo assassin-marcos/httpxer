@@ -25,9 +25,11 @@ use std::sync::Arc;
 
 mod cdn;
 mod dns;
+mod fuzz;
 mod probe;
 mod techdetect;
 mod update;
+mod wildcard;
 
 /// Embedded Wappalyzer fingerprint snapshot — same JSON httpx uses. Refresh
 /// with `--fingerprints <path>` pointing at a freshly-downloaded copy from
@@ -112,6 +114,58 @@ struct Args {
     /// keeps output files small.
     #[arg(long)]
     with_body: bool,
+
+    // ── Fuzz-mode flags (v0.3.0+) ──────────────────────────────────────
+    // Presence of `-path / --paths` switches the binary from enrich mode
+    // (1 probe per host) into fuzz mode (host × wordlist Cartesian probe).
+    // All flags below are inert in enrich mode.
+    /// Wordlist file (one path per line) — when set, switches to fuzz mode
+    /// (host × path probe). Empty paths and `#` comments are skipped.
+    #[arg(short = 'p', long = "paths", alias = "path", help_heading = "Fuzz mode")]
+    paths: Option<String>,
+
+    /// (fuzz) Comma-separated status codes to emit
+    #[arg(
+        long = "match-codes",
+        alias = "mc",
+        default_value = "200,301,302,307,308,401,403",
+        help_heading = "Fuzz mode"
+    )]
+    match_codes: String,
+
+    /// (fuzz) Body preview length in bytes (HTML-entity-encoded in output)
+    #[arg(long = "body-preview", default_value_t = 8192, help_heading = "Fuzz mode")]
+    body_preview: usize,
+
+    /// (fuzz) Wildcard suppression policy: strict|mark|off
+    #[arg(
+        long = "wildcard-policy",
+        default_value = "strict",
+        help_heading = "Fuzz mode"
+    )]
+    wildcard_policy: String,
+
+    /// (fuzz) Shortcut for `--wildcard-policy off`
+    #[arg(long = "no-wildcard", help_heading = "Fuzz mode")]
+    no_wildcard: bool,
+
+    /// (fuzz) Per-host requests/sec ceiling. 0 = disabled (default).
+    #[arg(long = "rate-limit", default_value_t = 0.0, help_heading = "Fuzz mode")]
+    rate_limit: f64,
+
+    /// (fuzz) Retry count on network error
+    #[arg(long = "retries", default_value_t = 1, help_heading = "Fuzz mode")]
+    retries: u32,
+
+    /// (fuzz) Emit status_code=0 records (connection errors). Off by default.
+    #[arg(long = "include-errors", help_heading = "Fuzz mode")]
+    include_errors: bool,
+
+    /// (fuzz) HTTP or SOCKS5 proxy URL. Currently a no-op pending pool-
+    /// builder support; reserved for the v0.3.x point release that adds
+    /// per-pool proxy wiring. Setting it flips `via_proxy:true` in output.
+    #[arg(long = "proxy", help_heading = "Fuzz mode")]
+    proxy: Option<String>,
 
     // ── Self-management ────────────────────────────────────────────────
     /// Install the latest release (replaces this binary in place)
@@ -374,6 +428,53 @@ async fn main() -> Result<()> {
     let mut hosts = read_hosts(input_path)?;
     let initial = hosts.len();
     eprintln!("[+] input: {} unique hosts", initial);
+
+    // 2a. FUZZ MODE — triggered by `-path / --paths <wordlist>`.
+    //     Bypasses enrich-mode's DNS/CDN/tech-detect path entirely and
+    //     issues a host × path Cartesian probe through the same wreq
+    //     pool, with per-request `redirect::Policy::none()` so 3xx is a
+    //     finding (not chased). Output schema matches retroh4ck-prober
+    //     v0.1.0 — see `src/fuzz.rs` for the FuzzRecord layout.
+    if let Some(paths_path) = args.paths.as_deref() {
+        let words = fuzz::read_words(paths_path)?;
+        eprintln!("[+] wordlist: {} unique paths", words.len());
+
+        // Build wildcard policy from flags. `--no-wildcard` overrides.
+        let policy = fuzz::WildcardPolicy::from_cli(&args.wildcard_policy, args.no_wildcard)?;
+
+        // Build the impersonation pool once — fuzz uses the same pool
+        // enrich does, so the init logic is identical.
+        probe::init_pool(args.timeout_ms, args.no_impersonate);
+        if !args.no_impersonate {
+            eprintln!("[+] TLS impersonation: rotating real-browser JA3/JA4 + HTTP/2 fingerprints");
+        } else {
+            eprintln!("[+] TLS impersonation: DISABLED (--no-impersonate)");
+        }
+
+        let match_codes: Vec<u16> = args
+            .match_codes
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u16>().ok())
+            .collect();
+        if match_codes.is_empty() {
+            anyhow::bail!("--match-codes parsed to zero codes (got '{}')", args.match_codes);
+        }
+
+        let cfg = fuzz::FuzzCfg {
+            match_codes,
+            body_preview_bytes: args.body_preview,
+            wildcard_policy: policy,
+            include_errors: args.include_errors,
+            retries: args.retries,
+            via_proxy: args.proxy.is_some(),
+            threads: args.threads,
+            timeout_ms: args.timeout_ms,
+            rate_limit_rps: args.rate_limit,
+        };
+
+        fuzz::run(&hosts, &words, cfg, output_path, args.no_resume, policy).await?;
+        return Ok(());
+    }
 
     // 2. Resume: skip already-processed entries from the existing output file.
     if !args.no_resume {

@@ -95,9 +95,14 @@ pub fn resolve_redirect_url(base: &str, loc: &str) -> String {
 /// Accept-Language is kept per-slot too because real browsers vary it by
 /// install — and some WAFs cross-check Accept-Language consistency vs the
 /// presumed locale of the TLS / HTTP-2 fingerprint.
-struct PoolSlot {
-    client: Client,
-    accept_lang: &'static str,
+///
+/// `tag` is the short label emitted in the fuzz-mode JSONL `tls_impersonation`
+/// field (e.g. `"chrome-137"`, `"firefox-139"`, `"vanilla"`). It is set when
+/// the pool is built so the fuzz worker doesn't need a runtime lookup.
+pub struct PoolSlot {
+    pub client: Client,
+    pub accept_lang: &'static str,
+    pub tag: &'static str,
 }
 
 static POOL: OnceCell<Vec<PoolSlot>> = OnceCell::new();
@@ -116,33 +121,33 @@ pub fn init_pool(timeout_ms: u64, no_impersonate: bool) {
         // a single repeating JA4 hash. Includes mobile profiles (iOS Safari,
         // Firefox Android) because the mobile share of real internet traffic
         // is roughly 50%; an all-desktop scan stands out.
-        let profiles: &[(Emulation, &str)] = &[
+        let profiles: &[(Emulation, &str, &str)] = &[
             // Desktop Chrome — broadest real-world share
-            (Emulation::Chrome137, "en-US,en;q=0.9"),
-            (Emulation::Chrome136, "en-US,en;q=0.9"),
-            (Emulation::Chrome135, "en-GB,en;q=0.9"),
-            (Emulation::Chrome133, "en-US,en;q=0.9,fr;q=0.8"),
-            (Emulation::Chrome131, "en-US,en;q=0.9,es;q=0.8"),
+            (Emulation::Chrome137, "en-US,en;q=0.9",       "chrome-137"),
+            (Emulation::Chrome136, "en-US,en;q=0.9",       "chrome-136"),
+            (Emulation::Chrome135, "en-GB,en;q=0.9",       "chrome-135"),
+            (Emulation::Chrome133, "en-US,en;q=0.9,fr;q=0.8", "chrome-133"),
+            (Emulation::Chrome131, "en-US,en;q=0.9,es;q=0.8", "chrome-131"),
             // Desktop Firefox
-            (Emulation::Firefox139, "en-US,en;q=0.5"),
-            (Emulation::Firefox136, "en-US,en;q=0.5,de;q=0.3"),
-            (Emulation::Firefox133, "en-US,en;q=0.5"),
+            (Emulation::Firefox139, "en-US,en;q=0.5",       "firefox-139"),
+            (Emulation::Firefox136, "en-US,en;q=0.5,de;q=0.3", "firefox-136"),
+            (Emulation::Firefox133, "en-US,en;q=0.5",       "firefox-133"),
             // Desktop Safari (macOS)
-            (Emulation::Safari18_5, "en-US,en;q=0.9"),
-            (Emulation::Safari18_3_1, "en-US,en;q=0.9"),
-            (Emulation::Safari18_2, "en-US,en;q=0.9"),
+            (Emulation::Safari18_5,   "en-US,en;q=0.9", "safari-18.5"),
+            (Emulation::Safari18_3_1, "en-US,en;q=0.9", "safari-18.3.1"),
+            (Emulation::Safari18_2,   "en-US,en;q=0.9", "safari-18.2"),
             // Desktop Edge (Chromium-based — distinct JA4 from Chrome because
             // of slightly different cipher suite ordering and HTTP-2 settings)
-            (Emulation::Edge134, "en-US,en;q=0.9"),
-            (Emulation::Edge131, "en-US,en;q=0.9"),
+            (Emulation::Edge134, "en-US,en;q=0.9", "edge-134"),
+            (Emulation::Edge131, "en-US,en;q=0.9", "edge-131"),
             // Mobile Safari (iOS)
-            (Emulation::SafariIos18_1_1, "en-US,en;q=0.9"),
-            (Emulation::SafariIos17_4_1, "en-US,en;q=0.9"),
+            (Emulation::SafariIos18_1_1, "en-US,en;q=0.9", "safari-ios-18.1.1"),
+            (Emulation::SafariIos17_4_1, "en-US,en;q=0.9", "safari-ios-17.4.1"),
             // Mobile Firefox (Android)
-            (Emulation::FirefoxAndroid135, "en-US,en;q=0.5"),
+            (Emulation::FirefoxAndroid135, "en-US,en;q=0.5", "firefox-android-135"),
         ];
         let mut pool: Vec<PoolSlot> = Vec::new();
-        for (emul, lang) in profiles {
+        for (emul, lang, tag) in profiles {
             let mut b = Client::builder()
                 .timeout(timeout)
                 .connect_timeout(timeout)
@@ -154,6 +159,7 @@ pub fn init_pool(timeout_ms: u64, no_impersonate: bool) {
                 pool.push(PoolSlot {
                     client: c,
                     accept_lang: lang,
+                    tag: if no_impersonate { "vanilla" } else { tag },
                 });
             }
         }
@@ -164,11 +170,23 @@ pub fn init_pool(timeout_ms: u64, no_impersonate: bool) {
                 pool.push(PoolSlot {
                     client: c,
                     accept_lang: "en-US,en;q=0.9",
+                    tag: "vanilla",
                 });
             }
         }
         pool
     });
+}
+
+/// Public accessor for the impersonation pool — the fuzz orchestrator needs
+/// direct access to the slot (client + accept_lang + tag) because it issues
+/// raw single-shot GETs with `redirect::Policy::none()` rather than going
+/// through `http_probe_once`'s manual hop-chasing loop.
+///
+/// `init_pool` MUST have been called before this — that's already done at the
+/// top of `main()` for both enrich and fuzz mode.
+pub fn pick_pool_slot() -> Option<&'static PoolSlot> {
+    pick_slot()
 }
 
 fn pick_slot() -> Option<&'static PoolSlot> {

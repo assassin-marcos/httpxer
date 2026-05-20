@@ -1,8 +1,8 @@
 [package]
 name = "httpxer"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2021"
-description = "Native httpx-enrichment replacement with TLS impersonation (JA3/JA4 + HTTP/2 SETTINGS) — Wappalyzer tech-detect, CDN tagging, NDJSON output. One static binary."
+description = "Native httpx-replacement: enrichment + path-fuzz with browser-grade TLS impersonation, wildcard auto-suppress, Wappalyzer tech-detect. One static binary."
 license = "MIT"
 authors = ["assassin-marcos"]
 rust-version = "1.75"
@@ -51,6 +51,18 @@ ipnetwork = "0.20"
 
 anyhow = "1"
 url    = "2"
+
+# ── Fuzz-mode deps (v0.3.0+) ────────────────────────────────────────────────
+# md-5: per-(host,path) snippet_md5 used by the wildcard detector to flag
+#       identical-body responses (e.g. CrowdRiff catch-all 404 pages).
+# hex:  lowercase hex encoding for snippet_md5 (matches retroh4ck-prober v0.1.0
+#       output format so downstream parsers don't have to switch case).
+# governor: token-bucket rate limiter for the per-host `--rate-limit` knob.
+# chrono:   ISO-8601 timestamp on every fuzz record (UTC).
+md-5     = "0.10"
+hex      = "0.4"
+governor = "0.6"
+chrono   = { version = "0.4", features = ["serde"] }
 
 # Self-update: pulls prebuilt release binaries from GitHub on `httpxer -u`.
 # Uses rustls so it doesn't drag in another OpenSSL dep (we already have
