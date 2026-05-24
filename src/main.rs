@@ -23,10 +23,13 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 
+mod auth;
 mod cdn;
+mod crawl;
 mod dns;
 mod fuzz;
 mod probe;
+mod recurse;
 mod techdetect;
 mod update;
 mod wildcard;
@@ -43,9 +46,11 @@ const EMBEDDED_FINGERPRINTS: &str = include_str!("../fingerprints.json");
     about = "Native httpx-enrichment replacement — status/title/server/CL/redirect/CDN/Wappalyzer."
 )]
 struct Args {
-    /// Input file (one hostname/URL per line, "-" for stdin)
+    /// Input file (one hostname/URL per line, "-" for stdin). Either `-l`
+    /// or `-u` is required (mutually compatible — `-u` is a one-host
+    /// shortcut).
     #[arg(short = 'l', long, alias = "list",
-          required_unless_present_any = ["update", "check_update", "uninstall"])]
+          required_unless_present_any = ["update", "check_update", "uninstall", "target"])]
     input: Option<String>,
 
     /// Output NDJSON file
@@ -141,10 +146,15 @@ struct Args {
     // All flags below are inert in enrich mode.
     /// Wordlist file (one path per line) — when set, switches to fuzz mode
     /// (host × path probe). Empty paths and `#` comments are skipped.
+    /// v0.3.7 also accepts `-w` / `--wordlist` / `--wordlists` for
+    /// dirsearch-muscle-memory compat (all aliases point at the same flag).
     #[arg(
         short = 'p',
         long = "paths",
+        visible_short_alias = 'w',
         alias = "path",
+        visible_alias = "wordlist",
+        alias = "wordlists",
         help_heading = "Fuzz mode"
     )]
     paths: Option<String>,
@@ -190,6 +200,115 @@ struct Args {
     #[arg(long = "include-errors", help_heading = "Fuzz mode")]
     include_errors: bool,
 
+    /// (fuzz) Status codes to EXCLUDE from output (default `429,503` —
+    /// transient overload). Empty to disable. 403/404 are NOT in the
+    /// default because they can be real findings (Apache reveal-on-403,
+    /// stack-trace 404s).
+    #[arg(
+        long = "exclude",
+        alias = "exclude-codes",
+        alias = "exclude-status",
+        default_value = "429,503",
+        help_heading = "Fuzz mode"
+    )]
+    exclude_codes: String,
+
+    /// (fuzz) Alias of `--match-codes` for dirsearch-muscle-memory users.
+    #[arg(short = 'i', long = "include", help_heading = "Fuzz mode")]
+    include_status: Option<String>,
+
+    // ── Recursion (v0.3.7) ─────────────────────────────────────────────
+    /// Enable recursive fuzz — discovered directories get re-fuzzed with
+    /// the same wordlist up to `-R` levels deep. Per-directory multi-sample
+    /// wildcard fingerprinting prevents soft-404 / catchall cascades.
+    /// Default: off (single-round, v0.3.6 behavior).
+    #[arg(short = 'r', long = "recursive", help_heading = "Recursion")]
+    recursive: bool,
+
+    /// (recursion) Max depth. Default 3 when `-r` is on.
+    #[arg(
+        short = 'R',
+        long = "recursion-depth",
+        default_value_t = 3,
+        help_heading = "Recursion"
+    )]
+    recursion_depth: u8,
+
+    /// (recursion) Also recurse on 200 + autoindex marker (`Index of /`).
+    #[arg(long = "recurse-on-200", help_heading = "Recursion")]
+    recurse_on_200: bool,
+
+    /// (recursion) Also recurse on 403 (off by default — WAF noise prone).
+    #[arg(long = "recurse-on-403", help_heading = "Recursion")]
+    recurse_on_403: bool,
+
+    /// (recursion) Hard cap on discovered directories per input host.
+    #[arg(long = "max-dirs-per-host", default_value_t = 200, help_heading = "Recursion")]
+    max_dirs_per_host: usize,
+
+    /// (recursion) Hard cap on total probes per input host across all rounds.
+    #[arg(long = "max-probes-per-host", default_value_t = 50_000, help_heading = "Recursion")]
+    max_probes_per_host: usize,
+
+    /// (recursion) Override the built-in --exclude-subdirs default list
+    /// (asset/traversal noise). Comma-separated. Empty string = disable
+    /// excludes entirely.
+    #[arg(long = "exclude-subdirs", help_heading = "Recursion")]
+    exclude_subdirs: Option<String>,
+
+    /// (recursion) Append to the built-in --exclude-subdirs list
+    /// (doesn't replace defaults; just adds).
+    #[arg(long = "add-excludes", help_heading = "Recursion")]
+    add_excludes: Option<String>,
+
+    // ── Crawl (v0.3.7) ─────────────────────────────────────────────────
+    /// Enable response crawling — parse HTML/robots.txt/sitemap.xml for
+    /// endpoints and add them to the fuzz frontier. Same-host scope by
+    /// default; static assets + third-party CDNs filtered out.
+    #[arg(long = "crawl", help_heading = "Crawl")]
+    crawl: bool,
+
+    /// (crawl) Max crawl depth. Default = `--recursion-depth`.
+    #[arg(long = "crawl-depth", help_heading = "Crawl")]
+    crawl_depth: Option<u8>,
+
+    /// (crawl) Cap on URLs extracted per response (default 200).
+    #[arg(long = "max-links-per-page", default_value_t = 200, help_heading = "Crawl")]
+    max_links_per_page: usize,
+
+    /// (crawl) Override the same-host default scope. Comma-separated host
+    /// patterns. Supports `*.example.com` wildcard suffix.
+    /// Built-in third-party deny list (Google/Cloudflare/CDN hosts) still
+    /// applies regardless.
+    #[arg(long = "scope", help_heading = "Crawl")]
+    scope: Option<String>,
+
+    // ── Misc fuzz behavior (v0.3.7) ────────────────────────────────────
+    /// (fuzz) Follow redirects within fuzz probes (3xx normally a finding).
+    /// Auto-on when `--crawl` is set.
+    #[arg(long = "fuzz-follow-redirects", help_heading = "Fuzz mode")]
+    fuzz_follow_redirects: bool,
+
+    // ── Auth (v0.3.7) ──────────────────────────────────────────────────
+    /// Custom request header. Repeatable. Format `"Name: Value"`.
+    #[arg(short = 'H', long = "header", help_heading = "Auth")]
+    headers: Vec<String>,
+
+    /// `Authorization: Bearer TOKEN` shortcut.
+    #[arg(long = "bearer", help_heading = "Auth")]
+    bearer: Option<String>,
+
+    /// Cookie to attach (initial seed). Repeatable. Format `"Name=Value"`.
+    /// wreq's cookie jar persists `Set-Cookie` responses across requests.
+    #[arg(long = "cookie", help_heading = "Auth")]
+    cookies: Vec<String>,
+
+    // ── Convenience ─────────────────────────────────────────────────────
+    /// Single-target shortcut (alternative to `-l file`). Equivalent to
+    /// passing a one-line input file.
+    #[arg(short = 'u', long = "target")]
+    target: Option<String>,
+
     /// HTTP / HTTPS / SOCKS5 proxy URL. Applied to EVERY client in the
     /// 16-slot pool, so both enrich and fuzz modes route through the same
     /// upstream. Accepts `http://host:port`, `https://host:port`,
@@ -199,8 +318,10 @@ struct Args {
     proxy: Option<String>,
 
     // ── Self-management ────────────────────────────────────────────────
-    /// Install the latest release (replaces this binary in place)
-    #[arg(short = 'u', long, help_heading = "Self-management")]
+    /// Install the latest release (replaces this binary in place).
+    /// Short flag is `-U` (uppercase) — `-u` was reclaimed for `--target`
+    /// in v0.3.7 for dirsearch-muscle-memory compat.
+    #[arg(short = 'U', long, help_heading = "Self-management")]
     update: bool,
 
     /// Check for updates and exit (no install)
@@ -723,15 +844,26 @@ async fn main() -> Result<()> {
         }
     }
 
-    let input_path = args
-        .input
-        .as_deref()
-        .context("missing -l/--list input file")?;
     let output_path = args.output.as_deref().context("missing -o/--output path")?;
 
-    // 1. Read + dedupe input.
-    let mut hosts = read_hosts(input_path)?;
+    // 1. Read + dedupe input. `-u TARGET` is a one-host shortcut that
+    //    short-circuits the file read entirely. When BOTH `-u` and `-l`
+    //    are passed, the target gets prepended to the file's list (then
+    //    deduped).
+    let mut hosts: Vec<String> = Vec::new();
+    if let Some(t) = args.target.as_deref() {
+        hosts.push(t.to_string());
+    }
+    if let Some(p) = args.input.as_deref() {
+        hosts.extend(read_hosts(p)?);
+    }
+    // Dedupe while preserving first-seen order.
+    let mut seen_inputs: HashSet<String> = HashSet::new();
+    hosts.retain(|h| seen_inputs.insert(h.clone()));
     let initial = hosts.len();
+    if initial == 0 {
+        anyhow::bail!("no input — pass `-u URL` or `-l file`");
+    }
     eprintln!("[+] input: {} unique hosts", initial);
 
     // 2a. FUZZ MODE — triggered by `-path / --paths <wordlist>`.
@@ -756,28 +888,94 @@ async fn main() -> Result<()> {
             eprintln!("[+] TLS impersonation: DISABLED (--no-impersonate)");
         }
 
-        let match_codes: Vec<u16> = args
-            .match_codes
+        // -i / --include is a dirsearch-style alias for --match-codes.
+        // When passed, it OVERRIDES match-codes.
+        let codes_source = args
+            .include_status
+            .as_deref()
+            .unwrap_or(args.match_codes.as_str());
+        let match_codes: Vec<u16> = codes_source
             .split(',')
             .filter_map(|s| s.trim().parse::<u16>().ok())
             .collect();
         if match_codes.is_empty() {
             anyhow::bail!(
-                "--match-codes parsed to zero codes (got '{}')",
-                args.match_codes
+                "match codes parsed to zero (got '{}')",
+                codes_source
             );
         }
+        let exclude_codes: Vec<u16> = args
+            .exclude_codes
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u16>().ok())
+            .collect();
+
+        // Build the auth ctx (validates header/cookie syntax up-front).
+        let auth_ctx = auth::AuthCtx::from_cli(
+            &args.headers,
+            args.bearer.as_deref(),
+            &args.cookies,
+        )?;
+        let extra_headers: Vec<(String, String)> = auth_ctx
+            .headers
+            .iter()
+            .map(|(n, v)| (n.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+
+        // Exclude-subdirs: built-in defaults unless --exclude-subdirs
+        // override is passed; --add-excludes always appends.
+        let exclude_subdirs = recurse::build_exclude_set(
+            args.exclude_subdirs.as_deref(),
+            args.add_excludes.as_deref(),
+        );
+
+        // Scope: empty = same-host-as-input default.
+        let scope_hosts: Vec<String> = args
+            .scope
+            .as_deref()
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Recursion off when `-r` not passed; otherwise honour -R depth.
+        let recursion_depth = if args.recursive { args.recursion_depth } else { 0 };
+        // Crawl-depth defaults to recursion-depth (so a single -R bumps both).
+        let crawl_depth = args.crawl_depth.unwrap_or(args.recursion_depth);
+        // Crawl auto-follows redirects to capture terminal-page bodies.
+        let fuzz_follow_redirects = args.fuzz_follow_redirects || args.crawl;
 
         let cfg = fuzz::FuzzCfg {
             match_codes,
+            exclude_codes,
             body_preview_bytes: args.body_preview,
             wildcard_policy: policy,
+            wildcard_samples: 3,
             include_errors: args.include_errors,
             retries: args.retries,
             via_proxy: args.proxy.is_some(),
             threads: args.threads,
             timeout_ms: args.timeout_ms,
             rate_limit_rps: args.rate_limit,
+            recursion_depth,
+            recurse_on_200: args.recurse_on_200,
+            recurse_on_403: args.recurse_on_403,
+            max_dirs_per_host: args.max_dirs_per_host,
+            max_probes_per_host: args.max_probes_per_host,
+            similarity_window: 2,
+            crawl_enabled: args.crawl,
+            crawl_depth,
+            crawl_robots: true,
+            crawl_sitemap: true,
+            max_links_per_page: args.max_links_per_page,
+            scope_hosts,
+            exclude_subdirs,
+            fuzz_follow_redirects,
+            initial_cookie_header: auth_ctx.initial_cookie_header(),
+            extra_headers,
         };
 
         fuzz::run(&hosts, &words, cfg, output_path, args.no_resume, policy).await?;

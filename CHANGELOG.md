@@ -2,6 +2,66 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.3.7] — 2026-05-25
+
+### Added (foundation + FP-hardening that ships today)
+- **Multi-sample wildcard fingerprinting (the big FP killer).** Pre-flight now probes 3 random hex paths per host (was 1) and REQUIRES all three to agree on `(status, content_length, content_type, snippet_md5)` before recording a wildcard. Disagreement marks the host path-sensitive and emits a stderr warning — no suppression there (so we don't over-suppress real findings on dynamic servers). Defeats dirsearch's / ffuf's single-sample failure mode on catchall / SPA / per-path-varying servers. `wildcard::agreed_from_samples()` is the new helper.
+- **Auth — `-H` / `--bearer` / `--cookie`.** Repeatable `-H "Name: Value"` for custom headers, `--bearer TOKEN` shortcut for `Authorization: Bearer`, `--cookie "Name=Value"` for initial cookie seed. All validated at CLI parse so typos fail loudly before the scan runs. New `src/auth.rs` module with `AuthCtx::from_cli()`.
+- **`-u` / `--target <URL>` shortcut** — single-target convenience, no need to make a file for one-host scans. Mutually compatible with `-l`. (`-u` for update relocated to `-U`; long form `--update` unchanged.)
+- **`-i` / `--include <codes>`** — dirsearch-style alias for `--match-codes`. Lets users paste their dirsearch invocation verbatim.
+- **`--exclude <codes>` / `--exclude-codes` / `--exclude-status`** — status code exclude filter. Default `"429,503"` (transient overload only; 403/404 stay in because they can be real findings). All three flag names accepted.
+- **`-w` / `--wordlist` / `--wordlists`** — aliases for `-p` / `--paths`.
+- **Smart `--exclude-subdirs` built-in default list.** New `src/recurse.rs` ships `DEFAULT_EXCLUDE_SUBDIRS` covering 40+ asset directories (`assets`, `static`, `css`, `js`, `_next`, `_nuxt`, `node_modules`), encoded path-traversal noise (`%2e%2e`, `..%2f`, `..;`), Java path-param tricks (`%3b`, `;`), and noisy health endpoints (`healthz`, `_status`). User can `--exclude-subdirs <list>` to override entirely or `--add-excludes <list>` to append.
+- **`--fuzz-follow-redirects`** — opt-in redirect chasing inside fuzz mode (default: 3xx is a finding). Auto-on when `--crawl` set (crawl needs terminal-page body to parse links).
+- **CLI scaffolding for v0.3.8 recursion + crawl.** All flags parse + validate + populate `FuzzCfg` today: `-r/--recursive`, `-R/--recursion-depth`, `--crawl`, `--crawl-depth`, `--recurse-on-200`, `--recurse-on-403`, `--max-dirs-per-host`, `--max-probes-per-host`, `--max-links-per-page`, `--scope`. The supporting modules (`recurse.rs`, `crawl.rs`) are shipped + unit-tested. **Multi-round orchestration lands in v0.3.8** — using `-r` / `--crawl` today produces a stderr warning and a single-pass run with the v0.3.7 FP guards active.
+
+### New modules (foundational; ~750 LOC)
+- **`src/auth.rs`** (8 tests) — header / bearer / cookie parsing with up-front validation.
+- **`src/recurse.rs`** (10 tests) — built-in exclude-subdirs list, strict directory detector (301/302/307/308 with Location-parity check; 200 + Index-of marker opt-in; 403 opt-in), self-similarity loop detector (window-K segment-tail comparison + cross-URL visited index), per-host probe / dir budgets via atomic counters, canonical-URL key for the visited-set.
+- **`src/crawl.rs`** (12 tests) — HTML link extractor (regex-based, covers `<a>`, `<link>`, `<script>`, `<img>`, `<form>`, `<iframe>`, `<source>`, `<embed>`, `<object>`, `<meta http-equiv=refresh>`), robots.txt parser (Disallow / Allow / Sitemap directives), sitemap.xml extractor (`<loc>` URLs), built-in 41-host third-party CDN deny list (Google / Cloudflare / Fastly / Stripe / Segment / etc.), static-asset extension filter (40+ extensions: `.css/.js/.png/.jpg/.svg/.woff/...`), scope filter with `*.example.com` wildcard support, self-referencing URL drop.
+
+### Fixed
+- `is_self_similar()` cross-URL check no longer early-returns on URLs shorter than `window * 2` segments. The within-URL self-repeat check still needs that minimum; the cross-URL index lookup works on any URL with at least `window` segments. Caught by my own regression test (`index_then_detect_cross_url_loop`).
+
+### Changed
+- Version: 0.3.6 → **0.3.7**
+- `dispatch_one()` signature gained `extra_headers`, `initial_cookie_header`, `follow_redirects` parameters. All call sites updated.
+- `wildcard_preflight()` signature gained auth-passthrough parameters.
+- `FuzzCfg` grew 18 new fields (recursion / crawl / auth / smart defaults). All have sensible defaults so existing call sites construct without surprise.
+- `FuzzRecord` gained 3 new optional fields (`depth`, `source`, `parent_url`), all `skip_serializing_if`-gated → output is byte-compatible with v0.3.6 at depth 0.
+- Self-management short flag `-u` → `-U` (`-u` reclaimed for `--target` per dirsearch convention; `--update` long form unchanged).
+
+### Tests
+- **57 unit tests passing** (up from 23). New: 8 (auth) + 10 (recurse) + 12 (crawl) + 4 (wildcard multi-sample) — covering each new building block in isolation.
+
+### Deferred to v0.3.8
+- **Recursion orchestration** — `-r` parses + the recurse module is wired + budgets respected + smart excludes applied, but the multi-round per-prefix-fuzz loop runs single-pass today. Stderr warning when `-r` is set so users aren't misled.
+- **Crawl integration** — `--crawl` parses + `crawl.rs` extractors are unit-tested, but the per-probe link extraction → frontier enqueue loop ships next. Stderr warning identical to above.
+- **Tech-detect-driven `-e auto`** — extension preset infrastructure not yet wired.
+- **Output format dispatcher** (`--format jsonl|csv|plain`) — JSONL-only today.
+- **6-layer multi-signal detector** (dynamic-bit-stripping md5, DOM-structure hash, multi-provider WAF challenge fingerprints) — single-signal multi-sample is the v0.3.7 floor; full layered detector lands in v0.3.8.
+- **Auto-throttle on 429 spike** — `--rate-limit` works manually; reactive auto-engage lands next.
+- **Exponential backoff retries** — current 50 ms-fixed backoff stays.
+
+### Unchanged (compatibility)
+- Default enrich JSONL shape: byte-compatible with v0.3.6.
+- Default fuzz JSONL shape at depth 0 (which is everything in v0.3.7): byte-compatible with v0.3.6.
+- All v0.3.6 CLI flags continue to work unchanged.
+
+### Migration cheatsheet — dirsearch → httpxer v0.3.7
+
+```bash
+# dirsearch
+dirsearch -u https://target.com -w common.txt -i 200,301,401 \
+  --exclude-status=429 -H "X-Forwarded-For: 127.0.0.1" -o out.jsonl
+
+# httpxer v0.3.7 (paste-compatible)
+httpxer -u https://target.com -w common.txt -i 200,301,401 \
+  --exclude 429 -H "X-Forwarded-For: 127.0.0.1" -o out.jsonl
+```
+
+Add `-r` (recursive) or `--crawl` to opt into the v0.3.8 features (stderr warning today; behaviour ships next release).
+
 ## [0.3.6] — 2026-05-20
 
 ### Fixed

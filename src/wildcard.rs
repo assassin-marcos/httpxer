@@ -24,6 +24,24 @@ pub struct WildcardSig {
     pub snippet_md5: String,
 }
 
+/// Multi-sample agreement check. Given N samples (typically 3), return
+/// `Some(sig)` when ALL samples agree on `(content_length, content_type,
+/// snippet_md5)` — that's a rock-solid wildcard signal.
+///
+/// Returns `None` when any sample differs, signalling the server is
+/// path-sensitive at this level — we SHOULDN'T trust a single-sample
+/// fingerprint AND SHOULDN'T recurse because we can't tell signal from
+/// noise. This is the v0.3.7 hardening of the single-sample dirsearch /
+/// ffuf model; gracefully degrades to single-sample when N=1.
+pub fn agreed_from_samples(samples: &[WildcardSig]) -> Option<WildcardSig> {
+    let first = samples.first()?.clone();
+    if samples.iter().all(|s| s == &first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
 /// In-memory map of host → wildcard signature. Constructed once at fuzz
 /// pre-flight then handed out to workers as `Arc<WildcardMap>`.
 #[derive(Debug, Default)]
@@ -101,6 +119,48 @@ mod tests {
         assert!(m.matches("https://x.com/admin", 200, "text/html", "bbb"));
         // No cross-contamination.
         assert!(!m.matches("https://x.com/api", 200, "text/html", "bbb"));
+    }
+
+    #[test]
+    fn agreed_three_identical_samples() {
+        let s = WildcardSig {
+            content_length: 100,
+            content_type: "text/html".into(),
+            snippet_md5: "abc".into(),
+        };
+        let samples = vec![s.clone(), s.clone(), s.clone()];
+        assert_eq!(agreed_from_samples(&samples), Some(s));
+    }
+
+    #[test]
+    fn agreed_returns_none_when_samples_disagree() {
+        let a = WildcardSig {
+            content_length: 100,
+            content_type: "text/html".into(),
+            snippet_md5: "abc".into(),
+        };
+        let b = WildcardSig {
+            content_length: 100,
+            content_type: "text/html".into(),
+            snippet_md5: "DIFFERENT".into(),
+        };
+        let samples = vec![a.clone(), a, b];
+        assert!(agreed_from_samples(&samples).is_none());
+    }
+
+    #[test]
+    fn agreed_single_sample_passes_through() {
+        let s = WildcardSig {
+            content_length: 100,
+            content_type: "text/html".into(),
+            snippet_md5: "abc".into(),
+        };
+        assert_eq!(agreed_from_samples(&[s.clone()]), Some(s));
+    }
+
+    #[test]
+    fn agreed_empty_returns_none() {
+        assert!(agreed_from_samples(&[]).is_none());
     }
 
     #[test]

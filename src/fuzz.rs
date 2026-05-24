@@ -36,7 +36,7 @@ use tokio::sync::{Mutex, Semaphore};
 use wreq::redirect::Policy;
 
 use crate::probe;
-use crate::wildcard::{WildcardMap, WildcardSig};
+use crate::wildcard::{self, WildcardMap, WildcardSig};
 
 /// Max bytes read from the wire per fuzz probe. Same cap as retroh4ck-prober
 /// v0.1.0 — keeps memory bounded under high concurrency on misbehaving
@@ -101,6 +101,25 @@ struct FuzzRecord {
     error: Option<String>,
     timestamp: String,
     prober: &'static str,
+
+    // ── v0.3.7 additions (recursion + crawl provenance) ────────────────
+    // All three are `skip_serializing_if`-gated so depth-0 wordlist hits
+    // remain byte-compatible with the v0.3.6 schema.
+    /// Round / recursion depth — 0 for the initial host × wordlist pass.
+    #[serde(skip_serializing_if = "is_u8_zero", default)]
+    depth: u8,
+    /// Probe origin tag. Empty at depth 0. One of: "wordlist",
+    /// "recursion", "crawl-html", "crawl-robots", "crawl-sitemap".
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    source: String,
+    /// Parent directory or response URL this probe was derived from.
+    /// Empty at depth 0.
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    parent_url: String,
+}
+
+fn is_u8_zero(v: &u8) -> bool {
+    *v == 0
 }
 
 /// Per-(host,path) work item.
@@ -121,14 +140,49 @@ struct ProbeItem {
 #[allow(dead_code)]
 pub struct FuzzCfg {
     pub match_codes: Vec<u16>,
+    /// Status codes to EXCLUDE from output even when they're in match_codes.
+    /// Default `[429, 503]` — transient overload codes that rarely indicate
+    /// real findings. Empty = exclude nothing.
+    pub exclude_codes: Vec<u16>,
     pub body_preview_bytes: usize,
     pub wildcard_policy: WildcardPolicy,
+    /// Wildcard pre-flight sample count. v0.3.7 default 3; all must agree
+    /// on `(content_length, content_type, snippet_md5)` to trust the
+    /// fingerprint. Disagreement → mark dir path-sensitive → skip recursion.
+    pub wildcard_samples: u8,
     pub include_errors: bool,
     pub retries: u32,
     pub via_proxy: bool, // true iff --proxy was set
     pub threads: usize,
     pub timeout_ms: u64,
     pub rate_limit_rps: f64,
+    // ── Recursion (v0.3.7) ─────────────────────────────────────────────
+    /// Max recursion depth. 0 = off (backwards compatible with v0.3.6).
+    pub recursion_depth: u8,
+    pub recurse_on_200: bool,
+    pub recurse_on_403: bool,
+    pub max_dirs_per_host: usize,
+    pub max_probes_per_host: usize,
+    /// Self-similarity window for loop detection (default 2). 0 = disabled.
+    pub similarity_window: usize,
+    // ── Crawl (v0.3.7) ─────────────────────────────────────────────────
+    pub crawl_enabled: bool,
+    pub crawl_depth: u8,
+    pub crawl_robots: bool,
+    pub crawl_sitemap: bool,
+    pub max_links_per_page: usize,
+    pub scope_hosts: Vec<String>,
+    /// Built-in + user-overridden subdirectory exclude list (lowercased).
+    pub exclude_subdirs: std::collections::HashSet<String>,
+    // ── Misc behavior (v0.3.7) ─────────────────────────────────────────
+    /// Follow redirects within fuzz probes (default off — 3xx is a finding).
+    /// Auto-on when crawl_enabled (crawl needs terminal URL + body).
+    pub fuzz_follow_redirects: bool,
+    /// Cookie header to attach to every request (initial-state seed).
+    /// Built from `--cookie name=value` entries.
+    pub initial_cookie_header: Option<String>,
+    /// Additional headers from `--header`/`--bearer`. Empty when no auth.
+    pub extra_headers: Vec<(String, String)>,
 }
 
 /// Wildcard-handling policy. `strict` (default) suppresses any record whose
@@ -399,6 +453,9 @@ async fn dispatch_one(
     url: &str,
     host_key: &str,
     body_preview_bytes: usize,
+    extra_headers: &[(String, String)],
+    initial_cookie_header: Option<&str>,
+    follow_redirects: bool,
 ) -> Result<(ParsedResp, &'static str, String), String> {
     // Pin one TLS profile per host so the wildcard fingerprint computed at
     // pre-flight (snippet_md5 etc.) matches what the actual fuzz probes
@@ -406,21 +463,37 @@ async fn dispatch_one(
     // signatures diverge on UA-varying servers.
     let slot = probe::pick_pool_slot_for(host_key)
         .ok_or_else(|| "probe pool not initialised".to_string())?;
-    let resp = slot
+    // Redirect policy: per-request override. Crawl mode wants the terminal
+    // body (so we can parse links from the final landing page); fuzz mode
+    // default keeps 3xx as a finding.
+    let redirect_policy = if follow_redirects {
+        Policy::limited(10)
+    } else {
+        Policy::none()
+    };
+    let mut req = slot
         .client
         .get(url)
-        // Per-request override — keeps the SHARED enrich pool's default
-        // policy (`limited(10)`) untouched while making this single
-        // request return 3xx unchased.
-        .redirect(Policy::none())
+        .redirect(redirect_policy)
         .header("Accept-Language", slot.accept_lang)
         .header(
             "Accept",
             "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        )
-        .send()
-        .await
-        .map_err(|e| short_err(&e.to_string()))?;
+        );
+    // Auth headers — user-supplied via -H / --bearer. Validated at CLI
+    // parse so the per-request attach is safe.
+    for (n, v) in extra_headers {
+        req = req.header(n.as_str(), v.as_str());
+    }
+    // Initial cookie seed — user-supplied via --cookie. Once wreq's
+    // cookie_store is enabled the response Set-Cookie persists for follow-up
+    // requests to the same domain. (v0.3.7 ships header-attach only;
+    // cookie_store wiring lands in v0.3.8 when the pool builder gets a
+    // .cookie_store(true) toggle.)
+    if let Some(c) = initial_cookie_header {
+        req = req.header("Cookie", c);
+    }
+    let resp = req.send().await.map_err(|e| short_err(&e.to_string()))?;
 
     let status = resp.status().as_u16();
 
@@ -497,9 +570,26 @@ async fn dispatch_one(
 
 /// Public for `main()` — same signature dispatch_one returns, used by the
 /// wildcard pre-flight probe.
-async fn wildcard_preflight(host_input: &str, body_preview_bytes: usize) -> Option<WildcardSig> {
+async fn wildcard_preflight(
+    host_input: &str,
+    body_preview_bytes: usize,
+    extra_headers: &[(String, String)],
+    initial_cookie_header: Option<&str>,
+) -> Option<WildcardSig> {
     let url = format!("{}{}", host_input, random_hex_path(32));
-    let (parsed, _tag, _ua) = match dispatch_one(&url, host_input, body_preview_bytes).await {
+    // Pre-flight ALWAYS uses follow_redirects=false: a 3xx to e.g. /login
+    // would otherwise let the wildcard fingerprint reflect the login page
+    // instead of the catchall.
+    let (parsed, _tag, _ua) = match dispatch_one(
+        &url,
+        host_input,
+        body_preview_bytes,
+        extra_headers,
+        initial_cookie_header,
+        false,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(_) => return None,
     };
@@ -655,25 +745,74 @@ pub async fn run(
         wildcard_policy.as_str(),
     );
 
-    // ── Wildcard pre-flight per host (unless `off`). Sequential — most runs
-    //    have <50 hosts and we want the fingerprints printed before fuzz
-    //    starts hammering paths.
+    // v0.3.7 honesty notice — `-r` / `--crawl` parse and validate, the
+    // supporting modules (recurse.rs, crawl.rs) are shipped + tested, but
+    // the multi-round ORCHESTRATION wires them in v0.3.8. Today's run uses
+    // the v0.3.7 single-pass path with the new FP guards (multi-sample
+    // wildcards, auth, exclude-codes). Without this warning users would
+    // assume they were getting recursive behaviour they aren't.
+    if cfg.recursion_depth > 0 || cfg.crawl_enabled {
+        eprintln!(
+            "[!] -r / --crawl: v0.3.7 ships the foundation (modules, CLI flags, \
+             multi-sample wildcards). Multi-round orchestration lands in v0.3.8. \
+             This run will single-pass with v0.3.7 FP guards."
+        );
+    }
+
+    // ── Multi-sample wildcard pre-flight per host (v0.3.7).
+    //    Probes N random hex paths (default 3); requires all N to AGREE
+    //    on (status, content_length, content_type, snippet_md5). Disagreement
+    //    = server is path-sensitive → no wildcard recorded (we can't trust
+    //    a single-sample fingerprint when the server varies per path).
+    //    This is the killer FP guard that defeats dirsearch's single-sample
+    //    failure mode on dynamic / catchall servers.
     let mut wildcard_map = WildcardMap::new();
     if !matches!(wildcard_policy, WildcardPolicy::Off) {
+        let n_samples = cfg.wildcard_samples.max(1) as usize;
         for h in hosts.iter() {
             let input = host_to_input(h);
             let host = bare_host(&input);
-            if let Some(sig) = wildcard_preflight(&input, cfg.body_preview_bytes).await {
-                eprintln!(
-                    "  [wildcard] {} cl={} md5={}",
-                    host, sig.content_length, sig.snippet_md5
-                );
-                // Key by the FULL `host_to_input` form (scheme + host + any
-                // path prefix), not bare host. Two inputs that share a
-                // hostname but differ in path-prefix (`https://x/api` vs
-                // `https://x/admin`) used to collide and the second wildcard
-                // probe silently overwrote the first.
-                wildcard_map.insert(input, sig);
+            let mut samples: Vec<WildcardSig> = Vec::with_capacity(n_samples);
+            for _ in 0..n_samples {
+                if let Some(sig) = wildcard_preflight(
+                    &input,
+                    cfg.body_preview_bytes,
+                    &cfg.extra_headers,
+                    cfg.initial_cookie_header.as_deref(),
+                )
+                .await
+                {
+                    samples.push(sig);
+                }
+            }
+            match wildcard::agreed_from_samples(&samples) {
+                Some(sig) => {
+                    eprintln!(
+                        "  [wildcard] {} cl={} md5={} ({} samples agreed)",
+                        host, sig.content_length, sig.snippet_md5, n_samples
+                    );
+                    // Key by the FULL `host_to_input` form (scheme + host +
+                    // any path prefix), not bare host — two inputs that
+                    // share a hostname but differ in path-prefix used to
+                    // collide and the second wildcard probe silently
+                    // overwrote the first.
+                    wildcard_map.insert(input, sig);
+                }
+                None if samples.len() < n_samples => {
+                    // Some probes failed entirely (404 / timeout / not 2xx-3xx).
+                    // Common case for well-behaved targets that 404 random
+                    // paths. NOT path-sensitive — just no wildcard to record.
+                }
+                None => {
+                    // All samples returned but disagreed → path-sensitive
+                    // server. NO suppression here (would over-suppress real
+                    // findings). Flag for user awareness.
+                    eprintln!(
+                        "  [wildcard] {} → path-sensitive (samples disagreed); \
+                         emitting all findings, recursion skipped here",
+                        host
+                    );
+                }
             }
         }
         if wildcard_map.is_empty() {
@@ -777,7 +916,16 @@ async fn run_probe(
 
     while attempts < max_attempts {
         attempts += 1;
-        match dispatch_one(&url, &item.host_input, cfg.body_preview_bytes).await {
+        match dispatch_one(
+            &url,
+            &item.host_input,
+            cfg.body_preview_bytes,
+            &cfg.extra_headers,
+            cfg.initial_cookie_header.as_deref(),
+            cfg.fuzz_follow_redirects,
+        )
+        .await
+        {
             Ok((parsed, tag, ua)) => {
                 parsed_opt = Some(parsed);
                 tls_tag = tag;
@@ -814,8 +962,14 @@ async fn run_probe(
                 is_wildcard = true;
             }
 
-            // Status-code filter.
+            // Status-code filter (include then exclude).
             if !cfg.match_codes.contains(&parsed.status) {
+                return;
+            }
+            // v0.3.7 — `--exclude` filter (default `429,503`; user can
+            // override). Applied AFTER match-codes so the user can express
+            // both inclusion and exclusion in the same scan.
+            if cfg.exclude_codes.contains(&parsed.status) {
                 return;
             }
 
@@ -857,6 +1011,9 @@ async fn run_probe(
                 error: None,
                 timestamp: now_iso8601(),
                 prober: PROBER_TAG,
+                depth: 0,
+                source: String::new(),
+                parent_url: String::new(),
             };
             write_record(out_file, &rec).await;
         }
@@ -891,6 +1048,9 @@ async fn run_probe(
                 error: last_err,
                 timestamp: now_iso8601(),
                 prober: PROBER_TAG,
+                depth: 0,
+                source: String::new(),
+                parent_url: String::new(),
             };
             write_record(out_file, &rec).await;
         }
@@ -1021,6 +1181,9 @@ mod tests {
             error: None,
             timestamp: "2026-05-20T12:00:00.000Z".into(),
             prober: PROBER_TAG,
+            depth: 0,
+            source: String::new(),
+            parent_url: String::new(),
         };
         let s = serde_json::to_string(&rec).unwrap();
         assert!(s.contains("\"status_code\":200"));
