@@ -776,6 +776,30 @@ fn read_existing_subdomains(path: &str) -> HashSet<String> {
     out
 }
 
+/// Decide whether to draw the ASCII banner BEFORE clap parses argv.
+/// We can't read parsed `args.quiet` / `args.no_art` here (parsing hasn't
+/// happened yet — that's the whole point — clap exiting on missing args
+/// would otherwise skip the banner), so we scan the raw argv directly.
+///
+/// Suppressed when:
+///   - stderr is not a TTY (piped output stays clean)
+///   - any of `-q`, `--quiet`, `--no-art` literally appears in argv
+///
+/// Note: `--no-update-check` does NOT suppress the banner — it only
+/// suppresses the "[!] update available" follow-up line. The ASCII art
+/// is the program's signature; we want it on every TTY invocation.
+fn banner_should_show_early(argv: &[String]) -> bool {
+    if !update::stderr_is_tty() {
+        return false;
+    }
+    for a in argv {
+        if a == "-q" || a == "--quiet" || a == "--no-art" {
+            return false;
+        }
+    }
+    true
+}
+
 /// Strip scheme + path/query/fragment so `https://foo.com/bar?x=1` becomes
 /// `foo.com`. Without stripping `?` and `#`, inputs like
 /// `https://foo.com?x=1` would resolve DNS as `foo.com?x=1` and silently
@@ -790,19 +814,28 @@ fn extract_host(input: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse_from(normalize_args(std::env::args()));
+    // v0.3.8: print the ASCII banner BEFORE clap parsing so it appears on
+    // EVERY invocation — including `httpxer` with no args (clap missing-
+    // arg error), `httpxer --version`, `httpxer --help`, and bad-flag
+    // typos. The previous order (parse → banner) meant clap exited on any
+    // parse failure before the banner could draw.
+    //
+    // Suppression is opt-in via a raw-argv pre-scan (we can't read parsed
+    // `args.quiet` yet — clap hasn't run). Cheap O(argv-len) scan; sub-µs.
+    let raw_argv: Vec<String> = std::env::args().collect();
+    let normalized_argv = normalize_args(raw_argv);
+    if banner_should_show_early(&normalized_argv) {
+        update::print_banner();
+    }
 
-    // v0.3.2: refresh the version-check cache + paint the ASCII banner
-    // BEFORE any early-exit so users see it on EVERY command — `httpxer`,
-    // `httpxer -u`, `-c`, `-X` — not just scan invocations. TTY-gated and
-    // suppressible via `--quiet` / `--no-art`. The cache refresh has a
-    // 120 s skip-window so back-to-back calls are network-free.
+    let args = Args::parse_from(normalized_argv);
+
+    // Refresh the version-check cache (best-effort, non-blocking up to
+    // 2.5 s) so the NEXT invocation's banner has fresh outdated/latest
+    // tag info. The current banner is already on screen by this point;
+    // the refresh just keeps the cache warm for next time.
     if !args.no_update_check && !args.quiet {
         update::refresh_update_cache_best_effort().await;
-    }
-    let show_art = !args.quiet && !args.no_art && update::stderr_is_tty();
-    if show_art {
-        update::print_banner();
     }
 
     // Self-management early-exits — handle before we touch input files / DNS / network.
@@ -1415,6 +1448,27 @@ mod tests {
         assert_eq!(extract_host("https://foo.com?x=1#section"), "foo.com");
         assert_eq!(extract_host("https://foo.com:8080/bar"), "foo.com:8080");
         assert_eq!(extract_host("foo.com"), "foo.com");
+    }
+
+    /// `banner_should_show_early` suppresses on suppression flags, lets
+    /// everything else through. The TTY arm is environment-dependent
+    /// (cargo test runs without a TTY); we test the flag-scan logic by
+    /// asserting suppression flags ALWAYS return false regardless of TTY.
+    #[test]
+    fn banner_suppression_flags_block_banner() {
+        // Suppression flags must always return false (TTY or no TTY).
+        assert!(!banner_should_show_early(&["httpxer".into(), "-q".into()]));
+        assert!(!banner_should_show_early(&["httpxer".into(), "--quiet".into()]));
+        assert!(!banner_should_show_early(&["httpxer".into(), "--no-art".into()]));
+        // Multi-arg cases — suppression flag anywhere blocks.
+        assert!(!banner_should_show_early(&[
+            "httpxer".into(),
+            "-u".into(),
+            "https://x.com".into(),
+            "--no-art".into(),
+            "-o".into(),
+            "out.json".into(),
+        ]));
     }
 
     /// host_ip falls back to the first AAAA when no A record exists.

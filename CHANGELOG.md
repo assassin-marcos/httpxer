@@ -2,6 +2,53 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.3.8] — 2026-05-25
+
+UX-fix patch. The recursion/crawl orchestration originally planned for
+v0.3.8 is renumbered to v0.3.9 — this release ships fast to unblock
+users whose first `httpxer` invocation showed only a clap error with no
+banner.
+
+### Fixed
+- **ASCII banner now shows on EVERY invocation when stderr is a TTY** —
+  including bare `httpxer` (missing-args clap error), `httpxer --version`,
+  `httpxer --help`, and bad-flag typos. Pre-v0.3.8 the banner was drawn
+  AFTER clap parsing, so any parse failure exited before the banner ran.
+  Now we pre-scan raw argv for `-q` / `--quiet` / `--no-art` and draw the
+  banner BEFORE handing off to clap.
+  - TTY-gated still — piped output (`httpxer ... | jq`) stays clean.
+  - Suppression flag scan is O(argv-len), sub-µs.
+  - `--no-update-check` no longer suppresses the ASCII banner (it never
+    should have — that flag is for the "[!] update available" follow-up
+    line, not the brand mark). To hide the banner use `-q` / `--quiet`
+    / `--no-art`.
+
+### Added
+- `banner_should_show_early(argv)` helper + unit test
+  (`banner_suppression_flags_block_banner`) covering each suppression
+  flag and the multi-arg case.
+
+### Changed
+- Version: 0.3.7 → **0.3.8**
+- Banner-draw call site moved from after `Args::parse_from()` to before.
+- `refresh_update_cache_best_effort()` still runs after parsing but now
+  serves the NEXT invocation's banner (the current banner is already on
+  screen by the time the refresh starts).
+
+### Renumbered to v0.3.9
+- Multi-round recursion orchestration (modules + flags shipped in v0.3.7;
+  orchestrator wiring slides one release)
+- Crawl module integration (extractors + scope + asset filter shipped;
+  per-probe extraction loop slides one release)
+- Layer 2 path-length-adjusted CL wildcard detection (bumped to top
+  priority by the v0.3.7 benchmark vs dirsearch on path-echo targets)
+- All other deferrals from v0.3.7 (`-e auto`, `--format`, 6-layer
+  detector, auto-throttle, exponential backoff)
+
+### Unchanged (compatibility)
+- All v0.3.7 CLI flags work identically.
+- Output schemas unchanged.
+
 ## [0.3.7] — 2026-05-25
 
 ### Added (foundation + FP-hardening that ships today)
