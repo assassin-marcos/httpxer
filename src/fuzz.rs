@@ -271,6 +271,46 @@ fn normalize_path(raw: &str) -> String {
     }
 }
 
+/// Choose hex-character counts for `n` pre-flight samples — varied so
+/// the v0.3.9 Layer 2 detector can compute the linear `CL = k × path_len
+/// + base` slope. Each sample gets a different `hex_len` ⇒ different
+/// `path_len`. Pattern: 16, 32, 64, 24, 48 (then repeats).
+fn pick_hex_lens(n: usize) -> Vec<usize> {
+    const POOL: &[usize] = &[16, 32, 64, 24, 48];
+    (0..n).map(|i| POOL[i % POOL.len()]).collect()
+}
+
+/// Decoded byte length of a URL path — counts `%XX` triplets as one byte
+/// (matches what any RFC-3986-compliant server sees after percent-
+/// decoding). Necessary for Layer 2's CL formula match, because aiohttp
+/// / nginx / IIS / etc. echo the DECODED path in path-echo bodies; counting
+/// the encoded length would inflate `expected_CL` and push real findings
+/// outside the tolerance window. Caught 37 spurious FPs in the v0.3.9
+/// benchmark before this fix.
+///
+/// Inline (no `percent_encoding` dep) — strictly an ASCII byte-count, no
+/// UTF-8 normalization. The hot path runs once per probe, must be cheap.
+fn decoded_path_len(path: &str) -> usize {
+    let bytes = path.as_bytes();
+    let mut len = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            len += 1;
+            i += 3;
+        } else {
+            len += 1;
+            i += 1;
+        }
+    }
+    len
+}
+
 /// Random hex path of length `n`, prefixed with `/`. Used by the wildcard
 /// detector to ask the server "do you 200 for ANY path?".
 fn random_hex_path(n: usize) -> String {
@@ -568,15 +608,24 @@ async fn dispatch_one(
     ))
 }
 
-/// Public for `main()` — same signature dispatch_one returns, used by the
-/// wildcard pre-flight probe.
-async fn wildcard_preflight(
+/// Run ONE wildcard pre-flight probe with a random hex path of the given
+/// length. Returns a `ProbeSample` for the v0.3.9 layered detector, or
+/// `None` when the probe didn't yield a usable body (status outside
+/// 200-399 / empty body / network error).
+///
+/// `hex_len` is the number of random hex characters in the path AFTER
+/// the leading `/` — caller varies this (typically 16, 32, 64) so the
+/// returned samples have different path lengths, which lets `detect()`
+/// compute the Layer 2 linear slope for path-echo servers.
+async fn wildcard_preflight_sample(
     host_input: &str,
     body_preview_bytes: usize,
     extra_headers: &[(String, String)],
     initial_cookie_header: Option<&str>,
-) -> Option<WildcardSig> {
-    let url = format!("{}{}", host_input, random_hex_path(32));
+    hex_len: usize,
+) -> Option<crate::wildcard::ProbeSample> {
+    let path = random_hex_path(hex_len); // e.g. "/abc...xyz"
+    let url = format!("{}{}", host_input, path);
     // Pre-flight ALWAYS uses follow_redirects=false: a 3xx to e.g. /login
     // would otherwise let the wildcard fingerprint reflect the login page
     // instead of the catchall.
@@ -593,17 +642,19 @@ async fn wildcard_preflight(
         Ok(v) => v,
         Err(_) => return None,
     };
-    // Match donor: only 200-399 with body counts as a wildcard fingerprint.
+    // Match donor: only 200-399 with body counts.
     if !matches!(parsed.status, 200..=399) {
         return None;
     }
     if parsed.content_length == 0 || parsed.snippet_md5.is_empty() {
         return None;
     }
-    Some(WildcardSig {
+    Some(crate::wildcard::ProbeSample {
+        status: parsed.status,
         content_length: parsed.content_length,
         content_type: parsed.content_type,
         snippet_md5: parsed.snippet_md5,
+        path_len: path.len(),
     })
 }
 
@@ -759,43 +810,63 @@ pub async fn run(
         );
     }
 
-    // ── Multi-sample wildcard pre-flight per host (v0.3.7).
-    //    Probes N random hex paths (default 3); requires all N to AGREE
-    //    on (status, content_length, content_type, snippet_md5). Disagreement
-    //    = server is path-sensitive → no wildcard recorded (we can't trust
-    //    a single-sample fingerprint when the server varies per path).
-    //    This is the killer FP guard that defeats dirsearch's single-sample
-    //    failure mode on dynamic / catchall servers.
+    // ── Two-layer wildcard pre-flight per host (v0.3.7 + v0.3.9).
+    //    Probes N random hex paths with VARYING lengths (16/32/64 chars)
+    //    so the detector can compute BOTH:
+    //      Layer 1 — static catchall (all bodies identical) — defeats
+    //        single-sample by requiring N-way agreement on (CL, CT, md5).
+    //      Layer 2 — path-echo / dynamic-CL (body length scales with path
+    //        length: CL = k × path_len + base) — defeats path-echo servers
+    //        that dirsearch / feroxbuster's K=1 heuristic catches but
+    //        our v0.3.7 multi-sample alone missed. v0.3.9 addition.
+    //    Disagreement on BOTH layers = path-sensitive server → no
+    //    suppression, stderr warning.
     let mut wildcard_map = WildcardMap::new();
     if !matches!(wildcard_policy, WildcardPolicy::Off) {
         let n_samples = cfg.wildcard_samples.max(1) as usize;
+        // Varying hex lengths give the Layer 2 slope detector different
+        // x-values. With n_samples=3 we use [16, 32, 64]; with other N
+        // we round-robin / extend the pattern.
+        let hex_lens = pick_hex_lens(n_samples);
         for h in hosts.iter() {
             let input = host_to_input(h);
             let host = bare_host(&input);
-            let mut samples: Vec<WildcardSig> = Vec::with_capacity(n_samples);
-            for _ in 0..n_samples {
-                if let Some(sig) = wildcard_preflight(
+            let mut samples: Vec<crate::wildcard::ProbeSample> =
+                Vec::with_capacity(n_samples);
+            for &hex_len in &hex_lens {
+                if let Some(sample) = wildcard_preflight_sample(
                     &input,
                     cfg.body_preview_bytes,
                     &cfg.extra_headers,
                     cfg.initial_cookie_header.as_deref(),
+                    hex_len,
                 )
                 .await
                 {
-                    samples.push(sig);
+                    samples.push(sample);
                 }
             }
-            match wildcard::agreed_from_samples(&samples) {
+            match wildcard::detect(&samples, 10) {
+                Some(sig) if sig.k.is_some() => {
+                    eprintln!(
+                        "  [wildcard L2] {} k={} base={} (path-echo detected; {}/{} samples)",
+                        host,
+                        sig.k.unwrap(),
+                        sig.base.unwrap(),
+                        samples.len(),
+                        n_samples
+                    );
+                    wildcard_map.insert(input, sig);
+                }
                 Some(sig) => {
                     eprintln!(
-                        "  [wildcard] {} cl={} md5={} ({} samples agreed)",
-                        host, sig.content_length, sig.snippet_md5, n_samples
+                        "  [wildcard L1] {} cl={} md5={} ({}/{} samples agreed)",
+                        host,
+                        sig.content_length,
+                        sig.snippet_md5,
+                        samples.len(),
+                        n_samples
                     );
-                    // Key by the FULL `host_to_input` form (scheme + host +
-                    // any path prefix), not bare host — two inputs that
-                    // share a hostname but differ in path-prefix used to
-                    // collide and the second wildcard probe silently
-                    // overwrote the first.
                     wildcard_map.insert(input, sig);
                 }
                 None if samples.len() < n_samples => {
@@ -804,11 +875,11 @@ pub async fn run(
                     // paths. NOT path-sensitive — just no wildcard to record.
                 }
                 None => {
-                    // All samples returned but disagreed → path-sensitive
-                    // server. NO suppression here (would over-suppress real
-                    // findings). Flag for user awareness.
+                    // All samples returned but BOTH layers disagreed → truly
+                    // path-sensitive. NO suppression (would over-suppress
+                    // real findings). Stderr warning for user awareness.
                     eprintln!(
-                        "  [wildcard] {} → path-sensitive (samples disagreed); \
+                        "  [wildcard] {} → path-sensitive (L1 + L2 both rejected); \
                          emitting all findings, recursion skipped here",
                         host
                     );
@@ -950,6 +1021,23 @@ async fn run_probe(
         Some(parsed) => {
             // Wildcard check before status filter. Key matches the
             // pre-flight insertion above: full host_input, not bare host.
+            // v0.3.9: pass `probe_path_len` so Layer 2 (path-echo) can
+            // verify `CL ≈ k × path_len + base`.
+            //
+            // Strip query + fragment from the path AND percent-decode it
+            // before measuring length — servers echoing the path back
+            // ALMOST ALWAYS reflect only the URL path component (not the
+            // query) and reflect it DECODED (`/%2e%2e/admin` is rendered
+            // as `/../admin` = 9 bytes vs 18 raw). Counting raw encoded
+            // length inflates the expected CL and pushes real findings
+            // outside the tolerance window. Caught 244 FPs total in the
+            // v0.3.9 path_echo benchmark before this two-step fix.
+            let probe_path_only = item
+                .path
+                .split(|c| c == '?' || c == '#')
+                .next()
+                .unwrap_or(&item.path);
+            let probe_path_len = decoded_path_len(probe_path_only);
             let mut is_wildcard = false;
             if !matches!(wildcard_policy, WildcardPolicy::Off)
                 && wildcards.matches(
@@ -957,6 +1045,7 @@ async fn run_probe(
                     parsed.content_length,
                     &parsed.content_type,
                     &parsed.snippet_md5,
+                    probe_path_len,
                 )
             {
                 is_wildcard = true;

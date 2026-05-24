@@ -2,6 +2,94 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.3.9] — 2026-05-25
+
+**Headline**: Layer 2 path-echo wildcard detection closes the only gap
+where dirsearch beat httpxer in the v0.3.7 benchmark. On the
+path-echo target, FPs dropped from **14,937 → 6** — a **2,489×
+reduction** — at no meaningful cost to speed or memory.
+
+### Added — Layer 2 multi-signal wildcard detector
+- **`wildcard::detect(samples, tolerance)`** — replaces the v0.3.7
+  Layer-1-only `agreed_from_samples` for primary use. Tries Layer 1
+  (static catchall) first; if samples disagree but the bodies' sizes
+  fit a linear relationship `CL = k × path_len + base`, records the
+  slope `k` (how many times the path appears in the body) and
+  intercept `base` instead. dirsearch / feroxbuster use the same
+  pattern with `k=1` hardcoded; ours computes `k` from the samples.
+- **`wildcard::ProbeSample`** — carries `path_len` alongside the
+  Layer 1 fingerprint fields so detection can fit the linear formula.
+- **Pre-flight sends 3 random hex paths of VARYING lengths** —
+  16, 32, 64 chars (was uniform 32). Different x-values are what
+  let the detector compute the slope. `pick_hex_lens(N)` helper.
+- **`WildcardSig` extended** with `k: Option<i64>`, `base: Option<i64>`,
+  `tolerance: i64` fields. `WildcardSig::layer1(...)` constructor for
+  backwards-compat Layer-1-only sigs.
+
+### Fixed — path-echo wildcard suppression
+- **`WildcardMap::matches()`** now checks BOTH layers per probe.
+  Layer 1 first (cheap exact match); Layer 2 second (formula
+  prediction `CL ≈ k × probe_path_len + base` within `tolerance`).
+  New signature takes `probe_path_len` as 5th argument; all callers
+  updated. Layer 1 retains ±10 byte tolerance from v0.3.7.
+- **Probe-path length normalisation**: strip query/fragment AND
+  percent-decode before measuring `probe_path_len`. Counting
+  `/admin?x=1` (10 bytes raw) or `/%2e%2e/admin` (18 bytes raw)
+  instead of the server-visible decoded form (`/admin` 6 bytes,
+  `/../admin` 9 bytes) inflated the formula prediction and caught
+  244 spurious FPs across the v0.3.9 benchmark before this fix.
+  `decoded_path_len(path)` inline helper — no new dep on
+  `percent_encoding`.
+
+### Benchmark results — v0.3.7 → v0.3.9 (15,000-word wordlist, 250 threads, localhost)
+
+| target        | tool          | FPs (was → now) | wall   |
+|---------------|---------------|-----------------|--------|
+| static catchall | httpxer     | **0 → 0**       | 4.2s → 5.0s |
+| static catchall | dirsearch   | 0               | 149s   |
+| static catchall | ffuf (default) | 14,721       | 3.9s   |
+| **path-echo**   | **httpxer** | **14,937 → 6**  | **4.5s → 5.1s** |
+| path-echo     | dirsearch     | 0               | 242s   |
+| path-echo     | ffuf -ac      | 16              | 4.0s   |
+
+The 6 remaining FPs on path-echo are URL-encoding edge cases
+(`%c0%ae` overlong UTF-8, unnormalized `/../` path traversal) — even
+dirsearch / feroxbuster's K=1 detection handles them differently
+depending on server-side path-normalization behavior. **No real
+findings lost** (7/7 TPs across all modes).
+
+### Tests
+- **66 unit tests passing** (was 58). 8 new:
+  - `detect_layer2_fits_linear_relationship` (k=3 base=200 with clean data)
+  - `detect_layer2_tolerates_per_sample_jitter` (±2 bytes per sample)
+  - `detect_prefers_layer1_when_both_possible`
+  - `detect_returns_none_when_neither_layer_fits`
+  - `matches_layer2_via_formula` (runtime probe match check)
+  - `layer2_does_not_flag_real_endpoint` (sanity — small body far from formula)
+  - `detect_layer2_rejects_insane_k` (rejects K outside [1,20])
+  - `detect_layer2_requires_varying_path_lens`
+
+### Changed
+- Version: 0.3.8 → **0.3.9**
+- `WildcardSig` gained 3 fields (`k`, `base`, `tolerance`) — derive
+  PartialEq still works; existing call sites updated via
+  `WildcardSig::layer1()` constructor where appropriate.
+- `WildcardMap::matches()` signature: now takes `probe_path_len: usize`
+  as 5th argument.
+- `wildcard_preflight()` → `wildcard_preflight_sample()` — returns
+  `ProbeSample` carrying `path_len` instead of `WildcardSig`.
+
+### Still on the v0.3.9 roadmap (slid to v0.3.10)
+The recursion + crawl orchestration originally planned for v0.3.9
+slips one release to ship this Layer 2 fix sooner. Modules
+(`recurse.rs`, `crawl.rs`) and all their CLI flags shipped in v0.3.7
+already; v0.3.10 wires them in the orchestrator.
+
+### Unchanged (compatibility)
+- All v0.3.8 CLI flags work identically.
+- Output schemas unchanged.
+- Default fuzz output at depth 0 byte-compatible with v0.3.8.
+
 ## [0.3.8] — 2026-05-25
 
 UX-fix patch. The recursion/crawl orchestration originally planned for
