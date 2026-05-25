@@ -2,6 +2,58 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.3.12] — 2026-05-25
+
+### Added
+- **Live in-place progress bar** (dirsearch / ffuf parity). Updates
+  every ~100 ms via `\r` + `\x1b[K`. Format:
+  `  [7439/14970] 49% | 3875 rps | eta 1s`
+  - TTY-gated — piped runs (`httpxer ... | jq`) fall through to the
+    batched cadence (one `[fuzz N/total]` line per 500 completions) so
+    log scrapers stay parseable.
+  - Atomic `completed_counter` shared with workers; separate ticker
+    task reads it every 100 ms. Previous v0.3.11 attempt at a drain-
+    loop counter never fired meaningfully because the spawn loop's
+    inline `while tasks.len() > backlog_cap` drains most tasks BEFORE
+    the post-spawn drain runs. Verified: 40 redraws captured over a
+    3.5 s scan (one every ~88 ms).
+- `format_eta(secs)` helper — compact `5s` / `1m30s` / `2h15m4s` units.
+
+### Fixed
+- **`is_tty` check moved to drain phase** (was missing entirely
+  pre-v0.3.12). Stderr-pipe scans now stream batched progress without
+  ANSI escape codes; TTY scans get the live bar.
+
+### Changed
+- Version: 0.3.11 → **0.3.12**
+- `cfg.threads * 4` backlog cap now serves two purposes: bounded
+  memory + workers actually completing during the spawn loop (which
+  the new atomic counter sees).
+
+### Tests
+- **73 unit tests passing** (was 72). 1 new:
+  - `format_eta_picks_compact_unit` — boundary checks at 0/59/60/3599/3600.
+
+### Smoke verification
+```
+$ httpxer -u http://x/ -w 15k-words.txt -t 20 -o out.jsonl
+[+] input: 1 unique hosts
+[+] wordlist: 14999 unique paths
+[+] fuzz: 1 hosts × 14970 paths = 14970 probes
+  [7439/14970] 49% | 3875 rps | eta 1s   ← redrawn in-place every 100 ms
+[+] fuzz done: 14970 probes in 3.50s (4274 rps avg) → out.jsonl
+```
+
+### Still on the roadmap (slid to v0.3.13)
+- Multi-round recursion orchestration
+- Crawl per-probe extraction loop
+- Auto-throttle on 429 spike
+- Extension multiplication (`-e auto`)
+
+### Unchanged
+- All v0.3.11 CLI flags work identically.
+- Output schemas unchanged.
+
 ## [0.3.11] — 2026-05-25
 
 UX policy change: JS crawling is now **on by default**.

@@ -28,8 +28,8 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use md5::{Digest, Md5};
 use serde::Serialize;
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
@@ -273,6 +273,18 @@ fn normalize_path(raw: &str) -> String {
         s.to_string()
     } else {
         format!("/{}", s)
+    }
+}
+
+/// Format a seconds count as a compact human-readable ETA used by the
+/// v0.3.12 live progress bar: `5s`, `1m30s`, `2h15m4s`. Zero → "0s".
+fn format_eta(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h{}m{}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+    } else if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
     }
 }
 
@@ -909,6 +921,59 @@ pub async fn run(
     // each spawned future, so we can't reach into it from the outer loop.
     let spawn_backlog_cap = cfg.threads * 4;
 
+    // v0.3.12 — live progress bar. Workers atomically bump `completed`
+    // when each probe finishes; a separate ticker task reads it every
+    // 100 ms and redraws the progress line. Counter is needed because
+    // the in-loop `while tasks.len() > spawn_backlog_cap` drains tasks
+    // DURING the spawn loop — the post-spawn drain only sees the final
+    // ~backlog_cap tasks, so the earlier code's drain-counting strategy
+    // never saw the bulk of completions.
+    let completed_counter = Arc::new(AtomicUsize::new(0));
+    let progress_done = Arc::new(AtomicBool::new(false));
+    let is_tty = std::io::stderr().is_terminal();
+    // Debug print removed v0.3.12 — kept the comment as a marker.
+    let progress_task = {
+        let counter = completed_counter.clone();
+        let done = progress_done.clone();
+        let total = total_probes;
+        let started_at = started;
+        tokio::spawn(async move {
+            use std::io::Write as _;
+            loop {
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let completed = counter.load(Ordering::Relaxed);
+                if is_tty {
+                    let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+                    let rps = completed as f64 / elapsed;
+                    let pct = (completed as f64 * 100.0 / total.max(1) as f64) as u32;
+                    let eta_secs = if rps > 0.0 {
+                        ((total.saturating_sub(completed)) as f64 / rps) as u64
+                    } else {
+                        0
+                    };
+                    let mut stderr = std::io::stderr();
+                    let _ = write!(
+                        stderr,
+                        "\r\x1b[K  [{}/{}] {}% | {:.0} rps | eta {}",
+                        completed, total, pct, rps, format_eta(eta_secs)
+                    );
+                    let _ = stderr.flush();
+                } else {
+                    // Piped runs — batched line per 500 completions.
+                    // (Was per-200 in v0.3.7 drain-loop counter; the
+                    // ticker-task variant uses 500 so the cadence
+                    // matches a TTY's ~100 ms refresh visually.)
+                    if completed > 0 && completed % 500 == 0 {
+                        eprintln!("  [fuzz {}/{}]", completed, total);
+                    }
+                }
+            }
+        })
+    };
+
     for h in hosts.iter() {
         let input = host_to_input(h);
         let host = bare_host(&input);
@@ -924,6 +989,7 @@ pub async fn run(
             let wildcards = wildcards.clone();
             let out_file = out_file.clone();
             let policy = wildcard_policy_arc.clone();
+            let counter = completed_counter.clone();
 
             // Acquire BEFORE spawn — keeps the FuturesUnordered set bounded
             // to the semaphore size + the number of pending awaits, instead
@@ -936,6 +1002,7 @@ pub async fn run(
                     limiter.acquire(&item.host_input).await;
                 }
                 run_probe(item, &cfg, &wildcards, &out_file, *policy).await;
+                counter.fetch_add(1, Ordering::Relaxed);
             }));
 
             // Throttle the spawn queue if we hit a backlog of completed
@@ -947,13 +1014,30 @@ pub async fn run(
         }
     }
 
-    // Drain.
-    let mut completed = 0usize;
-    while tasks.next().await.is_some() {
-        completed += 1;
-        if completed % 200 == 0 || completed == total_probes {
-            eprintln!("  [fuzz {}/{}]", completed, total_probes);
-        }
+    // Drain remaining tasks. Workers update the atomic counter; the
+    // ticker task reads it. We just need to wait for all spawned tasks
+    // to finish.
+    while tasks.next().await.is_some() {}
+    // Signal ticker to stop and let it draw the final 100%-complete line.
+    progress_done.store(true, Ordering::Relaxed);
+    let _ = progress_task.await;
+    if is_tty {
+        // Final redraw at 100% before the newline (ticker may have
+        // exited before catching the very-last counter increment).
+        use std::io::Write as _;
+        let final_completed = completed_counter.load(Ordering::Relaxed);
+        let elapsed = started.elapsed().as_secs_f64().max(0.001);
+        let rps = final_completed as f64 / elapsed;
+        let mut stderr = std::io::stderr();
+        let _ = write!(
+            stderr,
+            "\r\x1b[K  [{}/{}] 100% | {:.0} rps | eta 0s",
+            final_completed, total_probes, rps
+        );
+        let _ = stderr.flush();
+        // Newline so the "[+] fuzz done" line doesn't get appended onto
+        // the progress bar (which never had a \n).
+        eprintln!();
     }
 
     {
@@ -1179,6 +1263,18 @@ async fn write_record(out_file: &Arc<Mutex<std::fs::File>>, rec: &FuzzRecord) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_eta_picks_compact_unit() {
+        assert_eq!(format_eta(0), "0s");
+        assert_eq!(format_eta(5), "5s");
+        assert_eq!(format_eta(59), "59s");
+        assert_eq!(format_eta(60), "1m0s");
+        assert_eq!(format_eta(90), "1m30s");
+        assert_eq!(format_eta(3599), "59m59s");
+        assert_eq!(format_eta(3600), "1h0m0s");
+        assert_eq!(format_eta(8104), "2h15m4s");
+    }
 
     #[test]
     fn normalize_path_basic() {
