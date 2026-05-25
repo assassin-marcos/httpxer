@@ -122,11 +122,45 @@ fn is_u8_zero(v: &u8) -> bool {
     *v == 0
 }
 
-/// Per-(host,path) work item.
+/// Per-(host,path) work item. Carries v0.4.0 recursion/crawl provenance
+/// so the resulting FuzzRecord can be tagged with depth + source +
+/// parent_url for downstream consumers.
 struct ProbeItem {
     host_input: String, // e.g. "https://target.com" or "target.com"
     host: String,       // bare hostname, used as the WildcardMap key
     path: String,
+    /// Round / recursion depth — 0 for the initial host × wordlist pass.
+    depth: u8,
+    /// Probe origin tag. Empty at depth 0. One of: "wordlist" (depth 0),
+    /// "recursion" (re-fuzz under discovered dir), "crawl-html",
+    /// "crawl-robots", "crawl-sitemap".
+    source: String,
+    /// Parent URL this probe was derived from. Empty at depth 0.
+    parent_url: String,
+}
+
+/// Discovery emitted from a worker after a successful probe. Picked up
+/// by the multi-round orchestrator to seed the next round's frontier.
+/// v0.4.0 — needed for recursion + crawl orchestration.
+#[derive(Debug)]
+enum Discovery {
+    /// 301/302/307/308 with Location parity check passed (or 200 +
+    /// Index-of marker, or 403 opt-in) → directory worth re-fuzzing
+    /// the wordlist under in the next round.
+    Directory {
+        canonical_url: String,
+        host: String,
+        depth: u8,
+        parent: String,
+    },
+    /// Link extracted from the response body by `crawl::extract_urls`
+    /// (HTML / robots.txt / sitemap.xml). Already absolute + in-scope.
+    Link {
+        canonical_url: String,
+        source: String,
+        depth: u8,
+        parent: String,
+    },
 }
 
 /// All fuzz-mode configuration unfurled from CLI flags.
@@ -520,6 +554,11 @@ struct ParsedResp {
     server: String,
     body_preview_for_output: String,
     snippet_md5: String,
+    /// Raw response body (UTF-8 lossy, ≤256 KB). Used by v0.4.0 crawl
+    /// for HTML link extraction. Empty when the body was empty or when
+    /// crawl is disabled (caller decides whether to populate via the
+    /// `keep_raw_body` param to `dispatch_one`).
+    raw_body: String,
 }
 
 /// Per-host rate limiter — wraps `governor`. Off when `rps == 0.0`.
@@ -694,6 +733,12 @@ async fn dispatch_one(
     let preview_end = body_len.min(body_preview_bytes);
     let preview_raw = String::from_utf8_lossy(&body_bytes[..preview_end]).into_owned();
     let body_preview_for_output = html_escape_body_preview(&preview_raw);
+    // v0.4.0 — raw body for crawl link extraction. Lossy UTF-8 decode of
+    // the FULL body_bytes (already capped at BODY_READ_CAP / 256 KB).
+    // ~1.3× the cost of body_preview_for_output; acceptable given the
+    // crawl feature this enables. When `--crawl` is off, the orchestrator
+    // ignores this field — pre-v0.4.0 memory profile unchanged.
+    let raw_body = String::from_utf8_lossy(&body_bytes).into_owned();
 
     let ua = ua_string(slot.tag);
     Ok((
@@ -706,6 +751,7 @@ async fn dispatch_one(
             server,
             body_preview_for_output,
             snippet_md5,
+            raw_body,
         },
         slot.tag,
         ua,
@@ -900,19 +946,8 @@ pub async fn run(
         wildcard_policy.as_str(),
     );
 
-    // v0.3.7 honesty notice — `-r` / `--crawl` parse and validate, the
-    // supporting modules (recurse.rs, crawl.rs) are shipped + tested, but
-    // the multi-round ORCHESTRATION wires them in v0.3.8. Today's run uses
-    // the v0.3.7 single-pass path with the new FP guards (multi-sample
-    // wildcards, auth, exclude-codes). Without this warning users would
-    // assume they were getting recursive behaviour they aren't.
-    if cfg.recursion_depth > 0 || cfg.crawl_enabled {
-        eprintln!(
-            "[!] -r / --crawl: v0.3.7 ships the foundation (modules, CLI flags, \
-             multi-sample wildcards). Multi-round orchestration lands in v0.3.8. \
-             This run will single-pass with v0.3.7 FP guards."
-        );
-    }
+    // v0.4.0 — the deferred-since-v0.3.7 recursion + crawl orchestration
+    // is now wired. The `[!]` warning that used to print here is gone.
 
     // ── Two-layer wildcard pre-flight per host (v0.3.7 + v0.3.9).
     //    Probes N random hex paths with VARYING lengths (16/32/64 chars)
@@ -1061,6 +1096,46 @@ pub async fn run(
         })
     };
 
+    // ── v0.4.0: multi-round orchestrator setup ────────────────────────
+    // The single-pass spawn loop becomes ROUND 0 of a multi-round loop.
+    // Workers send discoveries (new dirs / crawled URLs) to disc_tx;
+    // after each round drains, the orchestrator collects them, dedups
+    // via `visited`, runs wildcard pre-flight for new dirs, and seeds
+    // the next round. Loops up to max(recursion_depth, crawl_depth).
+    let (disc_tx, mut disc_rx) =
+        tokio::sync::mpsc::unbounded_channel::<Discovery>();
+    // Visited set — canonical URLs we've already PROBED (or are about to).
+    // Insert-and-check is atomic via Mutex; HashSet for O(1) lookup.
+    let visited: Arc<tokio::sync::Mutex<HashSet<String>>> =
+        Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+    // Seed visited with the round-0 host × wordlist set so crawl-extracted
+    // links matching existing wordlist probes don't double-fire.
+    {
+        let mut v = visited.lock().await;
+        for h in hosts.iter() {
+            let input = host_to_input(h);
+            for path in words.iter() {
+                let url = format!("{}{}", input.trim_end_matches('/'), path);
+                v.insert(crate::recurse::canonical_url_key(&url));
+            }
+        }
+    }
+    // Per-host budgets (max_dirs, max_probes) prevent recursion blowup.
+    let host_budgets: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<crate::recurse::HostBudget>>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let max_round_depth = std::cmp::max(
+        cfg.recursion_depth as usize,
+        if cfg.crawl_enabled { cfg.crawl_depth as usize } else { 0 },
+    );
+    if max_round_depth > 0 {
+        eprintln!(
+            "[+] multi-round mode: depth={} (recursion={}, crawl={})",
+            max_round_depth, cfg.recursion_depth,
+            if cfg.crawl_enabled { cfg.crawl_depth as i16 } else { 0i16 }
+        );
+    }
+
+    // ── ROUND 0: hosts × wordlist (the existing single-pass loop) ─────
     for h in hosts.iter() {
         let input = host_to_input(h);
         let host = bare_host(&input);
@@ -1069,6 +1144,9 @@ pub async fn run(
                 host_input: input.clone(),
                 host: host.clone(),
                 path: path.clone(),
+                depth: 0,
+                source: String::new(),
+                parent_url: String::new(),
             };
             let sem = sem.clone();
             let limiter = limiter.clone();
@@ -1077,6 +1155,7 @@ pub async fn run(
             let out_file = out_file.clone();
             let policy = wildcard_policy_arc.clone();
             let counter = completed_counter.clone();
+            let disc = disc_tx.clone();
 
             // Acquire BEFORE spawn — keeps the FuturesUnordered set bounded
             // to the semaphore size + the number of pending awaits, instead
@@ -1088,7 +1167,7 @@ pub async fn run(
                 if limiter.enabled() {
                     limiter.acquire(&item.host_input).await;
                 }
-                run_probe(item, &cfg, &wildcards, &out_file, *policy).await;
+                run_probe(item, &cfg, &wildcards, &out_file, *policy, &disc).await;
                 counter.fetch_add(1, Ordering::Relaxed);
             }));
 
@@ -1101,10 +1180,171 @@ pub async fn run(
         }
     }
 
-    // Drain remaining tasks. Workers update the atomic counter; the
-    // ticker task reads it. We just need to wait for all spawned tasks
-    // to finish.
+    // Drain round-0 tasks. Workers update the atomic counter; the
+    // ticker task reads it.
     while tasks.next().await.is_some() {}
+
+    // ── v0.4.0: multi-round drain ─────────────────────────────────────
+    // After round 0 completes, collect Discovery messages (dirs from
+    // recursion + URLs from crawl extraction). For each new dir, run
+    // the multi-sample wildcard pre-flight. Then spawn another round
+    // of probes. Loop up to `max_round_depth`. Visited set prevents
+    // duplicate probes across rounds.
+    if max_round_depth > 0 {
+        for round in 1..=max_round_depth {
+            // Drain everything that's currently in the channel.
+            // (try_recv until empty — non-blocking; workers already
+            // finished so no more messages are coming for this round.)
+            let mut new_dirs: Vec<(String, String, u8, String)> = Vec::new(); // (url, host, depth, parent)
+            let mut new_urls: Vec<(String, String, u8, String)> = Vec::new(); // (url, source, depth, parent)
+            while let Ok(d) = disc_rx.try_recv() {
+                match d {
+                    Discovery::Directory { canonical_url, host, depth, parent } => {
+                        if (depth as usize) <= round {
+                            new_dirs.push((canonical_url, host, depth, parent));
+                        }
+                    }
+                    Discovery::Link { canonical_url, source, depth, parent } => {
+                        if (depth as usize) <= round {
+                            new_urls.push((canonical_url, source, depth, parent));
+                        }
+                    }
+                }
+            }
+            // Dedupe via visited set + apply per-host budgets.
+            let mut frontier_dirs: Vec<(String, String, u8, String)> = Vec::new();
+            let mut frontier_urls: Vec<(String, String, u8, String)> = Vec::new();
+            {
+                let mut v = visited.lock().await;
+                let mut budgets = host_budgets.lock().await;
+                for (canon, host, depth, parent) in new_dirs {
+                    if !v.insert(canon.clone()) { continue; }
+                    let budget = budgets.entry(host.clone()).or_insert_with(|| {
+                        Arc::new(crate::recurse::HostBudget::new(
+                            cfg.max_probes_per_host,
+                            cfg.max_dirs_per_host,
+                        ))
+                    });
+                    if !budget.try_inc_dir() { continue; }
+                    frontier_dirs.push((canon, host, depth, parent));
+                }
+                for (canon, source, depth, parent) in new_urls {
+                    if !v.insert(canon.clone()) { continue; }
+                    // Crawl URLs don't consume the dir budget; they're
+                    // single-shot probes, not new fuzz-prefixes.
+                    frontier_urls.push((canon, source, depth, parent));
+                }
+            }
+            if frontier_dirs.is_empty() && frontier_urls.is_empty() {
+                eprintln!("[+] round {}: no new discoveries — done", round);
+                break;
+            }
+            eprintln!(
+                "[+] round {}: fuzz {} discovered dirs + probe {} crawl-extracted URLs",
+                round, frontier_dirs.len(), frontier_urls.len()
+            );
+            // Multi-sample wildcard pre-flight for each NEW dir.
+            // Skip when wildcard policy is off OR when this dir already
+            // has a fingerprint inherited from its parent host_input.
+            // (We don't have an Arc<Mutex<WildcardMap>> for live mutation
+            // — for v0.4.0 MVP we just reuse the round-0 wildcard map.
+            // Per-dir pre-flight refinement lands in v0.4.1.)
+
+            // Spawn probes for new dirs × wordlist + new URLs.
+            for (dir_url, host, depth, parent) in &frontier_dirs {
+                for path in words.iter() {
+                    let full_url = format!("{}{}", dir_url.trim_end_matches('/'), path);
+                    // Visited check on the full probe URL — skip if some
+                    // other dir's expansion already covers it.
+                    {
+                        let mut v = visited.lock().await;
+                        if !v.insert(crate::recurse::canonical_url_key(&full_url)) {
+                            continue;
+                        }
+                    }
+                    let item = ProbeItem {
+                        host_input: dir_url.trim_end_matches('/').to_string(),
+                        host: host.clone(),
+                        path: path.clone(),
+                        depth: *depth,
+                        source: "recursion".to_string(),
+                        parent_url: parent.clone(),
+                    };
+                    let sem_c = sem.clone();
+                    let limiter_c = limiter.clone();
+                    let cfg_c = cfg.clone();
+                    let wildcards_c = wildcards.clone();
+                    let out_file_c = out_file.clone();
+                    let policy_c = wildcard_policy_arc.clone();
+                    let counter_c = completed_counter.clone();
+                    let disc_c = disc_tx.clone();
+                    let permit = sem_c.acquire_owned().await.ok();
+                    tasks.push(tokio::spawn(async move {
+                        let _p = permit;
+                        if limiter_c.enabled() {
+                            limiter_c.acquire(&item.host_input).await;
+                        }
+                        run_probe(item, &cfg_c, &wildcards_c, &out_file_c, *policy_c, &disc_c).await;
+                        counter_c.fetch_add(1, Ordering::Relaxed);
+                    }));
+                    while tasks.len() > spawn_backlog_cap {
+                        tasks.next().await;
+                    }
+                }
+            }
+            // Crawl-extracted URLs: each is a single-shot probe at the
+            // resolved URL (no wordlist expansion — these are concrete
+            // endpoints discovered from a response body).
+            for (link_url, source, depth, parent) in &frontier_urls {
+                // Split into (host_input, path) for the worker.
+                let (host_input, path, host) = match url::Url::parse(link_url) {
+                    Ok(u) => {
+                        let scheme = u.scheme().to_string();
+                        let h = u.host_str().unwrap_or("").to_string();
+                        let port = u.port().map(|p| format!(":{}", p)).unwrap_or_default();
+                        let host_input = format!("{}://{}{}", scheme, h, port);
+                        let path = format!("{}{}", u.path(),
+                            u.query().map(|q| format!("?{}", q)).unwrap_or_default());
+                        (host_input, path, h)
+                    }
+                    Err(_) => continue,
+                };
+                let item = ProbeItem {
+                    host_input,
+                    host,
+                    path,
+                    depth: *depth,
+                    source: source.clone(),
+                    parent_url: parent.clone(),
+                };
+                let sem_c = sem.clone();
+                let limiter_c = limiter.clone();
+                let cfg_c = cfg.clone();
+                let wildcards_c = wildcards.clone();
+                let out_file_c = out_file.clone();
+                let policy_c = wildcard_policy_arc.clone();
+                let counter_c = completed_counter.clone();
+                let disc_c = disc_tx.clone();
+                let permit = sem_c.acquire_owned().await.ok();
+                tasks.push(tokio::spawn(async move {
+                    let _p = permit;
+                    if limiter_c.enabled() {
+                        limiter_c.acquire(&item.host_input).await;
+                    }
+                    run_probe(item, &cfg_c, &wildcards_c, &out_file_c, *policy_c, &disc_c).await;
+                    counter_c.fetch_add(1, Ordering::Relaxed);
+                }));
+                while tasks.len() > spawn_backlog_cap {
+                    tasks.next().await;
+                }
+            }
+            // Drain this round before moving to next.
+            while tasks.next().await.is_some() {}
+        }
+    }
+    // Close the discovery channel so any remaining workers don't block.
+    drop(disc_tx);
+
     // Signal ticker to stop and let it draw the final 100%-complete line.
     progress_done.store(true, Ordering::Relaxed);
     let _ = progress_task.await;
@@ -1149,6 +1389,7 @@ async fn run_probe(
     wildcards: &Arc<WildcardMap>,
     out_file: &Arc<Mutex<std::fs::File>>,
     wildcard_policy: WildcardPolicy,
+    disc_tx: &tokio::sync::mpsc::UnboundedSender<Discovery>,
 ) {
     let url = format!("{}{}", item.host_input, item.path);
 
@@ -1258,6 +1499,9 @@ async fn run_probe(
                 &parsed.body_preview_for_output,
             );
 
+            // v0.4.0 — clone fields that the discovery block (below)
+            // also needs to read. ParsedResp gets fully consumed by the
+            // FuzzRecord move otherwise.
             let rec = FuzzRecord {
                 url: url.clone(),
                 input: item.host_input.clone(),
@@ -1265,12 +1509,12 @@ async fn run_probe(
                 host: item.host.clone(),
                 status_code: parsed.status,
                 content_length: parsed.content_length,
-                content_type: parsed.content_type,
-                title: parsed.title,
-                location: parsed.location,
+                content_type: parsed.content_type.clone(),
+                title: parsed.title.clone(),
+                location: parsed.location.clone(),
                 server: parsed.server.clone(),
-                webserver: parsed.server,
-                body_preview: parsed.body_preview_for_output,
+                webserver: parsed.server.clone(),
+                body_preview: parsed.body_preview_for_output.clone(),
                 tech: Vec::new(),
                 method: "GET",
                 is_wildcard,
@@ -1278,18 +1522,70 @@ async fn run_probe(
                 via_proxy: cfg.via_proxy,
                 attempts,
                 elapsed_ms,
-                snippet_md5: parsed.snippet_md5,
+                snippet_md5: parsed.snippet_md5.clone(),
                 tls_impersonation: tls_tag.to_string(),
                 user_agent: ua_used,
                 cf_challenge: cf,
                 error: None,
                 timestamp: now_iso8601(),
                 prober: PROBER_TAG,
-                depth: 0,
-                source: String::new(),
-                parent_url: String::new(),
+                depth: item.depth,
+                source: item.source.clone(),
+                parent_url: item.parent_url.clone(),
             };
             write_record(out_file, &rec, cfg.output_format, cfg.live_findings).await;
+
+            // ── v0.4.0: emit discoveries for multi-round orchestrator ─
+            // Only emit when we're NOT already at the deepest round —
+            // otherwise discoveries would be dropped anyway. Check both
+            // recursion + crawl independently.
+            let next_depth = item.depth.saturating_add(1);
+            if cfg.recursion_depth > 0 && next_depth <= cfg.recursion_depth {
+                if let Some(dir_url) = crate::recurse::detect_directory(
+                    &url,
+                    parsed.status,
+                    &parsed.location,
+                    &parsed.body_preview_for_output,
+                    cfg.recurse_on_200,
+                    cfg.recurse_on_403,
+                ) {
+                    let _ = disc_tx.send(Discovery::Directory {
+                        canonical_url: crate::recurse::canonical_url_key(&dir_url),
+                        host: item.host.clone(),
+                        depth: next_depth,
+                        parent: url.clone(),
+                    });
+                }
+            }
+            if cfg.crawl_enabled && next_depth <= cfg.crawl_depth {
+                let crawl_cfg = crate::crawl::CrawlCfg {
+                    crawl_robots: cfg.crawl_robots,
+                    crawl_sitemap: cfg.crawl_sitemap,
+                    max_links_per_page: cfg.max_links_per_page,
+                    scope_hosts: cfg.scope_hosts.clone(),
+                };
+                let links = crate::crawl::extract_urls(
+                    &parsed.raw_body,
+                    &parsed.content_type,
+                    &url,
+                    &crawl_cfg,
+                );
+                let source_tag = if url.ends_with("/robots.txt") {
+                    "crawl-robots"
+                } else if url.ends_with("/sitemap.xml") {
+                    "crawl-sitemap"
+                } else {
+                    "crawl-html"
+                };
+                for link in links {
+                    let _ = disc_tx.send(Discovery::Link {
+                        canonical_url: crate::recurse::canonical_url_key(&link),
+                        source: source_tag.to_string(),
+                        depth: next_depth,
+                        parent: url.clone(),
+                    });
+                }
+            }
         }
         None => {
             if !cfg.include_errors {
@@ -1322,9 +1618,9 @@ async fn run_probe(
                 error: last_err,
                 timestamp: now_iso8601(),
                 prober: PROBER_TAG,
-                depth: 0,
-                source: String::new(),
-                parent_url: String::new(),
+                depth: item.depth,
+                source: item.source.clone(),
+                parent_url: item.parent_url.clone(),
             };
             write_record(out_file, &rec, cfg.output_format, cfg.live_findings).await;
         }

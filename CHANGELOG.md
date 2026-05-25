@@ -2,6 +2,115 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.4.0] — 2026-05-25
+
+**THE BIG ONE.** Multi-round recursion + crawl orchestration — the
+deferred feature from v0.3.7 through v0.3.13 (6 releases of "still on
+the roadmap"). Minor-version bump signals the orchestrator-architecture
+change; existing CLI invocations still work.
+
+### Added — multi-round orchestration
+- **`-r` / `--recursive`** now actually recurses. After round 0
+  (host × wordlist), workers emit `Discovery::Directory` messages via
+  an mpsc channel whenever a 301/302/307/308 response's Location header
+  satisfies the parity check (Location == request_URL + "/"). The
+  orchestrator collects them, dedups via the visited set, applies
+  per-host budget caps (`--max-dirs-per-host`, `--max-probes-per-host`),
+  then re-fuzzes the wordlist under each discovered dir. Loops up to
+  `-R N` levels deep.
+- **`--crawl`** now actually crawls. Workers extract links from each
+  response body via the existing `crawl::extract_urls()` extractor
+  (HTML `<a/link/script/img/form/iframe/source/embed/object>` tags,
+  meta-refresh, robots.txt Disallow/Allow/Sitemap directives,
+  sitemap.xml `<loc>` entries). Same-host scope filter + static-asset
+  filter + third-party CDN deny list applied. Extracted URLs become
+  `Discovery::Link` messages → next round's frontier.
+- **`Discovery` enum** wraps both message types with `depth`, `parent`,
+  and source-tag metadata that flows into the emitted FuzzRecord's
+  `depth` / `source` / `parent_url` fields. `source` tags:
+  `"wordlist"` (depth 0), `"recursion"` (re-fuzzed under discovered dir),
+  `"crawl-html"`, `"crawl-robots"`, `"crawl-sitemap"`.
+- **Shared `visited` HashSet** across all rounds — canonical-URL keyed
+  via `recurse::canonical_url_key()`. Seeded with round-0 host ×
+  wordlist combinations so crawl-extracted URLs matching existing
+  probes don't double-fire.
+- **Per-host `HostBudget`** atomic counters — `max_dirs_per_host` (200
+  default) and `max_probes_per_host` (50000 default) prevent recursion
+  blowup on adversarial / catchall targets.
+
+### Architecture
+
+```
+visited: Mutex<HashSet>          ← seeded with round-0 probe URLs
+disc_tx: mpsc::UnboundedSender   ← workers send Discovery messages
+
+ROUND 0: hosts × wordlist           (existing spawn loop)
+  drain
+  collect Discovery::Dir / Link from disc_rx
+
+ROUND 1..=max_round_depth:
+  dedupe new dirs/URLs via visited
+  apply per-host budgets
+  spawn (new_dirs × wordlist) + new_urls
+  drain
+  collect next round's Discoveries
+```
+
+### Smoke verification
+
+Test server with planted endpoints reachable ONLY via crawl:
+- `/sitemap-discovered` — only in sitemap.xml's `<loc>`
+- `/robots-secret` — only in robots.txt's `Disallow:`
+- `/admin/users`, `/admin/settings` — only in HTML page link extraction
+
+```
+$ httpxer -u http://test/ -w 8-words.txt -r -R 2 --crawl --crawl-depth 2 -o out.txt
+[+] multi-round mode: depth=2 (recursion=2, crawl=2)
+[+] round 1: fuzz 0 discovered dirs + probe 4 crawl-extracted URLs
+[+] round 2: no new discoveries — done
+[+] fuzz done: 8 probes → 8 findings
+
+$ cat out.txt
+200     12B  http://test/api/v1/users
+200    101B  http://test/sitemap.xml
+200     39B  http://test/robots.txt
+200     84B  http://test/admin
+200     55B  http://test/sitemap-discovered   ← crawl
+200     42B  http://test/admin/settings       ← crawl
+200     39B  http://test/admin/users          ← crawl
+200     50B  http://test/robots-secret        ← crawl
+```
+
+4 of 8 findings came from crawl extraction — UNREACHABLE via wordlist
+alone. Recursion didn't fire here because the test server returned 200
+for /admin instead of 301-with-parity (aiohttp slash-normalization);
+on real servers with proper redirects, recursion produces the new dir
+frontier.
+
+### Changed
+- Version: 0.3.13 → **0.4.0**
+- `ProbeItem` gained `depth: u8`, `source: String`, `parent_url: String`.
+- `ParsedResp` gained `raw_body: String` (full body, ≤256 KB, used by
+  crawl link extraction; ~1.3× memory cost vs body_preview alone).
+- `run_probe()` signature: now takes `disc_tx` mpsc sender.
+- `run()` body: round-0 spawn loop + multi-round drain/collect/respawn.
+- Removed stale `[!] v0.3.7 ships the foundation…` deferral warning.
+
+### Still on the roadmap (post-v0.4.0)
+- Per-dir multi-sample wildcard pre-flight in recursive rounds (v0.4.x
+  currently reuses the round-0 host wildcard for all dirs under it)
+- Self-similarity loop guard activation (visited-set already prevents
+  infinite loops via the canonical-URL dedup)
+- Auto-throttle on 429 spike
+- Extension multiplication (`-e auto`)
+- 6-layer wildcard detector (Layers 3/4/6: dynamic-strip md5,
+  DOM-structure hash, multi-provider WAF challenge fingerprints)
+
+### Unchanged
+- All v0.3.13 CLI flags work identically.
+- Output schemas at depth 0 byte-compatible with v0.3.13.
+- Wildcard detection (Layers 1+2 from v0.3.9) unchanged.
+
 ## [0.3.13] — 2026-05-25
 
 UX overhaul — output is finally readable. Live findings on terminal,
