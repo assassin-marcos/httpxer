@@ -2,6 +2,74 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.4.2] — 2026-05-25
+
+UX-fix: crawl now actually finds the recon-valuable links it was
+silently dropping. The static-asset filter was over-aggressive —
+v0.4.0/0.4.1 extracted `<script src="/Scripts/jquery.js">`,
+`<a href="/backup.zip">`, `<a href="/api.json">` etc from response
+bodies, then immediately dropped them via `STATIC_ASSET_EXTS` before
+they reached the probe queue. User saw zero crawl-discovered
+findings on pages like Brinks `Result.aspx` that had dozens of
+real links.
+
+### Fixed
+- **`STATIC_ASSET_EXTS` trimmed from 40 entries → 22 (pure media only).**
+  Previously the filter was dropping HIGH-recon-value extensions
+  silently:
+  - `js, mjs, map` — JS files contain endpoints + secrets + config
+  - `json` — API responses + config payloads
+  - `xml, rss, atom` — sitemaps + feeds
+  - `pdf` — often-leaked documents
+  - `zip, tar, gz, tgz, rar, 7z, iso, dmg` — **BACKUP ARCHIVES** (recon GOLD)
+  - `exe, msi, deb, rpm` — installers (leak deployment intel)
+- **`css` still filtered** — comments occasionally have endpoints
+  but signal-to-noise is bad; users can disable defaults if needed.
+- **Pure media STILL filtered** (no recon value, just confirms asset
+  exists with 200): images (png/jpg/gif/svg/ico/webp/bmp/tiff/avif),
+  fonts (woff/woff2/ttf/eot/otf), video (mp4/webm/mov/avi/mkv/flv/m4v),
+  audio (mp3/wav/ogg/flac/m4a).
+
+### Smoke verification
+
+Realistic brinks-mimic Result.aspx page with 9 link types
+(JS/CSS/JSON/ZIP/SQL/PDF/PNG/anchor). One-word wordlist
+(`Result.aspx`) + `--crawl --crawl-depth 2`:
+
+```
+Findings (was 1 in v0.4.1, now 10 in v0.4.2):
+  200    572B  /Result.aspx                            ← original wordlist
+  200    239B  /Default.aspx                           ← <a href>
+  200      5KB /Institucional.aspx                     ← <a href>
+  403     26B  /admin/AdminMain.aspx                   ← <a href>
+  200     38B  /api/v2/user.json                       ← <a href> (was dropped pre-v0.4.2)
+  200      2KB /downloads/backup.zip                   ← <a href> (was dropped pre-v0.4.2)
+  200      1KB /exports/data.sql                       ← <a href> (was dropped pre-v0.4.2)
+  200      8KB /docs/manual.pdf                        ← <a href> (was dropped pre-v0.4.2)
+  200      3KB /Scripts/brinks-login.js                ← <script src> (was dropped pre-v0.4.2)
+  200     93KB /Scripts/jquery-1.9.1.min.js            ← <script src> (was dropped pre-v0.4.2)
+```
+
+**6 of 9 link types** discovered via crawl that v0.4.1 silently
+dropped. CSS + .ico correctly still filtered.
+
+### Changed
+- Version: 0.4.1 → **0.4.2**
+- `STATIC_ASSET_EXTS` shrunk from 40 → 22 entries (pure media only).
+- Test `static_asset_filter` updated to assert the new policy.
+
+### Still on roadmap (v0.4.3)
+- JS endpoint extraction (regex against JS body content) — discovers
+  endpoints INSIDE JS files (e.g. `fetch("/api/v3/users")` in a JS
+  bundle). Today httpxer probes JS files (recovers their content via
+  `--with-body` if you set it) but doesn't parse them for more
+  endpoints.
+
+### Unchanged
+- All v0.4.1 CLI flags work identically.
+- Output schemas unchanged.
+- Wildcard detection (Layers 1+2) unchanged.
+
 ## [0.4.1] — 2026-05-25
 
 UX-fix patch. The `(outdated → vX.Y.Z)` tag in the startup banner

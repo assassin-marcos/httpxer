@@ -76,15 +76,38 @@ pub const THIRD_PARTY_HOSTS: &[&str] = &[
 
 /// Static-asset extensions we skip from crawled URLs. Recursing /
 /// re-probing these adds noise and rarely yields findings.
+/// Pure-media extensions skipped from crawl-extracted URLs. Re-fuzzed:
+///
+/// v0.4.2 — TRIMMED from 40 entries to 22 (pure media only). Previous
+/// list was dropping HIGHLY recon-valuable extensions:
+///   - js, mjs, map (JS files contain API endpoints + secrets!)
+///   - json, xml, rss, atom (config / API responses / sitemaps)
+///   - pdf (often-leaked documents)
+///   - zip, tar.gz, 7z, rar, etc. (BACKUP archives — recon GOLD)
+///   - exe, msi, deb, rpm (installers — leak intel about deployments)
+///
+/// Result: `<script src="/Scripts/jquery.js">` extracted from a page
+/// like `/Result.aspx` was getting silently dropped, so users saw 0
+/// crawl-discovered findings even when the page had dozens of links.
+/// dirsearch keeps everything by default — we now match that policy
+/// for the categories that matter.
+///
+/// Still filtered (low recon value, just confirms the asset exists):
+///   - css (rarely contains endpoints; mostly noise)
+///   - images (png/jpg/gif/svg/ico/webp/bmp/tiff/avif)
+///   - fonts (woff/woff2/ttf/eot/otf)
+///   - video (mp4/webm/mov/avi/mkv/flv/m4v)
+///   - audio (mp3/wav/ogg/flac/m4a)
 pub const STATIC_ASSET_EXTS: &[&str] = &[
-    "css", "js", "mjs", "map", "json", "xml", "rss", "atom",
-    "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "bmp", "tiff",
+    // CSS — sometimes has commented endpoints but mostly noise
+    "css",
+    // Images
+    "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "bmp", "tiff", "avif",
+    // Fonts
     "woff", "woff2", "ttf", "eot", "otf",
-    "mp4", "webm", "mov", "avi", "mkv", "flv",
-    "mp3", "wav", "ogg", "flac",
-    "pdf",
-    "zip", "tar", "gz", "tgz", "rar", "7z", "iso", "dmg",
-    "exe", "msi", "deb", "rpm",
+    // Video / audio
+    "mp4", "webm", "mov", "avi", "mkv", "flv", "m4v",
+    "mp3", "wav", "ogg", "flac", "m4a",
 ];
 
 /// Crawl configuration — what to extract, what to allow as scope.
@@ -478,10 +501,23 @@ Disallow: /api/v2  # inline comment too
 
     #[test]
     fn static_asset_filter() {
+        // STILL filtered (pure media — low recon value)
         assert!(is_static_asset("https://x.com/app.css"));
-        assert!(is_static_asset("https://x.com/main.JS"));
         assert!(is_static_asset("https://x.com/logo.png"));
         assert!(is_static_asset("https://x.com/font.woff2"));
+        assert!(is_static_asset("https://x.com/clip.mp4"));
+        // NOT filtered in v0.4.2 (high recon value — JS/JSON contain
+        // endpoints + secrets; archives are backup dumps)
+        assert!(!is_static_asset("https://x.com/main.JS"));
+        assert!(!is_static_asset("https://x.com/Scripts/jquery.js"));
+        assert!(!is_static_asset("https://x.com/api.json"));
+        assert!(!is_static_asset("https://x.com/sitemap.xml"));
+        assert!(!is_static_asset("https://x.com/backup.zip"));
+        assert!(!is_static_asset("https://x.com/dump.tar.gz"));
+        assert!(!is_static_asset("https://x.com/db.sql.gz"));
+        assert!(!is_static_asset("https://x.com/setup.exe"));
+        assert!(!is_static_asset("https://x.com/manual.pdf"));
+        // Real endpoints — never filtered
         assert!(!is_static_asset("https://x.com/api/users"));
         assert!(!is_static_asset("https://x.com/admin"));
         assert!(!is_static_asset("https://x.com/api.v2/list"));
