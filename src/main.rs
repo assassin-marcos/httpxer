@@ -838,6 +838,19 @@ fn banner_should_show_early(argv: &[String]) -> bool {
     true
 }
 
+/// v0.4.1 — pre-scan argv for flags that suppress the network update
+/// check (mirror of `banner_should_show_early`, but for the GitHub
+/// API hit that refreshes the cache). Same constraint: we can't read
+/// parsed `args.no_update_check` yet because clap hasn't run.
+fn update_check_allowed_early(argv: &[String]) -> bool {
+    for a in argv {
+        if a == "-q" || a == "--quiet" || a == "--no-update-check" {
+            return false;
+        }
+    }
+    true
+}
+
 /// Strip scheme + path/query/fragment so `https://foo.com/bar?x=1` becomes
 /// `foo.com`. Without stripping `?` and `#`, inputs like
 /// `https://foo.com?x=1` would resolve DNS as `foo.com?x=1` and silently
@@ -862,19 +875,23 @@ async fn main() -> Result<()> {
     // `args.quiet` yet — clap hasn't run). Cheap O(argv-len) scan; sub-µs.
     let raw_argv: Vec<String> = std::env::args().collect();
     let normalized_argv = normalize_args(raw_argv);
-    if banner_should_show_early(&normalized_argv) {
+    let want_banner = banner_should_show_early(&normalized_argv);
+    let allow_update_check = update_check_allowed_early(&normalized_argv);
+
+    // v0.4.1: refresh the update cache BEFORE the banner so the
+    // `(outdated → vX.Y.Z)` tag is accurate on the FIRST invocation
+    // (not just the second one). `refresh_update_cache_best_effort` has
+    // an internal 120 s skip-window so back-to-back calls are
+    // network-free, and a 2.5 s hard cap so this never blocks startup
+    // for long. Skipped when `-q` / `--quiet` / `--no-update-check`.
+    if want_banner && allow_update_check {
+        update::refresh_update_cache_best_effort().await;
+    }
+    if want_banner {
         update::print_banner();
     }
 
     let args = Args::parse_from(normalized_argv);
-
-    // Refresh the version-check cache (best-effort, non-blocking up to
-    // 2.5 s) so the NEXT invocation's banner has fresh outdated/latest
-    // tag info. The current banner is already on screen by this point;
-    // the refresh just keeps the cache warm for next time.
-    if !args.no_update_check && !args.quiet {
-        update::refresh_update_cache_best_effort().await;
-    }
 
     // Self-management early-exits — handle before we touch input files / DNS / network.
     if args.update {

@@ -2,6 +2,57 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.4.1] — 2026-05-25
+
+UX-fix patch. The `(outdated → vX.Y.Z)` tag in the startup banner
+was silently broken for two reasons since the v0.3.8 banner-on-error
+work; both fixed here.
+
+### Fixed
+- **Banner now shows accurate `(outdated)` tag on the FIRST invocation.**
+  v0.3.8 moved the banner draw to BEFORE clap parsing (so it appears
+  on missing-args clap errors). Side effect: the cache refresh ran
+  AFTER the banner, meaning the first invocation showed whatever stale
+  data was in the cache (or nothing). v0.4.1 runs the refresh BEFORE
+  the banner — still TTY-gated, still suppressed by `-q` / `--quiet`
+  / `--no-update-check`, still capped at 2.5 s budget (with internal
+  120 s skip-window so back-to-back calls are network-free).
+- **Cache TTL extended 24 h → 30 days.** The previous 24 h cap hid
+  outdated warnings from users who run httpxer sporadically: cache
+  read returned `None` → no tag → user assumes they're current. Stale
+  outdated data is still useful (better to flag "v0.3.4, cached said
+  v0.4.0 5 days ago" than to flag nothing). The refresh itself still
+  runs on every invocation when allowed, so fresh data overwrites
+  stale within seconds anyway.
+
+### Added
+- `update_check_allowed_early(argv)` helper — mirror of
+  `banner_should_show_early` for the network update-check, lets the
+  refresh logic respect `--no-update-check` from raw argv (before
+  clap parses).
+
+### Verified
+
+```
+$ echo "0.9.99" > ~/.cache/httpxer/last_check  # simulate "latest"
+$ httpxer
+        httpxer 0.4.1  (outdated → v0.9.99)   · by assassin_marcos · ...
+
+$ touch -d "25 hours ago" ~/.cache/httpxer/last_check
+$ httpxer            # Was HIDDEN in v0.4.0 due to 24h TTL
+        httpxer 0.4.1  (outdated → v0.9.99)   · by assassin_marcos · ...
+
+$ touch -d "45 days ago" ~/.cache/httpxer/last_check
+$ httpxer            # Correctly hidden — beyond 30-day TTL
+        httpxer 0.4.1  · by assassin_marcos · ...
+```
+
+### Unchanged
+- Auto-update on `httpxer -u` works as before (downloads + replaces
+  binary via `self_update`).
+- All v0.4.0 CLI flags work identically.
+- Output schemas unchanged.
+
 ## [0.4.0] — 2026-05-25
 
 **THE BIG ONE.** Multi-round recursion + crawl orchestration — the

@@ -78,13 +78,20 @@ fn update_cache_path() -> Option<PathBuf> {
 }
 
 /// Read the cached "latest release version" written by the most recent
-/// `refresh_update_cache_best_effort` call. Returns None if the cache is
-/// missing, unreadable, or older than 24 h. Used by the startup banner.
+/// `refresh_update_cache_best_effort` call. Returns None when the cache
+/// is missing / unreadable / empty / older than **30 days**.
+///
+/// v0.4.1 — TTL extended from 24 h to 30 days. The 24 h limit was
+/// silently hiding "outdated" warnings from users who run httpxer
+/// sporadically (cache reads None → no `(outdated → vX.Y.Z)` tag →
+/// user thinks they're current). Stale-cache outdated warnings are
+/// still useful — better to flag "v0.3.4 → cached v0.4.0 (data from
+/// 5 days ago)" than to flag nothing.
 pub fn cached_latest_version() -> Option<String> {
     let p = update_cache_path()?;
     let meta = fs::metadata(&p).ok()?;
     let age = meta.modified().ok()?.elapsed().ok()?;
-    if age > Duration::from_secs(24 * 3_600) {
+    if age > Duration::from_secs(30 * 24 * 3_600) {
         return None;
     }
     let s = fs::read_to_string(&p).ok()?.trim().to_string();
