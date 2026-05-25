@@ -261,6 +261,28 @@ struct Args {
     #[arg(long = "add-excludes", help_heading = "Recursion")]
     add_excludes: Option<String>,
 
+    /// (recursion) How exclude entries match: `segment` (default — last
+    /// path component equals an entry, case-insensitive) or `substring`
+    /// (any entry appears anywhere in the path). Substring is dirsearch-
+    /// muscle-memory compat and catches encoded traversal noise
+    /// (`%2e%2e`, `%3b`, `..//`) hidden mid-path.
+    #[arg(long = "exclude-mode", default_value = "segment", help_heading = "Recursion")]
+    exclude_mode: String,
+
+    /// (fuzz) Exact content-length(s) to drop from output. Comma-separated
+    /// bytes — accepts trailing `B`. Mirrors dirsearch `--exclude-sizes`.
+    /// Empty = no size filter.
+    #[arg(long = "exclude-sizes", default_value = "", help_heading = "Fuzz mode")]
+    exclude_sizes: String,
+
+    /// (fuzz) Probe `/` once at startup and add its content-length to
+    /// `--exclude-sizes` automatically. Catches fake-200 catchall pages
+    /// that return the homepage for every path (a pattern the wildcard
+    /// detector usually catches, but this is the explicit dirsearch
+    /// pattern from `ROOT_SIZE=$(curl ...)`).
+    #[arg(long = "exclude-root-size", help_heading = "Fuzz mode")]
+    exclude_root_size: bool,
+
     // ── Crawl (v0.3.7) ─────────────────────────────────────────────────
     /// Enable response crawling — parse HTML/robots.txt/sitemap.xml for
     /// endpoints and add them to the fuzz frontier. Same-host scope by
@@ -961,6 +983,96 @@ async fn main() -> Result<()> {
             args.exclude_subdirs.as_deref(),
             args.add_excludes.as_deref(),
         );
+        let exclude_mode = recurse::ExcludeMode::from_cli(&args.exclude_mode)?;
+
+        // Exclude-sizes: parse comma-separated bytes (accept trailing 'B').
+        // Empty string = no size filter.
+        let mut exclude_sizes: Vec<i64> = args
+            .exclude_sizes
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim().trim_end_matches(['B', 'b']);
+                if s.is_empty() {
+                    None
+                } else {
+                    s.parse::<i64>().ok()
+                }
+            })
+            .collect();
+
+        // --exclude-root-size: probe `/` once and add its CL to
+        // exclude_sizes. Mirrors dirsearch's `ROOT_SIZE=$(curl ...)`
+        // pattern. Built on top of the existing enrich-mode probe.
+        if args.exclude_root_size {
+            // Pool isn't initialised yet (it's set up inside fuzz::run).
+            // Spin up a one-shot wreq client just for this probe — keeps
+            // the pre-flight independent of the impersonation profile that
+            // fuzz will eventually use, which is fine because we're just
+            // measuring the body size of the root page.
+            let timeout = std::time::Duration::from_millis(args.timeout_ms);
+            let client_res = wreq::Client::builder()
+                .timeout(timeout)
+                .cert_verification(false)
+                .build();
+            if let Ok(client) = client_res {
+                for h in &hosts {
+                    let url = if h.starts_with("http://") || h.starts_with("https://") {
+                        h.trim_end_matches('/').to_string()
+                    } else {
+                        format!("https://{}", h)
+                    };
+                    match client.get(&url).send().await {
+                        Ok(resp) => {
+                            let cl = resp
+                                .headers()
+                                .get("content-length")
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| s.parse::<i64>().ok());
+                            let size = match cl {
+                                Some(n) => n,
+                                None => match resp.bytes().await {
+                                    Ok(b) => b.len() as i64,
+                                    Err(_) => -1,
+                                },
+                            };
+                            if size > 0 && !exclude_sizes.contains(&size) {
+                                eprintln!(
+                                    "[+] root-size {} → adding {} to --exclude-sizes",
+                                    url, size
+                                );
+                                exclude_sizes.push(size);
+                            }
+                        }
+                        Err(e) => eprintln!(
+                            "[!] root-size probe failed for {}: {} (skipping)",
+                            url, e
+                        ),
+                    }
+                }
+            }
+        }
+
+        // v0.3.10 — apply exclude_subdirs to the wordlist BEFORE fuzz
+        // even starts. This is the dirsearch behaviour the user expected
+        // ("any queued path CONTAINING these strings is dropped"). When
+        // exclude_mode=substring, every wordlist entry containing any
+        // exclude pattern is dropped up-front; in segment mode only entries
+        // whose last component matches are dropped.
+        let initial_word_count = words.len();
+        let words: Vec<String> = words
+            .into_iter()
+            .filter(|w| !recurse::path_excluded(w, &exclude_subdirs, exclude_mode))
+            .collect();
+        let filtered = initial_word_count - words.len();
+        if filtered > 0 {
+            eprintln!(
+                "[+] exclude-subdirs ({} mode): {} wordlist entries dropped ({} → {})",
+                exclude_mode.as_str(),
+                filtered,
+                initial_word_count,
+                words.len()
+            );
+        }
 
         // Scope: empty = same-host-as-input default.
         let scope_hosts: Vec<String> = args
@@ -1006,6 +1118,8 @@ async fn main() -> Result<()> {
             max_links_per_page: args.max_links_per_page,
             scope_hosts,
             exclude_subdirs,
+            exclude_mode,
+            exclude_sizes,
             fuzz_follow_redirects,
             initial_cookie_header: auth_ctx.initial_cookie_header(),
             extra_headers,

@@ -19,15 +19,23 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-/// Built-in `--exclude-subdirs` default — directories we never recurse
-/// into unless the user explicitly overrides. Catches:
-///   - Static asset dirs (recursing finds nothing real)
+/// Built-in default exclude list — paths we never recurse into AND
+/// (when `ExcludeMode::Substring` is active) never even probe.
+///
+/// v0.3.10 expanded list (matches the user's bash `EXCL=( ... )` pattern):
+///   - Static asset dirs + compound forms (`static/css`, `static/fonts`...)
 ///   - JS framework asset prefixes (`_next`, `_nuxt`, `node_modules`)
-///   - Encoded path-traversal noise (`%2e%2e`, `..`, `..%2f`)
-///   - Common semicolon-trick paths (Java path-param injection)
-///   - Health/probe endpoints (always 200 with same body, recursion noise)
+///   - Encoded path-traversal noise — every dot/slash/backslash variant
+///   - Semicolon-bypass roots (Java path-param injection)
+///   - Slash-confusion + backslash-traversal combos
+///   - Mixed second-level encodings seen in real recon logs
+///   - Health/probe endpoints (always 200, recursion noise)
+///
+/// Lowercase-only — `segment_excluded` / `path_excluded` lowercase the
+/// candidate before comparison so uppercase variants (`%2E%2E`, `%5C`)
+/// match the lowercase entries here.
 pub const DEFAULT_EXCLUDE_SUBDIRS: &[&str] = &[
-    // Static asset directories
+    // ── Static asset dirs (single segment) ────────────────────────────
     "assets",
     "static",
     "public",
@@ -45,7 +53,22 @@ pub const DEFAULT_EXCLUDE_SUBDIRS: &[&str] = &[
     "audio",
     "icons",
     "svg",
-    // JS framework asset prefixes
+    "wp-content/uploads",
+    "uploads/cache",
+    // ── Static asset compound forms (multi-segment — caught in substring mode) ─
+    "static/css",
+    "static/fonts",
+    "static/images",
+    "static/img",
+    "static/media",
+    "static/icons",
+    "static/js",
+    "assets/css",
+    "assets/fonts",
+    "assets/images",
+    "assets/img",
+    "assets/js",
+    // ── JS framework asset prefixes ───────────────────────────────────
     "node_modules",
     "vendor",
     "bower_components",
@@ -59,33 +82,131 @@ pub const DEFAULT_EXCLUDE_SUBDIRS: &[&str] = &[
     "@vite",
     "@react-refresh",
     "@fs",
-    // Encoded path-traversal noise
-    "%2e%2e",
-    "%2E%2E",
-    "%2e%2e%2f",
-    "%2e%2e%5c",
-    "..%2f",
-    "..%5c",
-    "..;",
-    // Common semicolon-trick paths
-    "%3b",
-    "%3B",
-    ";",
-    // Health/probe endpoints
+    // ── Encoded dot-traversal (every variant) ─────────────────────────
+    "%2e%2e",       // ..
+    "%2e.",         // .. (mixed encode)
+    ".%2e",         // .. (mixed encode)
+    "..%2f",        // ../
+    "..%5c",        // ..\
+    "..\\",         // ..\
+    "../",          // plain ../
+    "..",           // plain ..
+    // ── Semicolon-bypass roots (Java / Tomcat / Jetty path-param) ─────
+    "%3b",          // ;
+    ";/",           // ;/
+    "%3b/",         // ;/
+    ";%2f",         // ;/
+    ";",            // bare semicolon
+    "..;",          // ..; (Tomcat traversal)
+    // ── Slash-confusion roots ─────────────────────────────────────────
+    "%2f/",         // //
+    "//",           // //
+    "/../",         // /../
+    "//..",         // //..
+    "///",          // ///
+    "%2f%2f",       // //
+    // ── Backslash-traversal ───────────────────────────────────────────
+    "%5c",          // \
+    "\\/",          // \/
+    "\\..",         // \..
+    "\\",           // bare backslash
+    // ── Mixed second-level combos seen in real recon logs ─────────────
+    "/..//",
+    "/;/",
+    "/.%2e",
+    "/%2e.",
+    "/%3b",
+    "/%5c",
+    // ── Health / probe endpoints (always-200 noise) ──────────────────
     "healthz",
     "readyz",
     "livez",
     "ping",
     "_health",
     "_status",
+    "actuator/health",
+    "ready",
+    "live",
 ];
 
-/// True iff `path_segment` should be skipped per the merged exclude list
-/// (built-in defaults + user `--add-excludes` + user `--exclude-subdirs`
-/// override). Case-insensitive match on the segment as a string.
+/// Exclusion match mode. dirsearch-paste-compat users want substring
+/// (any queued path CONTAINING the entry is dropped); pre-v0.3.10
+/// httpxer used segment (the dir's last path component EQUALS one of
+/// the entries). Substring is more aggressive — catches traversal /
+/// semicolon noise hidden anywhere in the path. Segment is more precise
+/// — won't reject `/api/css-tooling/x` just because it has `css` in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExcludeMode {
+    /// Match if the path's LAST component equals an exclude entry
+    /// (case-insensitive). Default — least aggressive, least false-drops.
+    #[default]
+    Segment,
+    /// Match if the path CONTAINS any exclude entry as a substring
+    /// (case-insensitive). Aggressive — drops `/api/admin/%3b/anything`
+    /// because `%3b` appears anywhere in it.
+    Substring,
+}
+
+impl ExcludeMode {
+    pub fn from_cli(s: &str) -> anyhow::Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "segment" => Ok(ExcludeMode::Segment),
+            "substring" => Ok(ExcludeMode::Substring),
+            other => anyhow::bail!(
+                "invalid --exclude-mode '{}' (want segment|substring)",
+                other
+            ),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExcludeMode::Segment => "segment",
+            ExcludeMode::Substring => "substring",
+        }
+    }
+}
+
+/// True iff `path_segment` should be skipped per `exclude_set`, using
+/// segment-equality matching (case-insensitive).
 pub fn segment_excluded(path_segment: &str, exclude_set: &HashSet<String>) -> bool {
     let lc = path_segment.to_ascii_lowercase();
     exclude_set.contains(&lc)
+}
+
+/// True iff `path` should be skipped per the merged exclude list, using
+/// the chosen `mode`. Path can be a full URL OR a bare path like
+/// `/admin/users` OR a wordlist entry like `admin/api/x`.
+///
+/// - **Segment mode**: extracts the last non-empty path segment and
+///   compares to the exclude entries (existing v0.3.7 behavior).
+/// - **Substring mode**: lowercases the path and checks if ANY exclude
+///   entry appears as a substring. Catches encoded traversal noise
+///   anywhere in the path. v0.3.10 addition.
+pub fn path_excluded(
+    path: &str,
+    exclude_set: &HashSet<String>,
+    mode: ExcludeMode,
+) -> bool {
+    match mode {
+        ExcludeMode::Segment => {
+            // Try URL form first; fall back to plain string segment split.
+            if let Some(seg) = last_path_segment(path) {
+                return segment_excluded(&seg, exclude_set);
+            }
+            // Bare path — split on '/' and take last non-empty.
+            let last = path
+                .trim_matches('/')
+                .rsplit('/')
+                .find(|s| !s.is_empty())
+                .unwrap_or("");
+            segment_excluded(last, exclude_set)
+        }
+        ExcludeMode::Substring => {
+            let lc = path.to_ascii_lowercase();
+            exclude_set.iter().any(|e| lc.contains(e))
+        }
+    }
 }
 
 /// Build the exclude set from CLI flags. When `override_list` is `Some`,
@@ -333,6 +454,108 @@ pub fn canonical_url_key(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exclude_mode_from_cli_parses() {
+        assert_eq!(
+            ExcludeMode::from_cli("segment").unwrap(),
+            ExcludeMode::Segment
+        );
+        assert_eq!(
+            ExcludeMode::from_cli("substring").unwrap(),
+            ExcludeMode::Substring
+        );
+        assert_eq!(
+            ExcludeMode::from_cli("SUBSTRING").unwrap(),
+            ExcludeMode::Substring
+        );
+        assert!(ExcludeMode::from_cli("bogus").is_err());
+    }
+
+    #[test]
+    fn path_excluded_segment_mode() {
+        let mut set = HashSet::new();
+        set.insert("css".to_string());
+        set.insert("%3b".to_string());
+        // Last segment matches → dropped.
+        assert!(path_excluded(
+            "https://x.com/static/css",
+            &set,
+            ExcludeMode::Segment
+        ));
+        assert!(path_excluded("/static/css", &set, ExcludeMode::Segment));
+        // Last segment doesn't match → kept (even though `css` is mid-path).
+        assert!(!path_excluded(
+            "https://x.com/css-tooling/v1/api",
+            &set,
+            ExcludeMode::Segment
+        ));
+        // Mid-path traversal not caught by segment mode.
+        assert!(!path_excluded(
+            "https://x.com/api/%3b/users",
+            &set,
+            ExcludeMode::Segment
+        ));
+    }
+
+    #[test]
+    fn path_excluded_substring_mode() {
+        let mut set = HashSet::new();
+        set.insert("%3b".to_string());
+        set.insert("%2e%2e".to_string());
+        set.insert("//".to_string());
+        // Substring anywhere → dropped.
+        assert!(path_excluded(
+            "/api/%3b/users",
+            &set,
+            ExcludeMode::Substring
+        ));
+        assert!(path_excluded(
+            "/x/%2e%2e/etc/passwd",
+            &set,
+            ExcludeMode::Substring
+        ));
+        assert!(path_excluded("/api//double-slash", &set, ExcludeMode::Substring));
+        // No substring match → kept.
+        assert!(!path_excluded("/api/users", &set, ExcludeMode::Substring));
+        // Case-insensitive.
+        assert!(path_excluded("/X/%3B/Y", &set, ExcludeMode::Substring));
+    }
+
+    #[test]
+    fn path_excluded_works_on_bare_paths() {
+        let mut set = HashSet::new();
+        set.insert("assets".to_string());
+        // Bare wordlist entry (no scheme/host).
+        assert!(path_excluded("assets", &set, ExcludeMode::Segment));
+        assert!(path_excluded("/assets", &set, ExcludeMode::Segment));
+        assert!(path_excluded("foo/assets", &set, ExcludeMode::Segment));
+        assert!(!path_excluded("assets-list", &set, ExcludeMode::Segment));
+    }
+
+    #[test]
+    fn default_excludes_cover_user_list() {
+        // Smoke-check the expanded v0.3.10 list covers the patterns the
+        // user explicitly listed. Lowercased; substring mode catches the
+        // mixed-case variants automatically.
+        let set = build_exclude_set(None, None);
+        for entry in &[
+            "%2e%2e", "%2e.", ".%2e", "..%2f", "..%5c", "../", "..",
+            "%3b", ";/", ";%2f", "..;",
+            "%2f/", "//", "/../", "//..", "///",
+            "%5c", "\\..",
+            "/..//", "/;/", "/%3b", "/%5c",
+            "assets", "css", "fonts", "images", "img", "icons", "media",
+            "static/css", "static/fonts", "static/images", "static/img",
+            "static/media", "static/icons",
+        ] {
+            assert!(
+                set.contains(&entry.to_ascii_lowercase()),
+                "missing default exclude entry: {}",
+                entry
+            );
+        }
+    }
 
     #[test]
     fn exclude_set_replaces_defaults_on_override() {

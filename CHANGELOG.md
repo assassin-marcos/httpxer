@@ -2,6 +2,107 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.3.10] — 2026-05-25
+
+The 3 tightenings the user asked for from the dirsearch-parity gap
+analysis — all shipped as actually-functional flags (not just CLI
+scaffolding). `--exclude-subdirs` is now wired into wordlist pre-
+filtering, so it does something useful TODAY without waiting for the
+v0.3.11 recursion orchestration.
+
+### Added
+- **`--exclude-mode segment|substring`** — choose how exclude entries
+  match. Default `segment` (last path component equals an entry; v0.3.7
+  behavior, low FP-drop risk). `substring` is the dirsearch-paste-compat
+  mode — any entry appears ANYWHERE in the path drops it. Substring
+  catches encoded traversal noise (`%2e%2e`, `%3b`, `..//`) hidden
+  mid-path; segment is more precise (won't drop `/api/css-tooling/x`
+  just because `css` is a substring).
+- **`--exclude-sizes <list>`** — exact content-length filter, comma-
+  separated. Accepts trailing `B` (e.g. `218B,500B,128`). Empty = no
+  size filter. dirsearch parity.
+- **`--exclude-root-size`** — probes `/` once at startup, captures the
+  homepage's content-length, and auto-adds it to `--exclude-sizes`.
+  Mirrors the user's bash pattern `ROOT_SIZE=$(curl -sk -o /dev/null
+  -w "%{size_download}" "$1/")`. Drops fake-200 catchall pages that
+  return the homepage for every probe.
+- **`--exclude-subdirs` now filters the WORDLIST** (not just future
+  recursion targets). In v0.3.7-v0.3.9 the flag parsed but never
+  fired against the wordlist; v0.3.10 wires it into the pre-fuzz
+  filter step. Result: an exclude list with `%3b,%2e%2e` (substring
+  mode) drops every wordlist entry containing those substrings
+  BEFORE any probe goes out.
+
+### Expanded — `DEFAULT_EXCLUDE_SUBDIRS`
+
+From 46 entries → 79 entries. New coverage matches the user's bash
+`EXCL=( ... )` list verbatim:
+
+```
+# Dot-traversal full set:
+%2e., .%2e, ../, .. (plain), ..\\
+# Semicolon-bypass:
+;/, %3b/, ;%2f, ..;
+# Slash-confusion:
+%2f/, //, /../, //.., ///, %2f%2f
+# Backslash-traversal:
+%5c, \\/, \\.., \\ (bare)
+# Mixed second-level combos:
+/..//, /;/, /.%2e, /%2e., /%3b, /%5c
+# Static asset compounds:
+static/css, static/fonts, static/images, static/img, static/media,
+static/icons, static/js, assets/css, assets/fonts, assets/images,
+assets/img, assets/js
+# Extra health endpoints:
+actuator/health, ready, live
+```
+
+### Tests
+- **71 unit tests passing** (was 66). 5 new:
+  - `exclude_mode_from_cli_parses` — CLI parse + case-insensitive
+  - `path_excluded_segment_mode` — segment match semantics
+  - `path_excluded_substring_mode` — substring match semantics
+    incl. case-insensitive + encoded patterns
+  - `path_excluded_works_on_bare_paths` — wordlist-entry shape
+  - `default_excludes_cover_user_list` — regression-check that every
+    entry from the user's `EXCL` bash list is in our defaults
+
+### Smoke verification (vs the user's dirsearch invocation)
+
+```
+$ httpxer -u http://test/ -w wordlist.txt --exclude-mode substring \
+    --add-excludes '%3b,%2e%2e,css' -o out.jsonl
+[+] wordlist: 7 unique paths
+[+] exclude-subdirs (substring mode): 4 wordlist entries dropped (7 → 3)
+```
+
+Dropped: `api/%3b/users`, `static/css/main.css`, `my-static-css-tool`,
+`foo/%2e%2e/etc/passwd`. Kept: `admin`, `api/v1/users`, `normal/path`.
+
+`--exclude-root-size` against a wildcard catchall server:
+```
+[+] root-size http://127.0.0.1 → adding 186 to --exclude-sizes
+[+] fuzz done: 7 probes → 1 record (6 catchall responses dropped)
+```
+
+### Changed
+- Version: 0.3.9 → **0.3.10**
+- `FuzzCfg` gained `exclude_mode: ExcludeMode` and `exclude_sizes: Vec<i64>`.
+- `recurse::ExcludeMode` enum + `path_excluded()` helper added.
+- `DEFAULT_EXCLUDE_SUBDIRS` grew from 46 → 79 entries.
+
+### Still on the roadmap (slid to v0.3.11)
+- Multi-round recursion orchestration (modules + flags + smart-exclude
+  wiring all shipped; orchestrator loop is the remaining work)
+- Crawl orchestration (HTML + robots + sitemap extractors all shipped
+  + tested; per-probe extraction loop slides one release)
+- Auto-throttle on 429 spike
+
+### Unchanged (compatibility)
+- All v0.3.9 CLI flags work identically.
+- Default mode is `segment` so old scans behave the same.
+- Output schemas unchanged.
+
 ## [0.3.9] — 2026-05-25
 
 **Headline**: Layer 2 path-echo wildcard detection closes the only gap

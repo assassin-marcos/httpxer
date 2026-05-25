@@ -174,6 +174,11 @@ pub struct FuzzCfg {
     pub scope_hosts: Vec<String>,
     /// Built-in + user-overridden subdirectory exclude list (lowercased).
     pub exclude_subdirs: std::collections::HashSet<String>,
+    /// How exclude entries match — segment (default) or substring (v0.3.10).
+    pub exclude_mode: crate::recurse::ExcludeMode,
+    /// Exact content-lengths to drop from output (v0.3.10 — dirsearch
+    /// `--exclude-sizes` parity). Empty = no size filter.
+    pub exclude_sizes: Vec<i64>,
     // ── Misc behavior (v0.3.7) ─────────────────────────────────────────
     /// Follow redirects within fuzz probes (default off — 3xx is a finding).
     /// Auto-on when crawl_enabled (crawl needs terminal URL + body).
@@ -1059,6 +1064,15 @@ async fn run_probe(
             // override). Applied AFTER match-codes so the user can express
             // both inclusion and exclusion in the same scan.
             if cfg.exclude_codes.contains(&parsed.status) {
+                return;
+            }
+            // v0.3.10 — `--exclude-sizes` filter. Exact content-length
+            // match (dirsearch parity). Combined with --exclude-root-size
+            // this lets the user drop fake-200 catchall pages by their
+            // homepage size without relying on the wildcard detector.
+            if !cfg.exclude_sizes.is_empty()
+                && cfg.exclude_sizes.contains(&parsed.content_length)
+            {
                 return;
             }
 
