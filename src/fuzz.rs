@@ -188,6 +188,12 @@ pub struct FuzzCfg {
     pub initial_cookie_header: Option<String>,
     /// Additional headers from `--header`/`--bearer`. Empty when no auth.
     pub extra_headers: Vec<(String, String)>,
+    /// Output file format (v0.3.13). `Json` = current behavior;
+    /// `Plain` = dirsearch-style `STATUS  SIZE  URL` per line.
+    pub output_format: OutputFormat,
+    /// Print findings live to stderr during the scan in dirsearch-style
+    /// format (v0.3.13). True by default; disable for clean log scraping.
+    pub live_findings: bool,
 }
 
 /// Wildcard-handling policy. `strict` (default) suppresses any record whose
@@ -273,6 +279,87 @@ fn normalize_path(raw: &str) -> String {
         s.to_string()
     } else {
         format!("/{}", s)
+    }
+}
+
+/// Format a byte size as a compact human string: 146B, 1KB, 1.2MB, 3.4GB.
+/// Negative → "--" (the marker for error records with no body).
+/// Used by both the live findings display and `--format plain`.
+fn format_size(bytes: i64) -> String {
+    if bytes < 0 {
+        return "--".to_string();
+    }
+    let b = bytes as f64;
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    if b < KB {
+        format!("{}B", bytes)
+    } else if b < MB {
+        format!("{:.0}KB", b / KB)
+    } else if b < GB {
+        format!("{:.1}MB", b / MB)
+    } else {
+        format!("{:.1}GB", b / GB)
+    }
+}
+
+/// Output format for `-o` file + live terminal findings (v0.3.13).
+/// - `Json` (default): one FuzzRecord JSON object per line — full data,
+///   downstream-parsable.
+/// - `Plain`: dirsearch-style `STATUS  SIZE  URL` per line — human-
+///   readable, much smaller files.
+/// Auto-detected from the `-o` file extension when `--format` isn't passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Json,
+    Plain,
+}
+
+impl OutputFormat {
+    pub fn from_cli(s: &str) -> anyhow::Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "json" | "jsonl" => Ok(Self::Json),
+            "plain" | "txt" => Ok(Self::Plain),
+            other => anyhow::bail!(
+                "invalid --format '{}' (want json|jsonl|plain|txt)",
+                other
+            ),
+        }
+    }
+
+    /// Auto-detect output format from `-o` file extension.
+    /// `.json` / `.jsonl` → Json; `.txt` → Plain. Anything else → Json (safe).
+    pub fn from_path(path: &str) -> Self {
+        let lc = path.to_ascii_lowercase();
+        if lc.ends_with(".txt") {
+            Self::Plain
+        } else {
+            Self::Json
+        }
+    }
+}
+
+/// Dirsearch-style single-line finding format. Used for BOTH live
+/// terminal display (TTY-gated, ANSI-colored) and `--format plain`
+/// file output (no ANSI). Empty when status is 0 (network error
+/// emit-errors path) so the table stays aligned at width.
+fn format_finding_line(status: u16, content_length: i64, url: &str, color: bool) -> String {
+    let size = format_size(content_length);
+    if color {
+        // Status code color cues — same palette as dirsearch / ffuf:
+        let color_code = match status {
+            200..=299 => "\x1b[32m",       // green
+            300..=399 => "\x1b[33m",       // yellow
+            401 | 403 => "\x1b[36m",       // cyan (auth-walled)
+            400 | 402 | 404..=499 => "\x1b[35m", // magenta (other 4xx)
+            500..=599 => "\x1b[31m",       // red (server error)
+            _ => "",
+        };
+        let reset = if color_code.is_empty() { "" } else { "\x1b[0m" };
+        format!("{}{:>3}{} {:>7}  {}", color_code, status, reset, size, url)
+    } else {
+        format!("{:>3} {:>7}  {}", status, size, url)
     }
 }
 
@@ -1202,7 +1289,7 @@ async fn run_probe(
                 source: String::new(),
                 parent_url: String::new(),
             };
-            write_record(out_file, &rec).await;
+            write_record(out_file, &rec, cfg.output_format, cfg.live_findings).await;
         }
         None => {
             if !cfg.include_errors {
@@ -1239,15 +1326,53 @@ async fn run_probe(
                 source: String::new(),
                 parent_url: String::new(),
             };
-            write_record(out_file, &rec).await;
+            write_record(out_file, &rec, cfg.output_format, cfg.live_findings).await;
         }
     }
 }
 
-async fn write_record(out_file: &Arc<Mutex<std::fs::File>>, rec: &FuzzRecord) {
-    let line = match serde_json::to_string(rec) {
-        Ok(s) => s,
-        Err(_) => return,
+/// v0.3.13 — write a record in the chosen format AND optionally print
+/// the dirsearch-style live finding line to stderr. Called by every
+/// emitted probe (after wildcard + status-code + size filters pass).
+///
+/// Live-print is TTY-gated when `is_tty=true` it uses ANSI color cues
+/// per HTTP status class (green 2xx / yellow 3xx / cyan 401-403 / etc).
+/// `eprintln!` is line-atomic so concurrent worker prints don't
+/// interleave mid-line, and `\r\x1b[K` clears the progress bar line so
+/// the next ticker redraw lands cleanly below the finding.
+async fn write_record(
+    out_file: &Arc<Mutex<std::fs::File>>,
+    rec: &FuzzRecord,
+    format: OutputFormat,
+    live: bool,
+) {
+    // ── 1. Live findings to stderr (UX) ──────────────────────────────
+    // Compute is_tty per-call. `IsTerminal::is_terminal()` is a cheap
+    // ioctl(TIOCGWINSZ)-style check — sub-microsecond, fine to call
+    // once per emitted record.
+    let is_tty = std::io::stderr().is_terminal();
+    if live && rec.status_code != 0 {
+        let line = format_finding_line(rec.status_code, rec.content_length, &rec.url, is_tty);
+        if is_tty {
+            // \r\x1b[K wipes the progress bar before our line lands; the
+            // ticker's next ~100 ms tick redraws the bar below.
+            eprintln!("\r\x1b[K{}", line);
+        } else {
+            eprintln!("{}", line);
+        }
+    }
+
+    // ── 2. File output in chosen format ──────────────────────────────
+    let line = match format {
+        OutputFormat::Json => match serde_json::to_string(rec) {
+            Ok(s) => s,
+            Err(_) => return,
+        },
+        OutputFormat::Plain => {
+            // Plain mode strips the heavy body_preview / VIEWSTATE blob
+            // entirely. One line per finding: STATUS SIZE URL.
+            format_finding_line(rec.status_code, rec.content_length, &rec.url, false)
+        }
     };
     let mut f = out_file.lock().await;
     if let Err(e) = writeln!(*f, "{}", line) {

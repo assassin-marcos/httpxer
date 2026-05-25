@@ -2,6 +2,80 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.3.13] — 2026-05-25
+
+UX overhaul — output is finally readable. Live findings on terminal,
+clean plain-text file format, no more giant VIEWSTATE blobs by default.
+
+### Added
+- **Live findings display** (dirsearch / ffuf parity). Every emitted
+  probe prints to stderr in `STATUS  SIZE  URL` format, color-coded
+  by HTTP status class (green 2xx, yellow 3xx, cyan 401/403, magenta
+  4xx, red 5xx). Sits above the v0.3.12 progress bar — `\r\x1b[K`
+  wipes the bar before each finding lands so the layout stays clean.
+  TTY-gated (no ANSI in piped output). Suppress with `--no-live`.
+- **`--format plain`** — output file format flag. Writes dirsearch-style
+  `STATUS  SIZE  URL` one per line instead of JSONL. **Strips the
+  body_preview entirely** — your `everything_scan.txt` shrinks from
+  ~50 MB (with VIEWSTATE blobs) to ~50 KB.
+- **`--format json|plain` + auto-detect from `-o` extension**. `.txt`
+  paths → `plain`, anything else → `json`. Explicit `--format` overrides.
+- **`format_size()` helper** — `146B`, `1KB`, `1.2MB`, `3.4GB`. Used by
+  both live findings and plain file output. Negative content-length
+  (error records) prints `--`.
+
+### Sample output
+
+Terminal (TTY, color-coded):
+```
+  [12876/14999] 86% | 4275 rps | eta 0s
+200      8B  http://x.com/favicon.ico
+301    320B  http://x.com/login
+403     --   http://x.com/.git/HEAD
+500   1.2KB  http://x.com/buggy.aspx
+```
+
+Plain file:
+```
+200     41B  http://127.0.0.1/wp-admin/admin-ajax.php
+200     35B  http://127.0.0.1/api/v1/users
+200     43B  http://127.0.0.1/login.aspx
+200     54B  http://127.0.0.1/Trace.axd
+```
+
+### Changed
+- Version: 0.3.12 → **0.3.13**
+- `FuzzCfg` gained `output_format: OutputFormat` and `live_findings: bool`.
+- `write_record()` signature: now takes `format` + `live` parameters.
+  Lives serialized JSON in JSON mode, formatted finding line in plain
+  mode. Calls is_terminal() per write to decide ANSI inclusion.
+- `OutputFormat` enum with `from_cli()` parser + `from_path()` extension-
+  based auto-detect.
+
+### Migration
+
+Your script benefits immediately — change `-o everything_scan.txt`
+behavior:
+
+| Before v0.3.13 | After v0.3.13 |
+|---|---|
+| `-o out.txt` → full JSONL with body_preview (~MBs) | `-o out.txt` → plain `STATUS SIZE URL` lines |
+| No live findings on terminal | Live findings stream by default |
+| Output file was the only feedback | Live findings + progress bar + output file |
+
+Keep `-o out.jsonl` (or `.json`) for the old JSONL behavior.
+
+### Still on the roadmap (slid to v0.3.14)
+- Multi-round recursion orchestration
+- Crawl per-probe extraction loop
+- Auto-throttle on 429 spike
+- Extension multiplication (`-e auto`)
+
+### Unchanged
+- All v0.3.12 CLI flags work identically.
+- `.json` / `.jsonl` output schemas unchanged — only plain-mode output
+  is new.
+
 ## [0.3.12] — 2026-05-25
 
 ### Added

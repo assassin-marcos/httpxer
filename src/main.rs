@@ -283,6 +283,22 @@ struct Args {
     #[arg(long = "exclude-root-size", help_heading = "Fuzz mode")]
     exclude_root_size: bool,
 
+    /// Output file format. `json` (default) writes one full FuzzRecord
+    /// JSONL line per finding. `plain` writes dirsearch-style
+    /// `STATUS  SIZE  URL` per finding — much smaller files, human-
+    /// readable, no body_preview. Auto-detected from `-o` extension when
+    /// this flag isn't passed (`.txt` → `plain`, anything else → `json`).
+    #[arg(long = "format", help_heading = "Output")]
+    format: Option<String>,
+
+    /// Suppress the live findings display on stderr (v0.3.13). By
+    /// default, every emitted finding prints to the terminal in
+    /// dirsearch-style format (`STATUS SIZE URL`, color-coded by status
+    /// class) above the progress bar. Pass this to silence and rely on
+    /// the output file only — useful for log scrapers / tee invocations.
+    #[arg(long = "no-live", help_heading = "Output")]
+    no_live: bool,
+
     // ── Crawl (v0.3.7) ─────────────────────────────────────────────────
     /// Enable response crawling — parse HTML/robots.txt/sitemap.xml for
     /// endpoints and add them to the fuzz frontier. Same-host scope by
@@ -1123,6 +1139,11 @@ async fn main() -> Result<()> {
             fuzz_follow_redirects,
             initial_cookie_header: auth_ctx.initial_cookie_header(),
             extra_headers,
+            output_format: match args.format.as_deref() {
+                Some(s) => fuzz::OutputFormat::from_cli(s)?,
+                None => fuzz::OutputFormat::from_path(output_path),
+            },
+            live_findings: !args.no_live,
         };
 
         fuzz::run(&hosts, &words, cfg, output_path, args.no_resume, policy).await?;
