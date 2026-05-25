@@ -2,6 +2,95 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.3.11] — 2026-05-25
+
+UX policy change: JS crawling is now **on by default**.
+
+### Changed
+- **Removed ALL JavaScript-related entries from `DEFAULT_EXCLUDE_SUBDIRS`.**
+  JS files routinely contain real API endpoints, config data, OAuth client
+  IDs, hardcoded credentials, and other recon-worthy artifacts. Blocking
+  them by default forfeits a major surface. The 15 removed entries are:
+  ```
+  js, static/js, assets/js,
+  node_modules, bower_components,
+  _next, _nuxt, _app,
+  __webpack, __webpack_hmr,
+  .sapper, .svelte-kit,
+  @vite, @react-refresh, @fs
+  ```
+  Result: a wordlist with `js`, `node_modules/lodash/package.json`,
+  `_next/data/foo.json`, `@vite/client`, `.svelte-kit/runtime` now
+  probes them all (was: 5/8 dropped in v0.3.10 substring mode; now:
+  0/8 dropped from the JS-specific list).
+
+### Still kept in defaults
+- General asset containers (`static`, `assets`, `public`, `dist`,
+  `build`, `bundle`, `bundles`) — they hold ALL asset types (CSS,
+  fonts, images, JS, ...), substring mode still drops them.
+- Visual asset dirs (`css`, `fonts`, `images`, `img`, `icons`,
+  `media`, `videos`, `audio`, `svg`)
+- Compound non-JS forms (`static/css`, `static/fonts`,
+  `static/images`, `assets/css`, `assets/fonts`, `assets/images`...)
+- All traversal / semicolon / slash / backslash patterns (always noise)
+- PHP/Composer `vendor` dir (ambiguous — kept)
+- Health endpoints (`healthz`, `readyz`, `livez`, `ping`,
+  `actuator/health`, `_health`, `_status`, `ready`, `live`)
+
+### Opting back in
+If you want JS dropped (rare — usually you want to crawl it):
+```bash
+httpxer ... --add-excludes 'js,node_modules,_next,_nuxt,@vite,.svelte-kit'
+```
+
+If you want everything blocked except JS (sometimes useful — e.g.
+focused-recon mode):
+```bash
+httpxer ... --exclude-subdirs 'css,fonts,images,assets/css,...'  # custom list
+```
+
+### Substring-mode caveat (unchanged)
+Paths nested inside `static/`, `assets/`, `public/`, `dist/`, `build/`
+are still dropped in substring mode because the parent container is
+in defaults. JS files at the ROOT (`/js/...`) or in JS framework
+prefixes (`/_next/...`, `/@vite/...`) pass through. To probe JS
+inside any asset container under substring mode:
+```bash
+httpxer ... --exclude-mode substring --exclude-subdirs 'css,fonts,images,svg'
+```
+
+### Tests
+- **72 unit tests passing** (was 71). 1 new:
+  - `defaults_do_not_block_js_crawl` — regression-check that the 15
+    JS-related entries are NOT in the default exclude list.
+- Renamed `default_excludes_cover_user_list` → `default_excludes_cover_user_list_minus_js`
+  to reflect the v0.3.11 policy.
+
+### Smoke verification
+
+```
+$ cat /tmp/js-test.txt
+admin
+js
+static/js/app.js          ← substring blocked by "static" container
+assets/js/main.bundle.js  ← substring blocked by "assets" container
+_next/data/foo.json
+@vite/client
+node_modules/lodash/package.json
+.svelte-kit/runtime
+
+$ httpxer -u http://x/ -w /tmp/js-test.txt --exclude-mode substring -o out.jsonl
+[+] wordlist: 8 unique paths
+[+] exclude-subdirs (substring mode): 2 wordlist entries dropped (8 → 6)
+```
+
+The 6 kept (down from v0.3.10's 3 kept): `admin`, `js`, `_next/...`,
+`@vite/...`, `node_modules/...`, `.svelte-kit/...`.
+
+### Unchanged
+- All v0.3.10 CLI flags work identically.
+- Output schemas unchanged.
+
 ## [0.3.10] — 2026-05-25
 
 The 3 tightenings the user asked for from the dirsearch-parity gap

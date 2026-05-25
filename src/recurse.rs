@@ -24,18 +24,30 @@ use std::sync::Mutex;
 ///
 /// v0.3.10 expanded list (matches the user's bash `EXCL=( ... )` pattern):
 ///   - Static asset dirs + compound forms (`static/css`, `static/fonts`...)
-///   - JS framework asset prefixes (`_next`, `_nuxt`, `node_modules`)
 ///   - Encoded path-traversal noise — every dot/slash/backslash variant
 ///   - Semicolon-bypass roots (Java path-param injection)
 ///   - Slash-confusion + backslash-traversal combos
 ///   - Mixed second-level encodings seen in real recon logs
 ///   - Health/probe endpoints (always 200, recursion noise)
 ///
+/// v0.3.11 change: ALL JavaScript-related entries removed by default —
+/// `js`, `static/js`, `assets/js`, `node_modules`, `_next`, `_nuxt`,
+/// `_app`, `__webpack*`, `.sapper`, `.svelte-kit`, `@vite`,
+/// `@react-refresh`, `@fs`, `bower_components`. JS files routinely
+/// contain real API endpoints, config data, and secret leaks worth
+/// crawling. If you want them dropped, add explicitly with
+/// `--add-excludes 'js,node_modules,_next,...'`.
+///
 /// Lowercase-only — `segment_excluded` / `path_excluded` lowercase the
 /// candidate before comparison so uppercase variants (`%2E%2E`, `%5C`)
 /// match the lowercase entries here.
 pub const DEFAULT_EXCLUDE_SUBDIRS: &[&str] = &[
     // ── Static asset dirs (single segment) ────────────────────────────
+    // NOTE: `js` and all JS-related entries are DELIBERATELY NOT in this
+    // list (v0.3.11 change). JS files often contain real API endpoints
+    // and config data worth crawling — blocking them by default
+    // forfeits a major recon surface. If you want JS dropped, add
+    // `--add-excludes 'js,node_modules,_next,...'` explicitly.
     "assets",
     "static",
     "public",
@@ -44,7 +56,6 @@ pub const DEFAULT_EXCLUDE_SUBDIRS: &[&str] = &[
     "bundle",
     "bundles",
     "css",
-    "js",
     "fonts",
     "images",
     "img",
@@ -56,32 +67,19 @@ pub const DEFAULT_EXCLUDE_SUBDIRS: &[&str] = &[
     "wp-content/uploads",
     "uploads/cache",
     // ── Static asset compound forms (multi-segment — caught in substring mode) ─
+    // NOTE: `static/js`, `assets/js` deliberately NOT here — see above.
     "static/css",
     "static/fonts",
     "static/images",
     "static/img",
     "static/media",
     "static/icons",
-    "static/js",
     "assets/css",
     "assets/fonts",
     "assets/images",
     "assets/img",
-    "assets/js",
-    // ── JS framework asset prefixes ───────────────────────────────────
-    "node_modules",
+    // ── PHP / Composer / framework dirs (not JS-specific) ─────────────
     "vendor",
-    "bower_components",
-    "_next",
-    "_nuxt",
-    "_app",
-    "__webpack",
-    "__webpack_hmr",
-    ".sapper",
-    ".svelte-kit",
-    "@vite",
-    "@react-refresh",
-    "@fs",
     // ── Encoded dot-traversal (every variant) ─────────────────────────
     "%2e%2e",       // ..
     "%2e.",         // .. (mixed encode)
@@ -534,10 +532,13 @@ mod tests {
     }
 
     #[test]
-    fn default_excludes_cover_user_list() {
-        // Smoke-check the expanded v0.3.10 list covers the patterns the
-        // user explicitly listed. Lowercased; substring mode catches the
-        // mixed-case variants automatically.
+    fn default_excludes_cover_user_list_minus_js() {
+        // Smoke-check the default list covers the non-JS patterns from
+        // the user's bash EXCL list. JS-related entries (js, static/js,
+        // assets/js, node_modules, _next, _nuxt, _app, __webpack*,
+        // .sapper, .svelte-kit, @vite, @react-refresh, @fs,
+        // bower_components) are DELIBERATELY excluded from defaults as
+        // of v0.3.11 — JS files contain endpoints/config worth crawling.
         let set = build_exclude_set(None, None);
         for entry in &[
             "%2e%2e", "%2e.", ".%2e", "..%2f", "..%5c", "../", "..",
@@ -552,6 +553,39 @@ mod tests {
             assert!(
                 set.contains(&entry.to_ascii_lowercase()),
                 "missing default exclude entry: {}",
+                entry
+            );
+        }
+    }
+
+    /// v0.3.11 — ensure JS-related entries are NOT in the default
+    /// exclude list. JS files often contain real endpoints / config /
+    /// secret leaks worth crawling. Users who want them dropped must
+    /// opt in via `--add-excludes 'js,node_modules,...'`.
+    #[test]
+    fn defaults_do_not_block_js_crawl() {
+        let set = build_exclude_set(None, None);
+        for entry in &[
+            "js",
+            "static/js",
+            "assets/js",
+            "node_modules",
+            "bower_components",
+            "_next",
+            "_nuxt",
+            "_app",
+            "__webpack",
+            "__webpack_hmr",
+            ".sapper",
+            ".svelte-kit",
+            "@vite",
+            "@react-refresh",
+            "@fs",
+        ] {
+            assert!(
+                !set.contains(&entry.to_ascii_lowercase()),
+                "v0.3.11 default exclude list must NOT contain JS-related entry: {} \
+                 (JS crawling is supported by default; users opt out via --add-excludes)",
                 entry
             );
         }
