@@ -2,6 +2,26 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.4.4] — 2026-06-02
+
+### Fixed
+- **App-shell wildcard suppression for unstable fake-200 bodies.** When
+  random-path wildcard samples share the same content type and first-body
+  fingerprint but content length drifts too widely to trust, httpxer now records
+  a prefix-only Layer 1 signature and suppresses matching probes by content type
+  plus first-body fingerprint.
+- **Wildcard logging for prefix-only signatures.** The pre-flight log now prints
+  `prefix-only` instead of a misleading negative content length marker.
+
+### Verified
+- Local bounded scan against `https://checkout.castorama.pl` using the first 700
+  entries of the admin wordlist reproduced the old failure: 631 fake `200`
+  records, all with the same first-body MD5 and zero wildcard suppression.
+
+### Unchanged
+- CLI flags and output schemas are unchanged.
+- Bounded content-length Layer 1 and path-echo Layer 2 behavior remain in place.
+
 ## [0.4.3] — 2026-06-02
 
 ### Fixed

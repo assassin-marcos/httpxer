@@ -997,6 +997,16 @@ pub async fn run(
                     );
                     wildcard_map.insert(input, sig);
                 }
+                Some(sig) if sig.content_length < 0 => {
+                    eprintln!(
+                        "  [wildcard L1] {} prefix-only md5={} ({}/{} samples agreed)",
+                        host,
+                        sig.snippet_md5,
+                        samples.len(),
+                        n_samples
+                    );
+                    wildcard_map.insert(input, sig);
+                }
                 Some(sig) => {
                     eprintln!(
                         "  [wildcard L1] {} cl={} md5={} ({}/{} samples agreed)",

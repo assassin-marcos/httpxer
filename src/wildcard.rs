@@ -16,10 +16,9 @@
 
 use std::collections::HashMap;
 
-/// Upper bound for learned static-catchall size drift. Fake-200 pages often
-/// contain per-request IDs, CSRF state, or hydration payload differences even
-/// when the first visible body chunk is identical. Keep this cap conservative
-/// so real pages that merely share a common HTML prefix are not suppressed.
+/// Upper bound for learned static-catchall size drift. Above this, same-prefix
+/// random-path responses are treated as an app-shell wildcard where the
+/// content length is not reliable enough to participate in matching.
 const MAX_DYNAMIC_LAYER1_TOLERANCE: i64 = 256;
 const DYNAMIC_LAYER1_SLACK: i64 = 16;
 
@@ -137,23 +136,30 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
             .max()
             .unwrap_or(first.content_length);
         let spread = max_cl - min_cl;
-        if spread <= MAX_DYNAMIC_LAYER1_TOLERANCE {
+        let (content_length, learned_tolerance) = if spread <= MAX_DYNAMIC_LAYER1_TOLERANCE {
             let learned_tolerance = if spread <= tolerance {
                 tolerance
             } else {
                 spread.saturating_add(DYNAMIC_LAYER1_SLACK)
             };
-            return Some(WildcardSig {
-                // Store the midpoint so runtime matching covers both sides of
-                // the learned range with one tolerance value.
-                content_length: min_cl + spread / 2,
-                content_type: first.content_type.clone(),
-                snippet_md5: first.snippet_md5.clone(),
-                k: None,
-                base: None,
-                tolerance: learned_tolerance,
-            });
-        }
+            // Store the midpoint so runtime matching covers both sides of the
+            // learned range with one tolerance value.
+            (min_cl + spread / 2, learned_tolerance)
+        } else {
+            // App-shell fallback: random paths agree on the first body chunk
+            // but carry large request-specific payload differences later in
+            // the body. In this mode, matching is CT + first-body fingerprint
+            // only; content length is intentionally ignored at runtime.
+            (-1, 0)
+        };
+        return Some(WildcardSig {
+            content_length,
+            content_type: first.content_type.clone(),
+            snippet_md5: first.snippet_md5.clone(),
+            k: None,
+            base: None,
+            tolerance: learned_tolerance,
+        });
     }
 
     // ── Layer 2: linear CL = k × path_len + base. ─────────────────────
@@ -234,11 +240,13 @@ impl WildcardMap {
         };
         let tol = sig.tolerance;
         // Layer 1 — static catchall match (CT + md5 exact, CL within tolerance).
-        if sig.content_type == ct
-            && sig.snippet_md5 == md5
-            && (sig.content_length - cl).abs() <= tol
-        {
-            return true;
+        if sig.content_type == ct && sig.snippet_md5 == md5 {
+            if sig.content_length < 0 {
+                return true;
+            }
+            if (sig.content_length - cl).abs() <= tol {
+                return true;
+            }
         }
         // Layer 2 — path-echo linear formula match. Only fires when
         // pre-flight detected a (k, base) relationship.
@@ -410,16 +418,36 @@ mod tests {
         ));
     }
 
-    /// Guardrail: a shared prefix alone is not enough. Very large size spread
-    /// could be real pages sharing a common app shell, so leave it unsuppressed.
+    /// App-shell fallback: a shared prefix with very large size spread is still
+    /// a wildcard when the samples came from random paths. Content length is
+    /// too noisy to use, so runtime matching falls back to CT + first-body hash.
     #[test]
-    fn detect_layer1_rejects_unbounded_same_prefix_spread() {
+    fn detect_layer1_ignores_length_for_wide_same_prefix_spread() {
         let samples = vec![
-            s(10_000, "text/html", "same-prefix", 17),
-            s(11_000, "text/html", "same-prefix", 33),
-            s(12_000, "text/html", "same-prefix", 65),
+            s(49_189, "text/html; charset=utf-8", "same-prefix", 17),
+            s(55_523, "text/html; charset=utf-8", "same-prefix", 33),
+            s(55_785, "text/html; charset=utf-8", "same-prefix", 65),
         ];
-        assert!(detect(&samples, 10).is_none());
+        let sig = detect(&samples, 10).expect("same-prefix app shell is a wildcard");
+        assert_eq!(sig.content_length, -1, "wide drift must ignore CL");
+        assert_eq!(sig.tolerance, 0);
+
+        let mut m = WildcardMap::new();
+        m.insert("x.com".into(), sig);
+        assert!(m.matches(
+            "x.com",
+            120_000,
+            "text/html; charset=utf-8",
+            "same-prefix",
+            128,
+        ));
+        assert!(!m.matches(
+            "x.com",
+            120_000,
+            "text/html; charset=utf-8",
+            "different-prefix",
+            128,
+        ));
     }
 
     /// Truly path-sensitive server — neither layer fits → None.
