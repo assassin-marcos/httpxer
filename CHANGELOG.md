@@ -2,6 +2,24 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.4.3] — 2026-06-02
+
+### Fixed
+- **Dynamic fake-200 wildcard suppression.** Multi-sample wildcard detection
+  now learns a bounded content-length drift when random-path responses share
+  the same content type and first-body fingerprint. This fixes hosts that return
+  same-looking `200` app-shell pages with per-request payload jitter that
+  exceeded the old fixed 10-byte window.
+
+### Added
+- Regression coverage for same-prefix wildcard pages with modest body-size
+  drift, plus a guardrail that keeps very large same-prefix spreads
+  unsuppressed.
+
+### Unchanged
+- CLI flags and output schemas are unchanged.
+- Path-echo Layer 2 wildcard detection remains unchanged.
+
 ## [0.4.2] — 2026-05-25
 
 UX-fix: crawl now actually finds the recon-valuable links it was
