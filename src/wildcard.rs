@@ -16,6 +16,13 @@
 
 use std::collections::HashMap;
 
+/// Upper bound for learned static-catchall size drift. Fake-200 pages often
+/// contain per-request IDs, CSRF state, or hydration payload differences even
+/// when the first visible body chunk is identical. Keep this cap conservative
+/// so real pages that merely share a common HTML prefix are not suppressed.
+const MAX_DYNAMIC_LAYER1_TOLERANCE: i64 = 256;
+const DYNAMIC_LAYER1_SLACK: i64 = 16;
+
 /// Per-host wildcard fingerprint. Carries BOTH layers of detection:
 ///
 /// **Layer 1 (static catchall)** — `content_length` + `content_type` +
@@ -114,21 +121,39 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
     }
     let first = &samples[0];
 
-    // ── Layer 1: static catchall (allow CL tolerance for jitter). ─────
-    let layer1_ok = samples.iter().all(|s| {
-        (s.content_length - first.content_length).abs() <= tolerance
-            && s.content_type == first.content_type
-            && s.snippet_md5 == first.snippet_md5
-    });
-    if layer1_ok {
-        return Some(WildcardSig {
-            content_length: first.content_length,
-            content_type: first.content_type.clone(),
-            snippet_md5: first.snippet_md5.clone(),
-            k: None,
-            base: None,
-            tolerance,
-        });
+    // ── Layer 1: static catchall (allow learned CL tolerance for jitter). ─────
+    let same_ct_and_prefix = samples
+        .iter()
+        .all(|s| s.content_type == first.content_type && s.snippet_md5 == first.snippet_md5);
+    if same_ct_and_prefix {
+        let min_cl = samples
+            .iter()
+            .map(|s| s.content_length)
+            .min()
+            .unwrap_or(first.content_length);
+        let max_cl = samples
+            .iter()
+            .map(|s| s.content_length)
+            .max()
+            .unwrap_or(first.content_length);
+        let spread = max_cl - min_cl;
+        if spread <= MAX_DYNAMIC_LAYER1_TOLERANCE {
+            let learned_tolerance = if spread <= tolerance {
+                tolerance
+            } else {
+                spread.saturating_add(DYNAMIC_LAYER1_SLACK)
+            };
+            return Some(WildcardSig {
+                // Store the midpoint so runtime matching covers both sides of
+                // the learned range with one tolerance value.
+                content_length: min_cl + spread / 2,
+                content_type: first.content_type.clone(),
+                snippet_md5: first.snippet_md5.clone(),
+                k: None,
+                base: None,
+                tolerance: learned_tolerance,
+            });
+        }
     }
 
     // ── Layer 2: linear CL = k × path_len + base. ─────────────────────
@@ -204,7 +229,9 @@ impl WildcardMap {
     /// (path-echo linear formula). `probe_path_len` is the byte length
     /// of the URL path the probe was sent to (e.g. `/admin` → 6).
     pub fn matches(&self, host: &str, cl: i64, ct: &str, md5: &str, probe_path_len: usize) -> bool {
-        let Some(sig) = self.inner.get(host) else { return false };
+        let Some(sig) = self.inner.get(host) else {
+            return false;
+        };
         let tol = sig.tolerance;
         // Layer 1 — static catchall match (CT + md5 exact, CL within tolerance).
         if sig.content_type == ct
@@ -317,9 +344,9 @@ mod tests {
     #[test]
     fn detect_layer2_fits_linear_relationship() {
         let samples = vec![
-            s(251, "text/html", "md5-A", 17),  // 3*17 + 200 = 251
-            s(299, "text/html", "md5-B", 33),  // 3*33 + 200 = 299
-            s(395, "text/html", "md5-C", 65),  // 3*65 + 200 = 395
+            s(251, "text/html", "md5-A", 17), // 3*17 + 200 = 251
+            s(299, "text/html", "md5-B", 33), // 3*33 + 200 = 299
+            s(395, "text/html", "md5-C", 65), // 3*65 + 200 = 395
         ];
         let sig = detect(&samples, 10).expect("Layer 2 should fit");
         assert_eq!(sig.k, Some(3));
@@ -332,9 +359,9 @@ mod tests {
     #[test]
     fn detect_layer2_tolerates_per_sample_jitter() {
         let samples = vec![
-            s(250, "text/html", "md5-A", 17),  // expected 251, off by -1
-            s(301, "text/html", "md5-B", 33),  // expected 299, off by +2
-            s(394, "text/html", "md5-C", 65),  // expected 395, off by -1
+            s(250, "text/html", "md5-A", 17), // expected 251, off by -1
+            s(301, "text/html", "md5-B", 33), // expected 299, off by +2
+            s(394, "text/html", "md5-C", 65), // expected 395, off by -1
         ];
         let sig = detect(&samples, 10).expect("Layer 2 should fit within tolerance");
         assert_eq!(sig.k, Some(3));
@@ -353,13 +380,55 @@ mod tests {
         assert_eq!(sig.content_length, 100);
     }
 
+    /// Dynamic fake-200 pages can keep the same first body chunk but drift in
+    /// total size because of request IDs / state payloads. This used to be
+    /// misclassified as path-sensitive once drift exceeded the hardcoded ±10.
+    #[test]
+    fn detect_layer1_learns_bounded_size_drift() {
+        let samples = vec![
+            s(55_523, "text/html; charset=utf-8", "same-prefix", 17),
+            s(55_495, "text/html; charset=utf-8", "same-prefix", 33),
+            s(55_511, "text/html; charset=utf-8", "same-prefix", 65),
+        ];
+        let sig = detect(&samples, 10).expect("bounded same-prefix drift is a wildcard");
+        assert!(sig.k.is_none(), "dynamic static catchall stays Layer 1");
+        assert_eq!(sig.content_type, "text/html; charset=utf-8");
+        assert_eq!(sig.snippet_md5, "same-prefix");
+        assert!(
+            sig.tolerance > 10,
+            "runtime tolerance must expand beyond the old fixed window"
+        );
+
+        let mut m = WildcardMap::new();
+        m.insert("x.com".into(), sig);
+        assert!(m.matches(
+            "x.com",
+            55_500,
+            "text/html; charset=utf-8",
+            "same-prefix",
+            128,
+        ));
+    }
+
+    /// Guardrail: a shared prefix alone is not enough. Very large size spread
+    /// could be real pages sharing a common app shell, so leave it unsuppressed.
+    #[test]
+    fn detect_layer1_rejects_unbounded_same_prefix_spread() {
+        let samples = vec![
+            s(10_000, "text/html", "same-prefix", 17),
+            s(11_000, "text/html", "same-prefix", 33),
+            s(12_000, "text/html", "same-prefix", 65),
+        ];
+        assert!(detect(&samples, 10).is_none());
+    }
+
     /// Truly path-sensitive server — neither layer fits → None.
     #[test]
     fn detect_returns_none_when_neither_layer_fits() {
         let samples = vec![
             s(100, "text/html", "abc", 17),
-            s(500, "text/html", "xyz", 33),  // unrelated CL jump
-            s(150, "text/html", "qrs", 65),  // not on a line either
+            s(500, "text/html", "xyz", 33), // unrelated CL jump
+            s(150, "text/html", "qrs", 65), // not on a line either
         ];
         assert!(detect(&samples, 10).is_none());
     }
@@ -383,9 +452,8 @@ mod tests {
         );
         // Probe at /foo (path_len=4) — expected CL = 12+200 = 212.
         assert!(m.matches("x.com", 212, "text/html", "any-md5", 4));
-        assert!(m.matches("x.com", 220, "text/html", "any-md5", 4));  // within tol
+        assert!(m.matches("x.com", 220, "text/html", "any-md5", 4)); // within tol
         assert!(!m.matches("x.com", 230, "text/html", "any-md5", 4)); // out of tol
-        // Different CT → no match even if CL fits.
         assert!(!m.matches("x.com", 212, "application/json", "any-md5", 4));
         // Probe at /admin (path_len=6) — expected CL = 18+200 = 218.
         assert!(m.matches("x.com", 218, "text/html", "any-md5", 6));
@@ -417,7 +485,7 @@ mod tests {
     fn detect_layer2_rejects_insane_k() {
         let samples = vec![
             s(100, "text/html", "a", 10),
-            s(100_000, "text/html", "b", 20),  // K = 99,900/10 = 9990
+            s(100_000, "text/html", "b", 20), // K = 99,900/10 = 9990
             s(200_000, "text/html", "c", 30),
         ];
         assert!(detect(&samples, 10).is_none());
