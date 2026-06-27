@@ -14,13 +14,29 @@
 //! The map key is the bare hostname (no scheme) — that's the unit httpxer's
 //! input pipeline normalises everything to via `extract_host()`.
 
+use md5::{Digest, Md5};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// Upper bound for learned static-catchall size drift. Above this, same-prefix
 /// random-path responses are treated as an app-shell wildcard where the
 /// content length is not reliable enough to participate in matching.
 const MAX_DYNAMIC_LAYER1_TOLERANCE: i64 = 256;
 const DYNAMIC_LAYER1_SLACK: i64 = 16;
+
+/// Minimum pairwise raw-body token-similarity required for the content-aware
+/// catchall layer (Layer 1b) to fire. This is a SECONDARY backstop — the
+/// primary guard is the exact normalized-snippet hash match (both samples must
+/// normalize to the identical 200-char fingerprint). The token ratio only
+/// guards against an over-aggressive normalizer fusing two *structurally
+/// different* pages, which sit near ~0.5 or below. Kept at 0.70 (not higher)
+/// because SHORT catchall bodies ("404 not found" + a nonce) legitimately have
+/// few shared tokens, so one varying nonce can drag a high-similarity body down
+/// toward ~0.85 — still clearly a wildcard, must not be rejected.
+const L1B_TOKEN_RATIO_MIN: f64 = 0.70;
+/// Raw-body prefix (bytes) used for the token-ratio guard — cheap + the
+/// volatile region we target sits near the top of error bodies.
+const L1B_TOKEN_PREFIX_BYTES: usize = 2048;
 
 /// Per-host wildcard fingerprint. Carries BOTH layers of detection:
 ///
@@ -56,6 +72,14 @@ pub struct WildcardSig {
     /// Per-byte tolerance for both layers' CL matching. Accommodates
     /// timestamps / request IDs in error bodies. Default 10.
     pub tolerance: i64,
+    /// **Layer 1b (content-aware catchall)** — md5 of the *normalized* body
+    /// (`normalize_snippet`): volatile tokens (UUIDs, long hex/number runs,
+    /// timestamps) blanked, whitespace collapsed. Set when the server returns
+    /// a near-constant-size body that differs only in a per-request nonce.
+    /// Empty for L1 / L2 sigs. When non-empty (and `snippet_md5` empty,
+    /// `k` None), runtime matching is by normalized CONTENT — never size-only
+    /// — so a real same-size page with different content is NOT suppressed.
+    pub normalized_snippet_md5: String,
 }
 
 impl WildcardSig {
@@ -68,6 +92,7 @@ impl WildcardSig {
             k: None,
             base: None,
             tolerance: 10,
+            normalized_snippet_md5: String::new(),
         }
     }
 }
@@ -82,6 +107,105 @@ pub struct ProbeSample {
     pub content_type: String,
     pub snippet_md5: String,
     pub path_len: usize,
+    /// Full (lossy-decoded, body-cap-bounded) response body. Already produced
+    /// by `dispatch_one`; carried here so Layer 1b can fingerprint by
+    /// *normalized content* rather than size alone. Empty when unavailable.
+    pub raw_body: String,
+}
+
+/// Normalize a response body for content-aware catchall fingerprinting:
+/// blank out per-request volatile tokens (UUIDs, long hex/number runs,
+/// ISO timestamps) and collapse whitespace, then keep the first 200 chars.
+/// Two catchall responses that differ ONLY in a nonce normalize to the same
+/// string; two genuinely different pages do not. Conservative by design —
+/// these patterns are essentially absent from real HTML/JSON body prefixes
+/// except as the volatile tokens we intend to erase.
+pub(crate) fn normalize_snippet(body: &str) -> String {
+    static NORM_RES: OnceLock<[regex::Regex; 4]> = OnceLock::new();
+    let res = NORM_RES.get_or_init(|| {
+        [
+            // RFC-4122 UUID
+            regex::Regex::new(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            )
+            .unwrap(),
+            // Long hex run (request-id / trace-id / hash)
+            regex::Regex::new(r"[0-9a-fA-F]{16,}").unwrap(),
+            // Long digit run (epoch ms/s, counters)
+            regex::Regex::new(r"[0-9]{10,}").unwrap(),
+            // ISO-8601 timestamp
+            regex::Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}").unwrap(),
+        ]
+    });
+    // Cap input before regex work; volatile tokens sit near the top.
+    let mut s: String = body.chars().take(L1B_TOKEN_PREFIX_BYTES).collect();
+    for re in res.iter() {
+        s = re.replace_all(&s, "\u{1}").into_owned();
+    }
+    // Collapse whitespace, then keep the first 200 chars of the normalized text.
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect()
+}
+
+/// md5 hex of a string — same digest path `dispatch_one` uses for snippet_md5.
+pub(crate) fn md5_hex(s: &str) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(s.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Minimum pairwise token-set similarity across samples' raw bodies, using
+/// `2·|A∩B| / (|A|+|B|)` over the first `L1B_TOKEN_PREFIX_BYTES`. Returns 1.0
+/// when fewer than two samples (nothing to disagree) or all token sets are
+/// empty (trivially identical). Guards Layer 1b against over-normalization.
+pub(crate) fn min_pairwise_token_ratio(samples: &[ProbeSample]) -> f64 {
+    fn tokens(body: &str) -> std::collections::HashSet<String> {
+        body.chars()
+            .take(L1B_TOKEN_PREFIX_BYTES)
+            .collect::<String>()
+            .to_ascii_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_string())
+            .collect()
+    }
+    if samples.len() < 2 {
+        return 1.0;
+    }
+    let sets: Vec<_> = samples.iter().map(|s| tokens(&s.raw_body)).collect();
+    let mut min_ratio = 1.0_f64;
+    for i in 0..sets.len() {
+        for j in (i + 1)..sets.len() {
+            let inter = sets[i].intersection(&sets[j]).count();
+            let total = sets[i].len() + sets[j].len();
+            let ratio = if total == 0 {
+                1.0
+            } else {
+                2.0 * inter as f64 / total as f64
+            };
+            if ratio < min_ratio {
+                min_ratio = ratio;
+            }
+        }
+    }
+    min_ratio
+}
+
+/// Reduce a host key to its base `scheme://authority`, dropping any path —
+/// `https://x.com/api/v2` → `https://x.com`. Lets a recursed dir URL fall back
+/// to the base-host wildcard fingerprint recorded at round 0.
+fn base_input_key(s: &str) -> String {
+    if let Some(scheme_end) = s.find("://") {
+        let after = scheme_end + 3;
+        if let Some(slash) = s[after..].find('/') {
+            return s[..after + slash].to_string();
+        }
+    }
+    s.to_string()
 }
 
 /// Backwards-compat helper — pure Layer 1 (static catchall) agreement
@@ -159,7 +283,63 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
             k: None,
             base: None,
             tolerance: learned_tolerance,
+            normalized_snippet_md5: String::new(),
         });
+    }
+
+    // ── Layer 1b (content-aware): same CT + bounded CL spread, body varies
+    //    only in a per-request nonce. ──────────────────────────────────────
+    // Catches catchall servers that return a near-constant-size body with
+    // per-request dynamic content (timestamp, request ID, nonce). L1 misses
+    // these because snippet_md5 differs; L2 misses them because CL doesn't
+    // scale with path length (k≈0). We fingerprint by NORMALIZED CONTENT
+    // (volatile tokens blanked) so runtime matching is content-based, never
+    // size-only — a real same-size page with different content is NOT
+    // suppressed. Two guards prevent over-suppression: (1) bounded CL spread
+    // (≤256), (2) raw-body token-similarity ≥ L1B_TOKEN_RATIO_MIN, so an
+    // over-aggressive normalizer can't fuse two structurally different pages.
+    // Requires real bodies — content fingerprinting is meaningless without
+    // them (and pre-flight always captures a non-empty body for 2xx/3xx).
+    let same_ct_with_bodies = samples
+        .iter()
+        .all(|s| s.content_type == first.content_type && !s.raw_body.is_empty());
+    if same_ct_with_bodies {
+        let min_cl = samples
+            .iter()
+            .map(|s| s.content_length)
+            .min()
+            .unwrap_or(first.content_length);
+        let max_cl = samples
+            .iter()
+            .map(|s| s.content_length)
+            .max()
+            .unwrap_or(first.content_length);
+        let spread = max_cl - min_cl;
+        if spread <= MAX_DYNAMIC_LAYER1_TOLERANCE {
+            let norm: Vec<String> = samples
+                .iter()
+                .map(|s| md5_hex(&normalize_snippet(&s.raw_body)))
+                .collect();
+            let normalized_agree = norm.iter().all(|h| *h == norm[0]);
+            if normalized_agree && min_pairwise_token_ratio(samples) >= L1B_TOKEN_RATIO_MIN {
+                // Tolerance: cover the observed spread for the (secondary) CL
+                // sanity check; primary match is the normalized-content hash.
+                let learned_tolerance = if spread <= tolerance {
+                    tolerance
+                } else {
+                    spread.saturating_add(DYNAMIC_LAYER1_SLACK)
+                };
+                return Some(WildcardSig {
+                    content_length: min_cl + spread / 2,
+                    content_type: first.content_type.clone(),
+                    snippet_md5: String::new(),
+                    k: None,
+                    base: None,
+                    tolerance: learned_tolerance,
+                    normalized_snippet_md5: norm[0].clone(),
+                });
+            }
+        }
     }
 
     // ── Layer 2: linear CL = k × path_len + base. ─────────────────────
@@ -204,6 +384,7 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
         k: Some(k),
         base: Some(base),
         tolerance,
+        normalized_snippet_md5: String::new(),
     })
 }
 
@@ -230,17 +411,59 @@ impl WildcardMap {
         self.inner.get(host)
     }
 
-    /// True if this probe matches the recorded wildcard signature for
-    /// this host. Checks BOTH Layer 1 (static catchall) and Layer 2
-    /// (path-echo linear formula). `probe_path_len` is the byte length
-    /// of the URL path the probe was sent to (e.g. `/admin` → 6).
+    /// Back-compat wrapper — matching without the response body. Cannot fire
+    /// the content-aware Layer 1b (which needs the body); use `matches_body`
+    /// in the live fuzz path. Retained for the many call sites / tests that
+    /// only exercise Layer 1 (exact md5) and Layer 2 (formula).
+    #[allow(dead_code)]
     pub fn matches(&self, host: &str, cl: i64, ct: &str, md5: &str, probe_path_len: usize) -> bool {
-        let Some(sig) = self.inner.get(host) else {
-            return false;
+        self.matches_body(host, cl, ct, md5, probe_path_len, "")
+    }
+
+    /// True if this probe matches the recorded wildcard signature for this
+    /// host. Checks Layer 1 (static catchall, exact md5), Layer 1b
+    /// (content-aware catchall, normalized-body hash) and Layer 2 (path-echo
+    /// linear formula). `probe_path_len` is the byte length of the URL path;
+    /// `raw_body` is the probe's response body (for Layer 1b normalization).
+    pub fn matches_body(
+        &self,
+        host: &str,
+        cl: i64,
+        ct: &str,
+        md5: &str,
+        probe_path_len: usize,
+        raw_body: &str,
+    ) -> bool {
+        // Exact key first; then fall back to the base scheme://authority key.
+        // Recursion passes a DISCOVERED DIR URL (e.g. https://x.com/api) as the
+        // host, but the round-0 fingerprint is stored under the base input
+        // (https://x.com) — without this fallback the host catchall wouldn't be
+        // suppressed under recursed dirs (catchall junk would leak). v0.4.5.
+        let sig = match self.inner.get(host) {
+            Some(s) => s,
+            None => {
+                let base = base_input_key(host);
+                match self.inner.get(&base) {
+                    Some(s) => s,
+                    None => return false,
+                }
+            }
         };
         let tol = sig.tolerance;
-        // Layer 1 — static catchall match (CT + md5 exact, CL within tolerance).
-        if sig.content_type == ct && sig.snippet_md5 == md5 {
+
+        // ── Layer 1b (content-aware catchall): empty snippet_md5 + present
+        //    normalized hash + k None. Match by NORMALIZED CONTENT only —
+        //    never size-only — so a real same-size page survives. This branch
+        //    is authoritative for such sigs (returns instead of falling
+        //    through to any size-based check).
+        if sig.k.is_none() && sig.snippet_md5.is_empty() && !sig.normalized_snippet_md5.is_empty() {
+            return sig.content_type == ct
+                && md5_hex(&normalize_snippet(raw_body)) == sig.normalized_snippet_md5;
+        }
+
+        // ── Layer 1 — static catchall (CT + exact md5; CL within tolerance,
+        //    or any CL when content_length < 0 = app-shell fallback).
+        if !sig.snippet_md5.is_empty() && sig.content_type == ct && sig.snippet_md5 == md5 {
             if sig.content_length < 0 {
                 return true;
             }
@@ -248,8 +471,9 @@ impl WildcardMap {
                 return true;
             }
         }
-        // Layer 2 — path-echo linear formula match. Only fires when
-        // pre-flight detected a (k, base) relationship.
+
+        // ── Layer 2 — path-echo linear formula. Only fires when pre-flight
+        //    detected a (k, base) relationship.
         if let (Some(k), Some(base)) = (sig.k, sig.base) {
             if sig.content_type == ct {
                 let expected = k * probe_path_len as i64 + base;
@@ -291,6 +515,20 @@ mod tests {
             content_type: ct.into(),
             snippet_md5: md5.into(),
             path_len,
+            raw_body: String::new(),
+        }
+    }
+
+    /// Content-aware sample helper — carries a `raw_body` so Layer 1b tests
+    /// can exercise normalized-content fingerprinting.
+    fn sb(cl: i64, ct: &str, md5: &str, path_len: usize, raw_body: &str) -> ProbeSample {
+        ProbeSample {
+            status: 200,
+            content_length: cl,
+            content_type: ct.into(),
+            snippet_md5: md5.into(),
+            path_len,
+            raw_body: raw_body.into(),
         }
     }
 
@@ -476,6 +714,7 @@ mod tests {
                 k: Some(3),
                 base: Some(200),
                 tolerance: 10,
+                normalized_snippet_md5: String::new(),
             },
         );
         // Probe at /foo (path_len=4) — expected CL = 12+200 = 212.
@@ -501,6 +740,7 @@ mod tests {
                 k: Some(3),
                 base: Some(200),
                 tolerance: 10,
+                normalized_snippet_md5: String::new(),
             },
         );
         // Real /login.aspx returns 43-byte body. Path_len = 11.
@@ -528,6 +768,146 @@ mod tests {
             s(200, "text/html", "b", 32),
             s(300, "text/html", "c", 32),
         ];
+        assert!(detect(&samples, 10).is_none());
+    }
+
+    // ── Layer 1b (v0.4.5) — same CT + CL, body varies ────────────────
+
+    /// Content-aware Layer 1b: same CT, near-constant CL, bodies differ ONLY
+    /// in a per-request nonce → normalized content agrees → detected, and the
+    /// normalized hash is stored (not size-only).
+    #[test]
+    fn detect_layer1b_content_aware_nonce() {
+        let body = |nonce: &str| {
+            format!(
+                "<html><head><title>404 Not Found</title></head><body><h1>Not Found</h1>\
+                 <p>The requested resource was not found on this server.</p>\
+                 <hr><p>request id {nonce}</p></body></html>"
+            )
+        };
+        let samples = vec![
+            sb(393, "text/html", "md5-A", 17, &body("0123456789abcdef0123456789abcdef")),
+            sb(393, "text/html", "md5-B", 33, &body("fedcba9876543210fedcba9876543210")),
+            sb(393, "text/html", "md5-C", 65, &body("aaaa1111bbbb2222cccc3333dddd4444")),
+        ];
+        let sig = detect(&samples, 10).expect("content-aware Layer 1b should fire");
+        assert!(sig.k.is_none(), "not a Layer 2 match");
+        assert!(sig.snippet_md5.is_empty(), "L1b stores empty exact-md5");
+        assert!(!sig.normalized_snippet_md5.is_empty(), "L1b stores normalized hash");
+        assert_eq!(sig.content_length, 393);
+        assert_eq!(sig.content_type, "text/html");
+    }
+
+    /// Content-aware L1b tolerates small CL drift while bodies normalize equal.
+    #[test]
+    fn detect_layer1b_tolerates_cl_drift() {
+        let body = |nonce: &str| {
+            format!(
+                "<html><body><h1>Forbidden</h1><p>access denied you do not have \
+                 permission for this requested resource on this server</p>\
+                 <p>trace {nonce}</p></body></html>"
+            )
+        };
+        let samples = vec![
+            sb(390, "text/html", "md5-A", 17, &body("0123456789abcdef")),
+            sb(395, "text/html", "md5-B", 33, &body("fedcba9876543210")),
+            sb(393, "text/html", "md5-C", 65, &body("abcdef0123456789")),
+        ];
+        let sig = detect(&samples, 10).expect("L1b should tolerate small CL drift");
+        assert!(sig.snippet_md5.is_empty());
+        assert!(!sig.normalized_snippet_md5.is_empty());
+    }
+
+    /// Content-aware L1b runtime: a probe whose body normalizes to the stored
+    /// hash IS suppressed; a real same-size page with DIFFERENT content is NOT
+    /// (the "no missing results" guarantee); wrong CT is NOT.
+    #[test]
+    fn matches_layer1b_content_aware_no_miss() {
+        let body = |nonce: &str| {
+            format!(
+                "<html><head><title>404 Not Found</title></head><body><h1>Not Found</h1>\
+                 <p>The requested resource was not found on this server.</p>\
+                 <hr><p>request id {nonce}</p></body></html>"
+            )
+        };
+        let samples = vec![
+            sb(393, "text/html", "md5-A", 17, &body("0123456789abcdef0123456789abcdef")),
+            sb(393, "text/html", "md5-B", 33, &body("fedcba9876543210fedcba9876543210")),
+            sb(393, "text/html", "md5-C", 65, &body("aaaa1111bbbb2222cccc3333dddd4444")),
+        ];
+        let sig = detect(&samples, 10).expect("L1b sig");
+        let mut m = WildcardMap::new();
+        m.insert("x.com".into(), sig);
+        // Same catchall template, brand-new nonce → suppressed.
+        assert!(m.matches_body(
+            "x.com", 393, "text/html", "z", 7,
+            &body("99998888777766665555444433332222"),
+        ));
+        // Real same-size page, genuinely different content → NOT suppressed.
+        assert!(!m.matches_body(
+            "x.com", 393, "text/html", "z", 7,
+            "<html><body><h1>Welcome admin</h1><p>secret internal dashboard here</p></body></html>",
+        ));
+        // Wrong CT → not suppressed.
+        assert!(!m.matches_body(
+            "x.com", 393, "application/json", "z", 7,
+            &body("1111222233334444aaaabbbbccccdddd"),
+        ));
+    }
+
+    /// Layer 1b must NOT fire when content types differ across samples.
+    #[test]
+    fn detect_layer1b_requires_same_ct() {
+        let body = |n: &str| {
+            format!("<html><body>error not found on this server request {n}</body></html>")
+        };
+        let samples = vec![
+            sb(393, "text/html", "md5-A", 17, &body("0123456789abcdef")),
+            sb(393, "application/json", "md5-B", 33, &body("fedcba9876543210")),
+            sb(393, "text/html", "md5-C", 65, &body("abcdef0123456789")),
+        ];
+        assert!(detect(&samples, 10).is_none());
+    }
+
+    /// Layer 1 must beat Layer 1b: when md5 agrees, use L1 (stronger signal).
+    #[test]
+    fn detect_layer1_beats_layer1b() {
+        let samples = vec![
+            s(393, "text/html", "same-md5", 17),
+            s(393, "text/html", "same-md5", 33),
+            s(393, "text/html", "same-md5", 65),
+        ];
+        let sig = detect(&samples, 10).unwrap();
+        assert_eq!(sig.snippet_md5, "same-md5", "L1 wins when md5 agrees");
+    }
+
+    /// Content-aware L1b must NOT fire when CL spread is too wide (>256):
+    /// such size chaos should remain path-sensitive, not a wildcard.
+    #[test]
+    fn detect_catchall_rejects_wide_spread() {
+        let body = |n: &str| {
+            format!("<html><body>not found resource on this server request {n}</body></html>")
+        };
+        let samples = vec![
+            sb(100, "text/html", "a", 17, &body("0123456789abcdef")),
+            sb(500, "text/html", "b", 33, &body("fedcba9876543210")),
+            sb(150, "text/html", "c", 65, &body("abcdef0123456789")),
+        ];
+        assert!(detect(&samples, 10).is_none());
+    }
+
+    /// Token-ratio guard: bodies whose NORMALIZED hashes collide (everything
+    /// volatile blanked) but whose RAW token-sets are structurally different
+    /// (<0.90 similarity) must NOT be treated as a wildcard.
+    #[test]
+    fn detect_catchall_rejects_structurally_different() {
+        let samples = vec![
+            sb(40, "text/html", "a", 17, "<x>0123456789abcdef0123456789abcdef</x>"),
+            sb(40, "text/html", "b", 33, "<x>fedcba9876543210fedcba9876543210</x>"),
+            sb(40, "text/html", "c", 65, "<x>aaaa1111bbbb2222cccc3333dddd4444</x>"),
+        ];
+        // Normalized hashes agree (hex blanked) but token ratio ≈0.5 → rejected;
+        // constant CL also means Layer 2 can't fit → overall None.
         assert!(detect(&samples, 10).is_none());
     }
 }
