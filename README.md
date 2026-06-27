@@ -1,6 +1,6 @@
 # httpxer
 
-**Native httpx + dirsearch replacement: enrichment + recursive fuzz + crawl, with browser-grade TLS impersonation and multi-signal wildcard detection. One 17 MB static binary.**
+**Native httpx + dirsearch replacement: enrichment + recursive fuzz + crawl, with browser-grade TLS impersonation, content-aware wildcard detection, auth-dir recursion, and a native 401/403 bypass engine. One static binary.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
@@ -20,7 +20,7 @@
 One tool, two jobs:
 
 - **Enrich mode** — reads a hostname list, probes each over HTTP(S), emits one NDJSON record per host with DNS / CDN / Wappalyzer tech-detect / HTTP fingerprint. Drop-in for ProjectDiscovery `httpx -json` (use `--httpx-compat` for byte-identical field shape).
-- **Fuzz mode** — host × wordlist Cartesian probe with **recursive** dir bruteforce, **crawl** (HTML/robots/sitemap link extraction), **multi-sample wildcard detection** (2-layer: static catchall + path-echo), and dirsearch-style **live progress bar + findings stream**.
+- **Fuzz mode** — host × wordlist Cartesian probe with **recursive** dir bruteforce (incl. **auto-recursion into protected `401`/`403` dirs**), **crawl** (HTML/robots/sitemap link extraction), **content-aware wildcard detection** (static catchall + per-request-nonce catchall + path-echo), a **native, content-confirmed `401`/`403` bypass engine**, and dirsearch-style **live progress bar + findings stream**.
 
 Both modes share a 16-slot **BoringSSL** pool that rotates real-browser JA3/JA4/HTTP-2 fingerprints per probe — defeats static WAF rule-blocks (Cloudflare, Akamai, Imperva, AWS, Datadome).
 
@@ -76,6 +76,17 @@ httpxer -u https://example.com/ -w wordlist.txt -o out.txt
 httpxer -u https://example.com/ -w wordlist.txt -o out.jsonl
 ```
 
+### Multi-dictionary
+
+`-w` accepts **comma-separated wordlists** — they're loaded, merged, and de-duplicated (a per-file load count is printed):
+
+```bash
+httpxer -u https://example.com/ -w admin.txt,api.txt,sensitive.txt -o out.txt
+#   [wordlist] admin.txt : 1204 paths (+1204 new)
+#   [wordlist] api.txt : 980 paths (+812 new)
+#   ...
+```
+
 ### dirsearch-equivalent invocation
 
 ```bash
@@ -84,30 +95,30 @@ httpxer -u https://example.com/ \
   -t 150 \
   -r -R 3 \
   --crawl --crawl-depth 3 \
-  -i 200,301,307,401 \
-  --exclude 429,403,404 \
+  -i 200,301,302,307,308 \
+  --exclude 429,503 \
   --timeout-ms 10000 \
   --retries 2 \
   --fuzz-follow-redirects \
-  --exclude-root-size \
-  -H "X-Forwarded-For: 127.0.0.1" \
-  -H "X-Original-URL: /" \
   -o everything.txt
 ```
 
+> No `X-Original-URL` / `X-Forwarded-For` headers needed — the **native bypass engine** applies those (and more) *only* on `401`/`403` responses, with the real path and content-confirmation, instead of poisoning every request. Pass `--safe` to disable it.
+
 ## Wildcard detection (the FP killer)
 
-Most directory bruteforcers drown in false positives on CDN-fronted / SPA targets. httpxer's detector is multi-sample + multi-layer:
+Most directory bruteforcers drown in false positives on CDN-fronted / SPA / soft-404 targets. httpxer's detector is multi-sample + multi-layer. Pre-flight probes a mix of **random-hex paths + realistic decoys** (`.conf`, `.config`, `.env`, `/.git/HEAD`) **concurrently**, so detection sees the same catchall your wordlist will hit:
 
-- **Layer 1 — static catchall**: 3 random hex paths probed at start. All 3 must agree on `(status, content_length, content_type, snippet_md5)` to record a wildcard fingerprint. Probes matching the fingerprint are suppressed.
-- **Layer 2 — path-echo / dynamic-CL**: when bodies differ but `content_length = k × path_length + base` fits linearly (server reflects path in body), the slope `k` is computed and used to predict the wildcard CL for any new probe path.
+- **Layer 1 — static catchall**: samples agree on `(content_type, content_length, snippet_md5)` → identical-page wildcard fingerprint. Matching probes are suppressed.
+- **Layer 1b — content-aware catchall**: the catchall returns a **near-constant-size body that varies per request** (a request-id / nonce / timestamp in the first bytes). This defeats Layer 1 (md5 differs every time) *and* Layer 2 (size doesn't scale with path). httpxer fingerprints it by the **normalized body** — UUIDs, long hex/digit runs and timestamps are blanked before hashing — and at runtime matches by that **normalized-content hash, never by size alone**. A real page that happens to be the same size as the catchall but has *different content* is therefore **never dropped**. Guards: bounded content-length spread + a raw-body token-similarity backstop, so the normalizer can't fuse two genuinely different pages.
+- **Layer 2 — path-echo / dynamic-CL**: when bodies differ but `content_length = k × path_length + base` fits linearly (server reflects the path in the body), the slope `k` predicts the wildcard CL for any new probe path.
 
-Result: ~0 false positives on static-catchall servers, ~6 FPs out of 15,000 probes on path-echo servers (the hardest case). dirsearch is the only other tool that gets close, at 30-50× the wall time.
+This closes the case where a constant-size catchall with a per-request token used to emit *every* wordlist hit as a fake `200`. The host fingerprint also applies under **recursed directories** (so catchall noise doesn't reappear one level down).
 
 | Policy | Behavior |
 |---|---|
 | `--wildcard-policy strict` *(default)* | Drop probes matching the wildcard |
-| `--wildcard-policy mark` | Emit them tagged `is_wildcard:true` |
+| `--wildcard-policy mark` | Emit them tagged `is_wildcard:true` (zero-suppression — you filter later) |
 | `--wildcard-policy off` / `--no-wildcard` | Skip pre-flight entirely |
 
 ## Recursion + crawl
@@ -115,9 +126,19 @@ Result: ~0 false positives on static-catchall servers, ~6 FPs out of 15,000 prob
 Pass `-r` (recursion) and/or `--crawl` to turn the host × wordlist single pass into a multi-round orchestrator:
 
 - **Recursion** — discovered directories (301/302/307/308 with `Location == URL + "/"` parity check; opt-in 200+autoindex via `--recurse-on-200`) get re-fuzzed with the wordlist up to `-R N` levels deep.
+- **Auth-dir recursion** *(auto-on)* — a `401`/`403` on a **directory-shaped** path (e.g. `/api`, `/internal` — not `/x.php`) is descended into so accessible children behind a protected parent are found (the classic `/api` = 401 → `/api/actuator` = 200). The `401`/`403` itself is **never emitted** (no auth-wall noise) — only its reachable children surface. Bounded by `--max-dirs-per-host`. The legacy `--recurse-on-403` flag (recurse *any* 403) still exists.
 - **Crawl** — every response body is parsed for HTML `<a/link/script/img/form/iframe>`, robots.txt `Disallow/Allow/Sitemap`, sitemap.xml `<loc>`. Same-host scope + third-party CDN deny list + static-media filter applied. Extracted URLs probed in the next round.
 
 Both share a visited-set + per-host probe/dir budgets (`--max-probes-per-host`, `--max-dirs-per-host`) so recursion never blows up on adversarial targets.
+
+## 401/403 bypass (native, auto, content-confirmed)
+
+When a probe hits `401`/`403`, httpxer automatically retries it with a small, conservative battery of access-control bypass techniques — **on the forbidden resource only, never on every request**:
+
+- **Header overrides** — `X-Original-URL`, `X-Rewrite-URL`, `X-Forwarded-For: 127.0.0.1`
+- **Path mutations** — e.g. `…/..;/`
+
+A bypass is reported **only when confirmed**: the retry returns `2xx`/`3xx`, its (normalized) content **differs** from the original block page, **and** it doesn't match the host catchall — so there are no fake-`200`s. Confirmed hits are emitted with a `bypass:"<technique>"` tag and a visible `[bypass] /admin 403→200 via X-Original-URL` line. Traffic is bounded by a per-host budget; it only ever *adds* findings, never suppresses. Pass **`--safe`** to disable it entirely (for programs/targets where bypass attempts are out of scope).
 
 ## TLS impersonation
 
@@ -156,15 +177,15 @@ Color-coded by status class when stderr is a TTY: green 2xx, yellow 3xx, cyan 40
 
 ### JSONL (default / `.jsonl` extension / `--format json`)
 
-Full structured record per finding. Fuzz mode includes `depth`, `source`, `parent_url` for multi-round provenance. Enrich mode (`--httpx-compat`) matches ProjectDiscovery httpx's JSON shape field-for-field.
+Full structured record per finding. Fuzz mode includes `depth`, `source`, `parent_url` for multi-round provenance, and `bypass` (the winning technique) on confirmed 401/403 bypasses. Enrich mode (`--httpx-compat`) matches ProjectDiscovery httpx's JSON shape field-for-field. New fields are `skip_serializing_if`-gated, so existing downstream parsers stay byte-compatible on the common case.
 
 Live findings stream to stderr above a `[N/total] X% | rps | eta` progress bar. Disable with `--no-live`.
 
 ## Auth
 
 ```bash
-# Custom headers (repeatable)
-httpxer ... -H "X-Forwarded-For: 127.0.0.1" -H "X-Original-URL: /"
+# Custom headers (repeatable) — e.g. an auth/tenant header for the whole scan
+httpxer ... -H "Authorization: Bearer eyJ..." -H "X-Tenant-Id: 42"
 
 # Bearer token
 httpxer ... --bearer eyJhbGciOiJIUzI1NiJ9.xyz
@@ -172,6 +193,8 @@ httpxer ... --bearer eyJhbGciOiJIUzI1NiJ9.xyz
 # Cookie jar (initial seed; Set-Cookie auto-persists)
 httpxer ... --cookie "sid=abc123" --cookie "csrf=token"
 ```
+
+> You don't need to pass `X-Original-URL` / `X-Forwarded-For` for ACL bypass — that's handled natively per-`401`/`403` (see [401/403 bypass](#401403-bypass-native-auto-content-confirmed)). `-H` is for headers you want on **every** request.
 
 ## Flags (most-used)
 
@@ -183,9 +206,12 @@ httpxer ... --cookie "sid=abc123" --cookie "csrf=token"
 | `-t <N>` | 250 | Concurrent probes |
 | `--timeout-ms` | 5000 | Per-probe timeout (ms) |
 | `--proxy <URL>` | — | HTTP / HTTPS / SOCKS5 proxy |
-| `-r / -R <N>` | off / 3 | Enable recursion, max depth |
+| `-r / -R <N>` | off / 3 | Enable recursion, max depth (incl. auto auth-dir recursion) |
 | `--crawl / --crawl-depth <N>` | off / 3 | Enable crawl, max depth |
-| `-i <codes>` | smart | Status codes to emit (alias: `--match-codes`) |
+| `-w a.txt,b.txt` | — | Multiple wordlists (merged + de-duplicated) |
+| `--wildcard-policy strict\|mark\|off` | `strict` | Drop / tag / skip wildcard matches |
+| `--safe` | off | Disable the native 401/403 bypass engine |
+| `-i <codes>` | `200,301,302,307,308,401,403` | Status codes to emit (alias: `--match-codes`) |
 | `--exclude <codes>` | `429,503` | Status codes to drop |
 | `--exclude-root-size` | off | Auto-probe `/` and add CL to exclude list |
 | `--exclude-mode segment\|substring` | `segment` | Exclude-list match style |

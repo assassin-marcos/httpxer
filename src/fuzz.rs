@@ -36,7 +36,7 @@ use tokio::sync::{Mutex, Semaphore};
 use wreq::redirect::Policy;
 
 use crate::probe;
-use crate::wildcard::{self, WildcardMap, WildcardSig};
+use crate::wildcard::{self, WildcardMap};
 
 /// Max bytes read from the wire per fuzz probe. Same cap as retroh4ck-prober
 /// v0.1.0 — keeps memory bounded under high concurrency on misbehaving
@@ -116,6 +116,11 @@ struct FuzzRecord {
     /// Empty at depth 0.
     #[serde(skip_serializing_if = "String::is_empty", default)]
     parent_url: String,
+    /// v0.4.5 — set to the winning technique (e.g. "X-Original-URL") when this
+    /// record is a CONFIRMED 401/403 bypass. `skip_serializing_if` keeps the
+    /// JSON byte-compatible for the common (non-bypass) case.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    bypass: Option<String>,
 }
 
 fn is_u8_zero(v: &u8) -> bool {
@@ -125,6 +130,7 @@ fn is_u8_zero(v: &u8) -> bool {
 /// Per-(host,path) work item. Carries v0.4.0 recursion/crawl provenance
 /// so the resulting FuzzRecord can be tagged with depth + source +
 /// parent_url for downstream consumers.
+#[derive(Clone)]
 struct ProbeItem {
     host_input: String, // e.g. "https://target.com" or "target.com"
     host: String,       // bare hostname, used as the WildcardMap key
@@ -195,6 +201,14 @@ pub struct FuzzCfg {
     pub recursion_depth: u8,
     pub recurse_on_200: bool,
     pub recurse_on_403: bool,
+    /// v0.4.5 — auto-recurse into directory-shaped 401/403 dirs (no flag;
+    /// smart default) so accessible children behind a protected parent
+    /// (e.g. /api=401 → /api/actuator=200) aren't missed. The 401/403 itself
+    /// is never emitted; bounded by `max_dirs_per_host`.
+    pub recurse_on_auth: bool,
+    /// v0.4.5 — native, content-confirmed 401/403 bypass engine (auto-on;
+    /// `--safe` sets this false). Bounded per host by `bypass::PER_HOST_PATH_BUDGET`.
+    pub bypass_enabled: bool,
     pub max_dirs_per_host: usize,
     pub max_probes_per_host: usize,
     /// Self-similarity window for loop detection (default 2). 0 = disabled.
@@ -270,22 +284,47 @@ impl WildcardPolicy {
 /// Read a path-wordlist file. Empty / commented lines dropped. Each entry
 /// normalised to a leading-slash form so `"admin"` becomes `"/admin"` and
 /// `"//admin"` collapses to `"/admin"`.
-pub fn read_words(path: &str) -> Result<Vec<String>> {
+pub fn read_words(path_spec: &str) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let f = std::fs::File::open(path).with_context(|| format!("open wordlist {}", path))?;
-    for line in BufReader::new(f).lines().map_while(Result::ok) {
-        let normalised = normalize_path(&line);
-        if normalised.is_empty() || normalised == "/" {
-            // skip blank / pure-slash entries; the wildcard probe owns "/"
-            continue;
+    // v0.4.5 — count comma-separated files so we can emit a per-file load log
+    // (transparency for multi-dictionary runs like `-w a.txt,b.txt,c.txt`).
+    let file_specs: Vec<&str> = path_spec
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let multi = file_specs.len() > 1;
+    for single_path in &file_specs {
+        let before = out.len();
+        let f = std::fs::File::open(single_path)
+            .with_context(|| format!("open wordlist {}", single_path))?;
+        let mut in_file = 0usize;
+        for line in BufReader::new(f).lines().map_while(Result::ok) {
+            let normalised = normalize_path(&line);
+            if normalised.is_empty() || normalised == "/" {
+                continue;
+            }
+            in_file += 1;
+            if seen.insert(normalised.clone()) {
+                out.push(normalised);
+            }
         }
-        if seen.insert(normalised.clone()) {
-            out.push(normalised);
+        if multi {
+            // Per-file: entries in the file and how many were NEW (post-dedupe).
+            eprintln!(
+                "  [wordlist] {} : {} paths (+{} new)",
+                single_path,
+                in_file,
+                out.len() - before
+            );
         }
     }
     if out.is_empty() {
-        anyhow::bail!("wordlist {} produced zero usable entries", path);
+        anyhow::bail!(
+            "wordlist(s) {} produced zero usable entries",
+            path_spec
+        );
     }
     Ok(out)
 }
@@ -767,14 +806,42 @@ async fn dispatch_one(
 /// the leading `/` — caller varies this (typically 16, 32, 64) so the
 /// returned samples have different path lengths, which lets `detect()`
 /// compute the Layer 2 linear slope for path-echo servers.
-async fn wildcard_preflight_sample(
+/// v0.4.5 — realistic-shape decoy pre-flight paths. The comcast-style catchall
+/// fires on dictionary-looking filenames (`.conf`/`.config`/`.git`), so probing
+/// only random hex can under-sample its behavior. These random-prefixed
+/// (non-existent) decoys make detection see the same catchall the wordlist hits.
+fn decoy_preflight_paths() -> Vec<String> {
+    let r = || {
+        let mut s = String::with_capacity(8);
+        for _ in 0..8 {
+            let n = fastrand::u8(0..16);
+            s.push(if n < 10 {
+                (b'0' + n) as char
+            } else {
+                (b'a' + (n - 10)) as char
+            });
+        }
+        s
+    };
+    vec![
+        format!("/{}.conf", r()),
+        format!("/{}.config", r()),
+        format!("/{}.log", r()),
+        format!("/{}.env", r()),
+        format!("/{}/.git/HEAD", r()),
+    ]
+}
+
+/// Run ONE wildcard pre-flight probe against an explicit `path`. Returns a
+/// `ProbeSample` for the layered detector, or `None` when the probe didn't
+/// yield a usable body (status outside 200-399 / empty body / network error).
+async fn wildcard_preflight_probe(
     host_input: &str,
     body_preview_bytes: usize,
     extra_headers: &[(String, String)],
     initial_cookie_header: Option<&str>,
-    hex_len: usize,
+    path: &str,
 ) -> Option<crate::wildcard::ProbeSample> {
-    let path = random_hex_path(hex_len); // e.g. "/abc...xyz"
     let url = format!("{}{}", host_input, path);
     // Pre-flight ALWAYS uses follow_redirects=false: a 3xx to e.g. /login
     // would otherwise let the wildcard fingerprint reflect the login page
@@ -805,6 +872,9 @@ async fn wildcard_preflight_sample(
         content_type: parsed.content_type,
         snippet_md5: parsed.snippet_md5,
         path_len: path.len(),
+        // v0.4.5: carry the body so the content-aware Layer 1b can fingerprint
+        // by normalized content (already captured by dispatch_one — no extra IO).
+        raw_body: parsed.raw_body,
     })
 }
 
@@ -970,21 +1040,29 @@ pub async fn run(
         for h in hosts.iter() {
             let input = host_to_input(h);
             let host = bare_host(&input);
-            let mut samples: Vec<crate::wildcard::ProbeSample> =
-                Vec::with_capacity(n_samples);
-            for &hex_len in &hex_lens {
-                if let Some(sample) = wildcard_preflight_sample(
+            // v0.4.5 — build hex + realistic-decoy pre-flight paths and probe
+            // them CONCURRENTLY (was sequential): wall-clock = slowest single
+            // probe, not the sum. Decoys make detection see the same catchall
+            // the dictionary hits (extension-sensitive servers).
+            let mut paths: Vec<String> =
+                hex_lens.iter().map(|&n| random_hex_path(n)).collect();
+            paths.extend(decoy_preflight_paths());
+            let total_preflight = paths.len();
+            let futs = paths.iter().map(|p| {
+                wildcard_preflight_probe(
                     &input,
                     cfg.body_preview_bytes,
                     &cfg.extra_headers,
                     cfg.initial_cookie_header.as_deref(),
-                    hex_len,
+                    p,
                 )
-                .await
-                {
-                    samples.push(sample);
-                }
-            }
+            });
+            let samples: Vec<crate::wildcard::ProbeSample> =
+                futures::future::join_all(futs)
+                    .await
+                    .into_iter()
+                    .flatten()
+                    .collect();
             match wildcard::detect(&samples, 10) {
                 Some(sig) if sig.k.is_some() => {
                     eprintln!(
@@ -993,7 +1071,7 @@ pub async fn run(
                         sig.k.unwrap(),
                         sig.base.unwrap(),
                         samples.len(),
-                        n_samples
+                        total_preflight
                     );
                     wildcard_map.insert(input, sig);
                 }
@@ -1003,7 +1081,17 @@ pub async fn run(
                         host,
                         sig.snippet_md5,
                         samples.len(),
-                        n_samples
+                        total_preflight
+                    );
+                    wildcard_map.insert(input, sig);
+                }
+                Some(sig) if sig.snippet_md5.is_empty() => {
+                    eprintln!(
+                        "  [wildcard L1b] {} cl={} content-aware ({}/{} samples agreed on normalized body)",
+                        host,
+                        sig.content_length,
+                        samples.len(),
+                        total_preflight
                     );
                     wildcard_map.insert(input, sig);
                 }
@@ -1014,11 +1102,11 @@ pub async fn run(
                         sig.content_length,
                         sig.snippet_md5,
                         samples.len(),
-                        n_samples
+                        total_preflight
                     );
                     wildcard_map.insert(input, sig);
                 }
-                None if samples.len() < n_samples => {
+                None if samples.len() < total_preflight => {
                     // Some probes failed entirely (404 / timeout / not 2xx-3xx).
                     // Common case for well-behaved targets that 404 random
                     // paths. NOT path-sensitive — just no wildcard to record.
@@ -1046,6 +1134,26 @@ pub async fn run(
     let limiter = Arc::new(ratelimit::HostRateLimiter::new(cfg.rate_limit_rps));
     let cfg = Arc::new(cfg);
     let wildcard_policy_arc = Arc::new(wildcard_policy);
+
+    // v0.4.5 — wreq pool-panic resilience. Counters track how many probes hit
+    // the wreq 5.3 connection-pool assertion race (pool.rs:651) and were
+    // retried / ultimately lost. Quiet the (benign, retried) pool assertion on
+    // stderr so it doesn't look like a crash; all other panics print normally.
+    let panic_retries = Arc::new(AtomicUsize::new(0));
+    let panic_failed = Arc::new(AtomicUsize::new(0));
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let from_wreq_pool = info
+                .location()
+                .map(|l| l.file().contains("pool.rs"))
+                .unwrap_or(false);
+            if from_wreq_pool {
+                return; // caught + retried by run_probe_resilient
+            }
+            default_hook(info);
+        }));
+    }
 
     let started = Instant::now();
     let mut tasks: FuturesUnordered<tokio::task::JoinHandle<()>> = FuturesUnordered::new();
@@ -1166,6 +1274,8 @@ pub async fn run(
             let policy = wildcard_policy_arc.clone();
             let counter = completed_counter.clone();
             let disc = disc_tx.clone();
+            let pretries = panic_retries.clone();
+            let pfailed = panic_failed.clone();
 
             // Acquire BEFORE spawn — keeps the FuturesUnordered set bounded
             // to the semaphore size + the number of pending awaits, instead
@@ -1177,7 +1287,10 @@ pub async fn run(
                 if limiter.enabled() {
                     limiter.acquire(&item.host_input).await;
                 }
-                run_probe(item, &cfg, &wildcards, &out_file, *policy, &disc).await;
+                run_probe_resilient(
+                    item, &cfg, &wildcards, &out_file, *policy, &disc, &pretries, &pfailed,
+                )
+                .await;
                 counter.fetch_add(1, Ordering::Relaxed);
             }));
 
@@ -1288,13 +1401,19 @@ pub async fn run(
                     let policy_c = wildcard_policy_arc.clone();
                     let counter_c = completed_counter.clone();
                     let disc_c = disc_tx.clone();
+                    let pretries_c = panic_retries.clone();
+                    let pfailed_c = panic_failed.clone();
                     let permit = sem_c.acquire_owned().await.ok();
                     tasks.push(tokio::spawn(async move {
                         let _p = permit;
                         if limiter_c.enabled() {
                             limiter_c.acquire(&item.host_input).await;
                         }
-                        run_probe(item, &cfg_c, &wildcards_c, &out_file_c, *policy_c, &disc_c).await;
+                        run_probe_resilient(
+                            item, &cfg_c, &wildcards_c, &out_file_c, *policy_c, &disc_c,
+                            &pretries_c, &pfailed_c,
+                        )
+                        .await;
                         counter_c.fetch_add(1, Ordering::Relaxed);
                     }));
                     while tasks.len() > spawn_backlog_cap {
@@ -1335,13 +1454,19 @@ pub async fn run(
                 let policy_c = wildcard_policy_arc.clone();
                 let counter_c = completed_counter.clone();
                 let disc_c = disc_tx.clone();
+                let pretries_c = panic_retries.clone();
+                let pfailed_c = panic_failed.clone();
                 let permit = sem_c.acquire_owned().await.ok();
                 tasks.push(tokio::spawn(async move {
                     let _p = permit;
                     if limiter_c.enabled() {
                         limiter_c.acquire(&item.host_input).await;
                     }
-                    run_probe(item, &cfg_c, &wildcards_c, &out_file_c, *policy_c, &disc_c).await;
+                    run_probe_resilient(
+                        item, &cfg_c, &wildcards_c, &out_file_c, *policy_c, &disc_c,
+                        &pretries_c, &pfailed_c,
+                    )
+                    .await;
                     counter_c.fetch_add(1, Ordering::Relaxed);
                 }));
                 while tasks.len() > spawn_backlog_cap {
@@ -1389,10 +1514,123 @@ pub async fn run(
         (total_probes as f64) / elapsed.max(0.001),
         output_path,
     );
+    // v0.4.5 — honest accounting of the wreq pool-panic race (if any fired).
+    let pr = panic_retries.load(Ordering::Relaxed);
+    let pf = panic_failed.load(Ordering::Relaxed);
+    if pr > 0 {
+        eprintln!(
+            "[+] connection-pool resilience: {} probe(s) hit the wreq pool race and were retried; {} still failed after retry",
+            pr, pf
+        );
+    }
     Ok(())
 }
 
 /// One (host, path) probe end-to-end.
+/// v0.4.5 — try the conservative 401/403 bypass battery (bypass::variants).
+/// Returns `(technique, response, url)` on the FIRST content-confirmed bypass:
+/// a 2xx/3xx whose NORMALIZED content differs from the original block page AND
+/// doesn't match the host catchall. Stops at the first win. Never emits a
+/// fake-200 (the content + wildcard checks are the guard).
+async fn attempt_auth_bypass(
+    item: &ProbeItem,
+    original: &ParsedResp,
+    cfg: &FuzzCfg,
+    wildcards: &Arc<WildcardMap>,
+) -> Option<(String, ParsedResp, String)> {
+    let orig_norm =
+        crate::wildcard::md5_hex(&crate::wildcard::normalize_snippet(&original.raw_body));
+    for v in crate::bypass::variants(&item.path) {
+        let url = format!("{}{}", item.host_input, v.path);
+        // Merge the user's -H headers with this technique's headers.
+        let mut headers = cfg.extra_headers.clone();
+        headers.extend(v.headers.iter().cloned());
+        let Ok((p, _tag, _ua)) = dispatch_one(
+            &url,
+            &item.host_input,
+            cfg.body_preview_bytes,
+            &headers,
+            cfg.initial_cookie_header.as_deref(),
+            false,
+        )
+        .await
+        else {
+            continue;
+        };
+        // Must have actually gotten through.
+        if !matches!(p.status, 200..=399) {
+            continue;
+        }
+        // Content must DIFFER from the original 401/403 block page (else the
+        // server just returned the same wall with a different status).
+        let norm = crate::wildcard::md5_hex(&crate::wildcard::normalize_snippet(&p.raw_body));
+        if norm == orig_norm {
+            continue;
+        }
+        // Must not be the host catchall (no fake-200s).
+        let plen = decoded_path_len(v.path.split(['?', '#']).next().unwrap_or(&v.path));
+        if wildcards.matches_body(
+            &item.host_input,
+            p.content_length,
+            &p.content_type,
+            &p.snippet_md5,
+            plen,
+            &p.raw_body,
+        ) {
+            continue;
+        }
+        return Some((v.label.to_string(), p, url));
+    }
+    None
+}
+
+/// Wraps `run_probe` so a panic mid-probe never crashes the run or silently
+/// drops the result. v0.4.5: the wreq 5.3 connection-pool has an
+/// `assert!(...is_pending())` race (pool.rs:651) that can fire under high
+/// concurrency to one host. We catch the unwind and retry the probe once;
+/// counters feed an honest end-of-run summary. The panic happens during the
+/// request (before any output lock), so a retry is clean.
+#[allow(clippy::too_many_arguments)]
+async fn run_probe_resilient(
+    item: ProbeItem,
+    cfg: &FuzzCfg,
+    wildcards: &Arc<WildcardMap>,
+    out_file: &Arc<Mutex<std::fs::File>>,
+    wildcard_policy: WildcardPolicy,
+    disc_tx: &tokio::sync::mpsc::UnboundedSender<Discovery>,
+    panic_retries: &AtomicUsize,
+    panic_failed: &AtomicUsize,
+) {
+    use futures::FutureExt as _;
+    let item_retry = item.clone();
+    let r = std::panic::AssertUnwindSafe(run_probe(
+        item,
+        cfg,
+        wildcards,
+        out_file,
+        wildcard_policy,
+        disc_tx,
+    ))
+    .catch_unwind()
+    .await;
+    if r.is_err() {
+        panic_retries.fetch_add(1, Ordering::Relaxed);
+        let r2 = std::panic::AssertUnwindSafe(run_probe(
+            item_retry,
+            cfg,
+            wildcards,
+            out_file,
+            wildcard_policy,
+            disc_tx,
+        ))
+        .catch_unwind()
+        .await;
+        if r2.is_err() {
+            panic_failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 async fn run_probe(
     item: ProbeItem,
     cfg: &FuzzCfg,
@@ -1467,39 +1705,117 @@ async fn run_probe(
             let probe_path_len = decoded_path_len(probe_path_only);
             let mut is_wildcard = false;
             if !matches!(wildcard_policy, WildcardPolicy::Off)
-                && wildcards.matches(
+                && wildcards.matches_body(
                     &item.host_input,
                     parsed.content_length,
                     &parsed.content_type,
                     &parsed.snippet_md5,
                     probe_path_len,
+                    &parsed.raw_body,
                 )
             {
                 is_wildcard = true;
             }
 
+            // v0.4.5 — strict wildcard suppression FIRST: a catchall match is
+            // neither emitted NOR recursed. Moved above discovery so a wildcard
+            // never spawns recursion.
+            if is_wildcard && matches!(wildcard_policy, WildcardPolicy::Strict) {
+                return;
+            }
+
+            // ── Recursion discovery — HOISTED above the emit filter (v0.4.5) ──
+            // Runs regardless of `match_codes`, so directory-shaped 401/403
+            // dirs are descended into WITHOUT being emitted (your "no 401
+            // noise"), and accessible children (e.g. /api/actuator) still
+            // surface. 200/3xx directory detection is unchanged. Bounded by
+            // --max-dirs-per-host in the orchestrator.
+            let next_depth = item.depth.saturating_add(1);
+            if cfg.recursion_depth > 0 && next_depth <= cfg.recursion_depth {
+                if let Some(dir_url) = crate::recurse::detect_directory(
+                    &url,
+                    parsed.status,
+                    &parsed.location,
+                    &parsed.body_preview_for_output,
+                    cfg.recurse_on_200,
+                    cfg.recurse_on_403,
+                    cfg.recurse_on_auth,
+                ) {
+                    let _ = disc_tx.send(Discovery::Directory {
+                        canonical_url: crate::recurse::canonical_url_key(&dir_url),
+                        host: item.host.clone(),
+                        depth: next_depth,
+                        parent: url.clone(),
+                    });
+                }
+            }
+
+            // ── Native 401/403 bypass (v0.4.5, auto-on unless --safe) ─────────
+            // On a forbidden response, try the conservative bypass battery.
+            // Confirmed wins are emitted as their own record tagged `bypass`;
+            // the raw 401/403 is NOT emitted (it's filtered below). Per-host
+            // budget bounds traffic.
+            if cfg.bypass_enabled
+                && matches!(parsed.status, 401 | 403)
+                && crate::bypass::charge_host(&item.host)
+            {
+                if let Some((technique, bp, bp_url)) =
+                    attempt_auth_bypass(&item, &parsed, cfg, wildcards).await
+                {
+                    eprintln!(
+                        "  [bypass] {} {}→{} via {}",
+                        bp_url, parsed.status, bp.status, technique
+                    );
+                    let cf = cf_challenge(bp.status, &bp.server, &bp.body_preview_for_output);
+                    let rec = FuzzRecord {
+                        url: bp_url,
+                        input: item.host_input.clone(),
+                        path: item.path.clone(),
+                        host: item.host.clone(),
+                        status_code: bp.status,
+                        content_length: bp.content_length,
+                        content_type: bp.content_type.clone(),
+                        title: bp.title.clone(),
+                        location: bp.location.clone(),
+                        server: bp.server.clone(),
+                        webserver: bp.server.clone(),
+                        body_preview: bp.body_preview_for_output.clone(),
+                        tech: Vec::new(),
+                        method: "GET",
+                        is_wildcard: false,
+                        wildcard_policy: policy_str.clone(),
+                        via_proxy: cfg.via_proxy,
+                        attempts,
+                        elapsed_ms,
+                        snippet_md5: bp.snippet_md5.clone(),
+                        tls_impersonation: tls_tag.to_string(),
+                        user_agent: ua_used.clone(),
+                        cf_challenge: cf,
+                        error: None,
+                        timestamp: now_iso8601(),
+                        prober: PROBER_TAG,
+                        depth: item.depth,
+                        source: "bypass".to_string(),
+                        parent_url: url.clone(),
+                        bypass: Some(technique),
+                    };
+                    write_record(out_file, &rec, cfg.output_format, cfg.live_findings).await;
+                }
+            }
+
+            // ── Emit filters (gate OUTPUT only; discovery already done) ───────
             // Status-code filter (include then exclude).
             if !cfg.match_codes.contains(&parsed.status) {
                 return;
             }
-            // v0.3.7 — `--exclude` filter (default `429,503`; user can
-            // override). Applied AFTER match-codes so the user can express
-            // both inclusion and exclusion in the same scan.
+            // v0.3.7 — `--exclude` filter (default `429,503`).
             if cfg.exclude_codes.contains(&parsed.status) {
                 return;
             }
-            // v0.3.10 — `--exclude-sizes` filter. Exact content-length
-            // match (dirsearch parity). Combined with --exclude-root-size
-            // this lets the user drop fake-200 catchall pages by their
-            // homepage size without relying on the wildcard detector.
+            // v0.3.10 — `--exclude-sizes` exact content-length match.
             if !cfg.exclude_sizes.is_empty()
                 && cfg.exclude_sizes.contains(&parsed.content_length)
             {
-                return;
-            }
-
-            // Strict wildcard suppression.
-            if is_wildcard && matches!(wildcard_policy, WildcardPolicy::Strict) {
                 return;
             }
 
@@ -1542,31 +1858,14 @@ async fn run_probe(
                 depth: item.depth,
                 source: item.source.clone(),
                 parent_url: item.parent_url.clone(),
+                bypass: None,
             };
             write_record(out_file, &rec, cfg.output_format, cfg.live_findings).await;
 
-            // ── v0.4.0: emit discoveries for multi-round orchestrator ─
-            // Only emit when we're NOT already at the deepest round —
-            // otherwise discoveries would be dropped anyway. Check both
-            // recursion + crawl independently.
-            let next_depth = item.depth.saturating_add(1);
-            if cfg.recursion_depth > 0 && next_depth <= cfg.recursion_depth {
-                if let Some(dir_url) = crate::recurse::detect_directory(
-                    &url,
-                    parsed.status,
-                    &parsed.location,
-                    &parsed.body_preview_for_output,
-                    cfg.recurse_on_200,
-                    cfg.recurse_on_403,
-                ) {
-                    let _ = disc_tx.send(Discovery::Directory {
-                        canonical_url: crate::recurse::canonical_url_key(&dir_url),
-                        host: item.host.clone(),
-                        depth: next_depth,
-                        parent: url.clone(),
-                    });
-                }
-            }
+            // ── v0.4.5: crawl-link discovery. (Directory/recursion discovery
+            // was hoisted ABOVE the emit filter so 401/403 dirs recurse
+            // without being emitted; it reused `next_depth` computed there.)
+            // Crawl runs only on emitted, status-matched pages.
             if cfg.crawl_enabled && next_depth <= cfg.crawl_depth {
                 let crawl_cfg = crate::crawl::CrawlCfg {
                     crawl_robots: cfg.crawl_robots,
@@ -1631,6 +1930,7 @@ async fn run_probe(
                 depth: item.depth,
                 source: item.source.clone(),
                 parent_url: item.parent_url.clone(),
+                bypass: None,
             };
             write_record(out_file, &rec, cfg.output_format, cfg.live_findings).await;
         }
@@ -1814,6 +2114,7 @@ mod tests {
             depth: 0,
             source: String::new(),
             parent_url: String::new(),
+            bypass: None,
         };
         let s = serde_json::to_string(&rec).unwrap();
         assert!(s.contains("\"status_code\":200"));
@@ -1824,6 +2125,8 @@ mod tests {
         assert!(s.contains("\"server\":\"nginx\""));
         assert!(s.contains("\"tls_impersonation\":\"chrome-131\""));
         assert!(s.contains("\"prober\":\"httpxer/"));
+        // v0.4.5 — schema compat: `bypass` absent when None (downstream-safe).
+        assert!(!s.contains("\"bypass\""), "bypass must be omitted when None");
     }
 
     /// Regression: `--rate-limit 0.1` used to round to 0, then clamp to 1

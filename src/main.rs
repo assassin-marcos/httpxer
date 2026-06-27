@@ -24,6 +24,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 
 mod auth;
+mod bypass;
 mod cdn;
 mod crawl;
 mod dns;
@@ -187,6 +188,12 @@ struct Args {
     /// (fuzz) Shortcut for `--wildcard-policy off`
     #[arg(long = "no-wildcard", help_heading = "Fuzz mode")]
     no_wildcard: bool,
+
+    /// (fuzz) Safe mode: disable the native, auto 401/403 bypass engine
+    /// (path-override headers + path mutations on forbidden responses).
+    /// Use on programs/targets where bypass attempts are out of scope.
+    #[arg(long = "safe", help_heading = "Fuzz mode")]
+    safe: bool,
 
     /// (fuzz) Per-host requests/sec ceiling. 0 = disabled (default).
     #[arg(long = "rate-limit", default_value_t = 0.0, help_heading = "Fuzz mode")]
@@ -1033,54 +1040,65 @@ async fn main() -> Result<()> {
             })
             .collect();
 
-        // --exclude-root-size: probe `/` once and add its CL to
-        // exclude_sizes. Mirrors dirsearch's `ROOT_SIZE=$(curl ...)`
-        // pattern. Built on top of the existing enrich-mode probe.
+        // --exclude-root-size: probe `/` once and add its CL to exclude_sizes.
+        // v0.4.5 — measure the root page through the SAME impersonation pool,
+        // `-H` headers and Accept profile the fuzz probes use, so the learned
+        // size matches what fuzz actually sees. (The old plain non-impersonated
+        // client could measure a different response on TLS-/header-sensitive
+        // edges — a real inconsistency.) Pool is already initialised above via
+        // `probe::init_pool`. Redirects off (matches fuzz default — a 3xx root
+        // is a finding, not a body to measure).
         if args.exclude_root_size {
-            // Pool isn't initialised yet (it's set up inside fuzz::run).
-            // Spin up a one-shot wreq client just for this probe — keeps
-            // the pre-flight independent of the impersonation profile that
-            // fuzz will eventually use, which is fine because we're just
-            // measuring the body size of the root page.
-            let timeout = std::time::Duration::from_millis(args.timeout_ms);
-            let client_res = wreq::Client::builder()
-                .timeout(timeout)
-                .cert_verification(false)
-                .build();
-            if let Ok(client) = client_res {
-                for h in &hosts {
-                    let url = if h.starts_with("http://") || h.starts_with("https://") {
-                        h.trim_end_matches('/').to_string()
-                    } else {
-                        format!("https://{}", h)
-                    };
-                    match client.get(&url).send().await {
-                        Ok(resp) => {
-                            let cl = resp
-                                .headers()
-                                .get("content-length")
-                                .and_then(|v| v.to_str().ok())
-                                .and_then(|s| s.parse::<i64>().ok());
-                            let size = match cl {
-                                Some(n) => n,
-                                None => match resp.bytes().await {
-                                    Ok(b) => b.len() as i64,
-                                    Err(_) => -1,
-                                },
-                            };
-                            if size > 0 && !exclude_sizes.contains(&size) {
-                                eprintln!(
-                                    "[+] root-size {} → adding {} to --exclude-sizes",
-                                    url, size
-                                );
-                                exclude_sizes.push(size);
-                            }
+            for h in &hosts {
+                let url = if h.starts_with("http://") || h.starts_with("https://") {
+                    h.trim_end_matches('/').to_string()
+                } else {
+                    format!("https://{}", h)
+                };
+                let Some(slot) = probe::pick_pool_slot_for(&url) else {
+                    continue;
+                };
+                let mut req = slot
+                    .client
+                    .get(&url)
+                    .redirect(wreq::redirect::Policy::none())
+                    .header("Accept-Language", slot.accept_lang)
+                    .header(
+                        "Accept",
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    );
+                for (n, v) in &extra_headers {
+                    req = req.header(n.as_str(), v.as_str());
+                }
+                match req.send().await {
+                    Ok(resp) => {
+                        if !matches!(resp.status().as_u16(), 200..=399) {
+                            continue;
                         }
-                        Err(e) => eprintln!(
-                            "[!] root-size probe failed for {}: {} (skipping)",
-                            url, e
-                        ),
+                        let cl = resp
+                            .headers()
+                            .get("content-length")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<i64>().ok());
+                        let size = match cl {
+                            Some(n) => n,
+                            None => match resp.bytes().await {
+                                Ok(b) => b.len() as i64,
+                                Err(_) => -1,
+                            },
+                        };
+                        if size > 0 && !exclude_sizes.contains(&size) {
+                            eprintln!(
+                                "[+] root-size {} → adding {} to --exclude-sizes",
+                                url, size
+                            );
+                            exclude_sizes.push(size);
+                        }
                     }
+                    Err(e) => eprintln!(
+                        "[!] root-size probe failed for {}: {} (skipping)",
+                        url, e
+                    ),
                 }
             }
         }
@@ -1141,6 +1159,10 @@ async fn main() -> Result<()> {
             recursion_depth,
             recurse_on_200: args.recurse_on_200,
             recurse_on_403: args.recurse_on_403,
+            // v0.4.5 — auth-dir recursion is auto-on (smart default, no flag).
+            recurse_on_auth: true,
+            // v0.4.5 — native 401/403 bypass is auto-on unless `--safe`.
+            bypass_enabled: !args.safe,
             max_dirs_per_host: args.max_dirs_per_host,
             max_probes_per_host: args.max_probes_per_host,
             similarity_window: 2,
