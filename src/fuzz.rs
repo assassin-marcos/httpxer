@@ -1128,6 +1128,9 @@ pub async fn run(
         }
     }
     let wildcards = Arc::new(wildcard_map);
+    // v0.4.6 — per-directory catchall cache, learned live during the run (both
+    // detectors write here). Budget scales with host count.
+    let catchall = Arc::new(Mutex::new(CatchallCache::new(hosts.len())));
 
     // ── Concurrency + rate limiter ─────────────────────────────────────
     let sem = Arc::new(Semaphore::new(cfg.threads.max(1)));
@@ -1270,6 +1273,7 @@ pub async fn run(
             let limiter = limiter.clone();
             let cfg = cfg.clone();
             let wildcards = wildcards.clone();
+            let catchall = catchall.clone();
             let out_file = out_file.clone();
             let policy = wildcard_policy_arc.clone();
             let counter = completed_counter.clone();
@@ -1288,7 +1292,8 @@ pub async fn run(
                     limiter.acquire(&item.host_input).await;
                 }
                 run_probe_resilient(
-                    item, &cfg, &wildcards, &out_file, *policy, &disc, &pretries, &pfailed,
+                    item, &cfg, &wildcards, &catchall, &out_file, *policy, &disc, &pretries,
+                    &pfailed,
                 )
                 .await;
                 counter.fetch_add(1, Ordering::Relaxed);
@@ -1366,12 +1371,11 @@ pub async fn run(
                 "[+] round {}: fuzz {} discovered dirs + probe {} crawl-extracted URLs",
                 round, frontier_dirs.len(), frontier_urls.len()
             );
-            // Multi-sample wildcard pre-flight for each NEW dir.
-            // Skip when wildcard policy is off OR when this dir already
-            // has a fingerprint inherited from its parent host_input.
-            // (We don't have an Arc<Mutex<WildcardMap>> for live mutation
-            // — for v0.4.0 MVP we just reuse the round-0 wildcard map.
-            // Per-dir pre-flight refinement lands in v0.4.1.)
+            // Per-directory catchall detection now happens LIVE inside
+            // `run_probe` via the hybrid `CatchallCache` (v0.4.6): each new
+            // prefix's shell is learned on demand (frequency + sibling-probe,
+            // content-aware) as its paths are probed, so recursed dirs no longer
+            // depend on the round-0 host map alone. No per-round pre-flight here.
 
             // Spawn probes for new dirs × wordlist + new URLs.
             for (dir_url, host, depth, parent) in &frontier_dirs {
@@ -1397,6 +1401,7 @@ pub async fn run(
                     let limiter_c = limiter.clone();
                     let cfg_c = cfg.clone();
                     let wildcards_c = wildcards.clone();
+                    let catchall_c = catchall.clone();
                     let out_file_c = out_file.clone();
                     let policy_c = wildcard_policy_arc.clone();
                     let counter_c = completed_counter.clone();
@@ -1410,8 +1415,8 @@ pub async fn run(
                             limiter_c.acquire(&item.host_input).await;
                         }
                         run_probe_resilient(
-                            item, &cfg_c, &wildcards_c, &out_file_c, *policy_c, &disc_c,
-                            &pretries_c, &pfailed_c,
+                            item, &cfg_c, &wildcards_c, &catchall_c, &out_file_c, *policy_c,
+                            &disc_c, &pretries_c, &pfailed_c,
                         )
                         .await;
                         counter_c.fetch_add(1, Ordering::Relaxed);
@@ -1450,6 +1455,7 @@ pub async fn run(
                 let limiter_c = limiter.clone();
                 let cfg_c = cfg.clone();
                 let wildcards_c = wildcards.clone();
+                let catchall_c = catchall.clone();
                 let out_file_c = out_file.clone();
                 let policy_c = wildcard_policy_arc.clone();
                 let counter_c = completed_counter.clone();
@@ -1463,8 +1469,8 @@ pub async fn run(
                         limiter_c.acquire(&item.host_input).await;
                     }
                     run_probe_resilient(
-                        item, &cfg_c, &wildcards_c, &out_file_c, *policy_c, &disc_c,
-                        &pretries_c, &pfailed_c,
+                        item, &cfg_c, &wildcards_c, &catchall_c, &out_file_c, *policy_c,
+                        &disc_c, &pretries_c, &pfailed_c,
                     )
                     .await;
                     counter_c.fetch_add(1, Ordering::Relaxed);
@@ -1584,6 +1590,284 @@ async fn attempt_auth_bypass(
     None
 }
 
+// ── v0.4.6 — per-directory (prefix-routed) catchall suppression ───────────
+// Some gateways route each top-level path prefix to a DIFFERENT micro-frontend,
+// each returning its OWN constant-size catchall shell for every sub-path
+// (e.g. /crm/*=1232B, /core/*=2783B, /sso/*=1560B on one real target). The
+// host-level pre-flight probes random paths only at `/`, so it learns just the
+// ROOT shell — every per-prefix catchall then sails through strict suppression.
+// This cache learns each prefix's shell on demand via TWO cooperating detectors
+// and suppresses content-matching hits (never size-only → real pages survive).
+
+/// Distinct paths that must return the identical normalized shell before the
+/// zero-traffic frequency detector promotes it to a catchall.
+const FREQ_PROMOTE_K: usize = 3;
+/// CL slack (bytes) for the frequency detector — a true per-prefix shell is
+/// near-constant size; wider drift means "not the same shell", don't count.
+const FREQ_CL_TOL: i64 = 24;
+/// Per-host cap on distinct parents the sibling-probe detector may sample,
+/// bounding added traffic / WAF exposure on huge wordlists.
+const MAX_CATCHALL_PARENTS_PER_HOST: usize = 256;
+
+/// Frequency-detector bucket: the set of DISTINCT paths that returned a given
+/// `(content_type, normalized_body_hash)`, plus a representative sig to promote.
+#[derive(Default)]
+struct FreqEntry {
+    paths: std::collections::HashSet<String>,
+    sig: Option<crate::wildcard::WildcardSig>,
+}
+
+/// Live, shared per-run cache for per-directory catchall detection.
+#[derive(Default)]
+struct CatchallCache {
+    /// Confirmed catchall sigs (from BOTH detectors). Checked content-aware.
+    learned: Vec<crate::wildcard::WildcardSig>,
+    /// (content_type, normalized_snippet_md5) → distinct paths seen + a sig.
+    freq: std::collections::HashMap<(String, String), FreqEntry>,
+    /// Parents already sibling-sampled (probed to completion / no-catchall).
+    probed_parents: std::collections::HashSet<String>,
+    /// Parents whose sibling-probe is IN FLIGHT right now. Concurrent hits under
+    /// the same parent wait on this instead of leaking (v0.4.6 race close).
+    inflight: std::collections::HashSet<String>,
+    /// Remaining sibling-probe budget for this run.
+    parents_budget: usize,
+}
+
+/// True if any learned catchall sig content-matches this response. Shared by
+/// steps (a) and the wait-loop so the check stays identical everywhere.
+fn any_learned_matches(
+    learned: &[crate::wildcard::WildcardSig],
+    parsed: &ParsedResp,
+    probe_path_len: usize,
+) -> bool {
+    learned.iter().any(|s| {
+        s.matches_probe(
+            parsed.content_length,
+            &parsed.content_type,
+            &parsed.snippet_md5,
+            probe_path_len,
+            &parsed.raw_body,
+        )
+    })
+}
+
+impl CatchallCache {
+    fn new(host_count: usize) -> Self {
+        Self {
+            parents_budget: MAX_CATCHALL_PARENTS_PER_HOST.saturating_mul(host_count.max(1)),
+            ..Default::default()
+        }
+    }
+
+    /// Detector A (frequency, zero traffic). Record one 2xx response's
+    /// normalized shell under `(ct, norm_hash)`. Returns `Some(sig)` the moment
+    /// this hit is the K-th DISTINCT path sharing that shell at a near-constant
+    /// CL — a newly confirmed catchall — and pushes it into `learned` (deduped).
+    /// A materially different CL under the same normalized prefix is rejected so
+    /// real varying-size endpoints can't inflate a bucket.
+    fn note_frequency(
+        &mut self,
+        ct: &str,
+        norm_hash: &str,
+        cl: i64,
+        path: &str,
+    ) -> Option<crate::wildcard::WildcardSig> {
+        let entry = self
+            .freq
+            .entry((ct.to_string(), norm_hash.to_string()))
+            .or_default();
+        match &entry.sig {
+            Some(s) if (s.content_length - cl).abs() > FREQ_CL_TOL => return None,
+            None => {
+                entry.sig = Some(crate::wildcard::WildcardSig {
+                    content_length: cl,
+                    content_type: ct.to_string(),
+                    snippet_md5: String::new(),
+                    k: None,
+                    base: None,
+                    tolerance: 10,
+                    normalized_snippet_md5: norm_hash.to_string(),
+                });
+            }
+            _ => {}
+        }
+        entry.paths.insert(path.to_string());
+        if entry.paths.len() < FREQ_PROMOTE_K {
+            return None;
+        }
+        let sig = entry.sig.clone()?;
+        let dup = self.learned.iter().any(|s| {
+            s.content_type == sig.content_type
+                && s.normalized_snippet_md5 == sig.normalized_snippet_md5
+        });
+        if !dup {
+            self.learned.push(sig.clone());
+        }
+        Some(sig)
+    }
+}
+
+/// Reduce a full URL to its immediate parent prefix (the directory containing
+/// the probed path): `https://h/crm/api/v1/auth` → `https://h/crm/api/v1`;
+/// `https://h/crm` and `https://h/` → `https://h`. Query/fragment stripped.
+fn parent_prefix(url: &str) -> String {
+    let (base, path) = match url.find("://") {
+        Some(i) => {
+            let after = i + 3;
+            match url[after..].find('/') {
+                Some(j) => (&url[..after + j], &url[after + j..]),
+                None => return url.to_string(),
+            }
+        }
+        None => return url.to_string(),
+    };
+    let path = path.split(|c| c == '?' || c == '#').next().unwrap_or(path);
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) | None => base.to_string(),
+        Some(k) => format!("{}{}", base, &trimmed[..k]),
+    }
+}
+
+/// Hybrid per-directory catchall test. Returns `true` if this 2xx response is a
+/// per-prefix catchall shell that should be SUPPRESSED (and not recursed).
+/// Never holds the cache lock across the network probe.
+async fn catchall_suppresses(
+    item: &ProbeItem,
+    parsed: &ParsedResp,
+    probe_path_len: usize,
+    cfg: &FuzzCfg,
+    cache: &Arc<Mutex<CatchallCache>>,
+) -> bool {
+    // Only content-bearing 2xx shells; redirects/empties are out of scope.
+    if !matches!(parsed.status, 200..=299) || parsed.raw_body.is_empty() {
+        return false;
+    }
+
+    // (a) Match against already-learned sigs (content-aware, zero probes).
+    {
+        let c = cache.lock().await;
+        if any_learned_matches(&c.learned, parsed, probe_path_len) {
+            return true;
+        }
+    }
+
+    // (b) Sibling-probe (Detector B): the FIRST hit under a new parent probes
+    //     two random siblings to confirm the shell; concurrent hits under the
+    //     same parent WAIT for that probe (never leak) rather than emitting.
+    let full_url = format!("{}{}", item.host_input, item.path);
+    let parent = parent_prefix(&full_url);
+    enum Role {
+        Probe,
+        Wait,
+        Skip,
+    }
+    let role = {
+        let mut c = cache.lock().await;
+        if c.inflight.contains(&parent) {
+            Role::Wait
+        } else if !c.probed_parents.contains(&parent) && c.parents_budget > 0 {
+            c.probed_parents.insert(parent.clone());
+            c.parents_budget -= 1;
+            c.inflight.insert(parent.clone());
+            Role::Probe
+        } else {
+            Role::Skip
+        }
+    };
+    match role {
+        Role::Probe => {
+            // Two random siblings, probed CONCURRENTLY (wall-clock = one probe,
+            // not two) so waiters under the same parent unblock fast.
+            let spaths: Vec<String> = [16usize, 32usize]
+                .iter()
+                .map(|&n| random_hex_path(n)) // "/<hex>" → sibling of parent
+                .collect();
+            let futs = spaths.iter().map(|p| {
+                wildcard_preflight_probe(
+                    &parent,
+                    cfg.body_preview_bytes,
+                    &cfg.extra_headers,
+                    cfg.initial_cookie_header.as_deref(),
+                    p,
+                )
+            });
+            let samples: Vec<crate::wildcard::ProbeSample> =
+                futures::future::join_all(futs).await.into_iter().flatten().collect();
+            // Require ≥2 agreeing samples so a single random 200 (a real page)
+            // can't be mistaken for a catchall.
+            let learned_sig = if samples.len() >= 2 {
+                crate::wildcard::detect(&samples, 10)
+            } else {
+                None
+            };
+            // Clear in-flight AND publish the sig in ONE critical section, so a
+            // waiter never sees "not in-flight" without also seeing the sig.
+            {
+                let mut c = cache.lock().await;
+                c.inflight.remove(&parent);
+                if let Some(sig) = &learned_sig {
+                    eprintln!(
+                        "  [catchall] {} cl={} content-aware (sibling-probe)",
+                        parent, sig.content_length
+                    );
+                    c.learned.push(sig.clone());
+                }
+            }
+            if let Some(sig) = learned_sig {
+                if sig.matches_probe(
+                    parsed.content_length,
+                    &parsed.content_type,
+                    &parsed.snippet_md5,
+                    probe_path_len,
+                    &parsed.raw_body,
+                ) {
+                    return true;
+                }
+            }
+        }
+        Role::Wait => {
+            // Poll until the in-flight sibling-probe lands (learned a sig we
+            // match → suppress) or clears without one (real dir → emit). The
+            // prober's remove+publish is atomic, so this never leaks. Budget
+            // covers one probe timeout + margin so a slow probe can't force an
+            // early give-up (which would leak the shell).
+            let max_polls = (cfg.timeout_ms / 10).max(50) as usize + 50;
+            for _ in 0..max_polls {
+                {
+                    let c = cache.lock().await;
+                    if any_learned_matches(&c.learned, parsed, probe_path_len) {
+                        return true;
+                    }
+                    if !c.inflight.contains(&parent) {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        Role::Skip => {}
+    }
+
+    // (c) Frequency (Detector A, zero traffic): count this normalized shell;
+    //     promote once K distinct paths share it at a near-constant CL.
+    let norm_hash = crate::wildcard::md5_hex(&crate::wildcard::normalize_snippet(&parsed.raw_body));
+    let mut c = cache.lock().await;
+    if let Some(sig) = c.note_frequency(
+        &parsed.content_type,
+        &norm_hash,
+        parsed.content_length,
+        &item.path,
+    ) {
+        eprintln!(
+            "  [catchall] {} cl={} content-aware ({} paths, frequency)",
+            parent, sig.content_length, FREQ_PROMOTE_K
+        );
+        return true;
+    }
+    false
+}
+
 /// Wraps `run_probe` so a panic mid-probe never crashes the run or silently
 /// drops the result. v0.4.5: the wreq 5.3 connection-pool has an
 /// `assert!(...is_pending())` race (pool.rs:651) that can fire under high
@@ -1595,6 +1879,7 @@ async fn run_probe_resilient(
     item: ProbeItem,
     cfg: &FuzzCfg,
     wildcards: &Arc<WildcardMap>,
+    catchall: &Arc<Mutex<CatchallCache>>,
     out_file: &Arc<Mutex<std::fs::File>>,
     wildcard_policy: WildcardPolicy,
     disc_tx: &tokio::sync::mpsc::UnboundedSender<Discovery>,
@@ -1607,6 +1892,7 @@ async fn run_probe_resilient(
         item,
         cfg,
         wildcards,
+        catchall,
         out_file,
         wildcard_policy,
         disc_tx,
@@ -1619,6 +1905,7 @@ async fn run_probe_resilient(
             item_retry,
             cfg,
             wildcards,
+            catchall,
             out_file,
             wildcard_policy,
             disc_tx,
@@ -1635,6 +1922,7 @@ async fn run_probe(
     item: ProbeItem,
     cfg: &FuzzCfg,
     wildcards: &Arc<WildcardMap>,
+    catchall: &Arc<Mutex<CatchallCache>>,
     out_file: &Arc<Mutex<std::fs::File>>,
     wildcard_policy: WildcardPolicy,
     disc_tx: &tokio::sync::mpsc::UnboundedSender<Discovery>,
@@ -1713,6 +2001,19 @@ async fn run_probe(
                     probe_path_len,
                     &parsed.raw_body,
                 )
+            {
+                is_wildcard = true;
+            }
+
+            // v0.4.6 — per-directory (prefix-routed) catchall suppression.
+            // The host-level check above only knows the ROOT shell; this learns
+            // each path-prefix's OWN catchall on demand (frequency + sibling
+            // probe, content-aware) so gateways that route /crm, /core, /sso …
+            // to different constant-size shells don't flood. Skipped when the
+            // host layer already flagged it, when policy is Off, or on non-2xx.
+            if !is_wildcard
+                && !matches!(wildcard_policy, WildcardPolicy::Off)
+                && catchall_suppresses(&item, &parsed, probe_path_len, cfg, catchall).await
             {
                 is_wildcard = true;
             }
@@ -1994,6 +2295,62 @@ async fn write_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── v0.4.6 per-directory catchall helpers ────────────────────────────
+
+    #[test]
+    fn parent_prefix_strips_last_segment() {
+        assert_eq!(
+            parent_prefix("https://h.com/crm/api/v1/auth"),
+            "https://h.com/crm/api/v1"
+        );
+        // one-segment path → host root
+        assert_eq!(parent_prefix("https://h.com/crm"), "https://h.com");
+        // trailing slash → parent is host root
+        assert_eq!(parent_prefix("https://h.com/crm/"), "https://h.com");
+        // root and bare host → host root
+        assert_eq!(parent_prefix("https://h.com/"), "https://h.com");
+        assert_eq!(parent_prefix("https://h.com"), "https://h.com");
+        // query/fragment ignored
+        assert_eq!(
+            parent_prefix("https://h.com/a/b?x=1#y"),
+            "https://h.com/a"
+        );
+    }
+
+    #[test]
+    fn frequency_promotes_only_at_k_distinct_paths() {
+        let mut c = CatchallCache::new(1);
+        // Two distinct paths of the same shell → not yet a catchall.
+        assert!(c.note_frequency("text/html", "hashA", 1232, "/crm/a").is_none());
+        assert!(c.note_frequency("text/html", "hashA", 1232, "/crm/b").is_none());
+        // The K-th (3rd) distinct path promotes it.
+        let sig = c
+            .note_frequency("text/html", "hashA", 1230, "/crm/c")
+            .expect("promotes at K distinct paths");
+        assert_eq!(sig.normalized_snippet_md5, "hashA");
+        assert!(sig.snippet_md5.is_empty(), "content-aware sig (no exact md5)");
+        // A repeat of an already-seen path must NOT advance the count.
+        let mut c2 = CatchallCache::new(1);
+        assert!(c2.note_frequency("text/html", "h", 500, "/x").is_none());
+        assert!(c2.note_frequency("text/html", "h", 500, "/x").is_none());
+        assert!(c2.note_frequency("text/html", "h", 500, "/x").is_none());
+    }
+
+    #[test]
+    fn frequency_rejects_material_cl_drift_and_different_content() {
+        let mut c = CatchallCache::new(1);
+        // Same normalized prefix but a real varying-size endpoint (CL drifts
+        // far beyond FREQ_CL_TOL) must never promote → real results survive.
+        assert!(c.note_frequency("application/json", "shape", 100, "/api/a").is_none());
+        assert!(c.note_frequency("application/json", "shape", 4000, "/api/b").is_none());
+        assert!(c.note_frequency("application/json", "shape", 9000, "/api/c").is_none());
+        // Distinct content hashes never accumulate toward one catchall.
+        let mut c2 = CatchallCache::new(1);
+        assert!(c2.note_frequency("text/html", "h1", 800, "/p1").is_none());
+        assert!(c2.note_frequency("text/html", "h2", 800, "/p2").is_none());
+        assert!(c2.note_frequency("text/html", "h3", 800, "/p3").is_none());
+    }
 
     #[test]
     fn format_eta_picks_compact_unit() {

@@ -95,6 +95,53 @@ impl WildcardSig {
             normalized_snippet_md5: String::new(),
         }
     }
+
+    /// True if a probe response matches THIS signature. Content-aware and
+    /// shared by both `WildcardMap::matches_body` (host-level) and the
+    /// per-directory catchall cache (v0.4.6): Layer 1b matches by NORMALIZED
+    /// body only (never size-only, so a real same-size page survives); Layer 1
+    /// by exact md5 + CL tolerance (or any CL when `content_length < 0`);
+    /// Layer 2 by the path-echo formula `CL ≈ k × path_len + base`.
+    pub fn matches_probe(
+        &self,
+        cl: i64,
+        ct: &str,
+        md5: &str,
+        probe_path_len: usize,
+        raw_body: &str,
+    ) -> bool {
+        let tol = self.tolerance;
+
+        // Layer 1b (content-aware): empty snippet_md5 + present normalized hash
+        // + k None. Authoritative for such sigs — match by normalized content.
+        if self.k.is_none() && self.snippet_md5.is_empty() && !self.normalized_snippet_md5.is_empty()
+        {
+            return self.content_type == ct
+                && md5_hex(&normalize_snippet(raw_body)) == self.normalized_snippet_md5;
+        }
+
+        // Layer 1 — static catchall (CT + exact md5; CL within tolerance, or
+        // any CL when content_length < 0 = app-shell fallback).
+        if !self.snippet_md5.is_empty() && self.content_type == ct && self.snippet_md5 == md5 {
+            if self.content_length < 0 {
+                return true;
+            }
+            if (self.content_length - cl).abs() <= tol {
+                return true;
+            }
+        }
+
+        // Layer 2 — path-echo linear formula.
+        if let (Some(k), Some(base)) = (self.k, self.base) {
+            if self.content_type == ct {
+                let expected = k * probe_path_len as i64 + base;
+                if (expected - cl).abs() <= tol {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 /// One probe sample collected during wildcard pre-flight. Carries the
@@ -449,40 +496,9 @@ impl WildcardMap {
                 }
             }
         };
-        let tol = sig.tolerance;
-
-        // ── Layer 1b (content-aware catchall): empty snippet_md5 + present
-        //    normalized hash + k None. Match by NORMALIZED CONTENT only —
-        //    never size-only — so a real same-size page survives. This branch
-        //    is authoritative for such sigs (returns instead of falling
-        //    through to any size-based check).
-        if sig.k.is_none() && sig.snippet_md5.is_empty() && !sig.normalized_snippet_md5.is_empty() {
-            return sig.content_type == ct
-                && md5_hex(&normalize_snippet(raw_body)) == sig.normalized_snippet_md5;
-        }
-
-        // ── Layer 1 — static catchall (CT + exact md5; CL within tolerance,
-        //    or any CL when content_length < 0 = app-shell fallback).
-        if !sig.snippet_md5.is_empty() && sig.content_type == ct && sig.snippet_md5 == md5 {
-            if sig.content_length < 0 {
-                return true;
-            }
-            if (sig.content_length - cl).abs() <= tol {
-                return true;
-            }
-        }
-
-        // ── Layer 2 — path-echo linear formula. Only fires when pre-flight
-        //    detected a (k, base) relationship.
-        if let (Some(k), Some(base)) = (sig.k, sig.base) {
-            if sig.content_type == ct {
-                let expected = k * probe_path_len as i64 + base;
-                if (expected - cl).abs() <= tol {
-                    return true;
-                }
-            }
-        }
-        false
+        // Per-sig content-aware match (shared with the per-directory catchall
+        // cache in fuzz.rs). Layers L1b / L1 / L2 in order.
+        sig.matches_probe(cl, ct, md5, probe_path_len, raw_body)
     }
 
     #[allow(dead_code)]
@@ -530,6 +546,28 @@ mod tests {
             path_len,
             raw_body: raw_body.into(),
         }
+    }
+
+    /// v0.4.6 sibling-probe core: a prefix that returns a byte-identical shell
+    /// for every sub-path yields a sig via `detect`; that sig (via the shared
+    /// `matches_probe`) suppresses a same-shell hit but NOT a real, different
+    /// page under the same prefix (the "no missing results" guarantee).
+    #[test]
+    fn sibling_probe_sig_suppresses_shell_but_not_real_page() {
+        let shell = "<!doctype html><html><head><title>CRM</title></head><body>\
+                     <div id=app></div><script src=/crm/main.js></script></body></html>";
+        // Two random siblings under /crm → identical shell, different path_lens.
+        let samples = vec![
+            sb(1232, "text/html; charset=UTF-8", "shellmd5", 17, shell),
+            sb(1232, "text/html; charset=UTF-8", "shellmd5", 33, shell),
+        ];
+        let sig = detect(&samples, 10).expect("constant shell yields a catchall sig");
+        // A genuine catchall hit (same shell, any path) → suppressed.
+        assert!(sig.matches_probe(1232, "text/html; charset=UTF-8", "shellmd5", 9, shell));
+        // A real page under the same prefix (different body + md5 + size) →
+        // NOT suppressed.
+        let real = "{\"user\":\"admin\",\"secret\":\"exposed-token-value-here\"}";
+        assert!(!sig.matches_probe(64, "application/json", "realmd5", 9, real));
     }
 
     #[test]
