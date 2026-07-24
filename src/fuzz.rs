@@ -959,20 +959,51 @@ fn cf_challenge(status: u16, server: &str, body_head: &str) -> bool {
 /// (scheme+netloc). Tries https first; if the caller supplies a URL we
 /// keep it verbatim.
 fn host_to_input(host: &str) -> String {
-    if host.starts_with("http://") || host.starts_with("https://") {
+    let s = if host.starts_with("http://") || host.starts_with("https://") {
         host.trim_end_matches('/').to_string()
     } else {
         format!("https://{}", host)
+    };
+    // v0.4.7 — drop the scheme's DEFAULT port. Crawl/recursion can surface both
+    // `https://x.com` and `https://x.com:443`; keeping them distinct split the
+    // wildcard fingerprint AND the per-host budgets, so the same host got
+    // fingerprinted twice and spent two bypass budgets. Non-default ports
+    // (`:8080`) are preserved — those are genuinely distinct endpoints.
+    let (scheme, rest) = if let Some(r) = s.strip_prefix("https://") {
+        ("https://", r)
+    } else if let Some(r) = s.strip_prefix("http://") {
+        ("http://", r)
+    } else {
+        return s;
+    };
+    let default_port = if scheme == "https://" { ":443" } else { ":80" };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    match authority.strip_suffix(default_port) {
+        Some(a) => format!("{}{}{}", scheme, a, tail),
+        None => s,
     }
 }
 
-/// Strip scheme + path so `https://target.com/foo` → `target.com`.
+/// Strip scheme + path so `https://target.com/foo` → `target.com`. The scheme's
+/// default port is dropped too (v0.4.7) so `x.com` and `x.com:443` are ONE host
+/// for the per-host budgets, bypass budget and the output `host` field.
 fn bare_host(s: &str) -> String {
-    let stripped = s
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
+    let (default_port, stripped) = if let Some(r) = s.strip_prefix("https://") {
+        (":443", r)
+    } else if let Some(r) = s.strip_prefix("http://") {
+        (":80", r)
+    } else {
+        ("", s)
+    };
     let end = stripped.find(['/', '?', '#']).unwrap_or(stripped.len());
-    stripped[..end].to_string()
+    let hostport = &stripped[..end];
+    if !default_port.is_empty() {
+        if let Some(h) = hostport.strip_suffix(default_port) {
+            return h.to_string();
+        }
+    }
+    hostport.to_string()
 }
 
 /// Fuzz-mode orchestrator. Drives wildcard pre-flight + the host×path
@@ -1535,9 +1566,20 @@ pub async fn run(
 /// One (host, path) probe end-to-end.
 /// v0.4.5 — try the conservative 401/403 bypass battery (bypass::variants).
 /// Returns `(technique, response, url)` on the FIRST content-confirmed bypass:
-/// a 2xx/3xx whose NORMALIZED content differs from the original block page AND
-/// doesn't match the host catchall. Stops at the first win. Never emits a
-/// fake-200 (the content + wildcard checks are the guard).
+/// a **2xx with a non-empty body** whose NORMALIZED content differs from the
+/// original block page AND doesn't match the host catchall. Stops at the first
+/// win. Never emits a fake-200 (the content + wildcard checks are the guard).
+///
+/// v0.4.7 — 3xx and empty bodies are NO LONGER accepted. Both guards were
+/// vacuous for redirects: a path-mutation like `/admin/..;/` is normalized by
+/// most servers to `..` and 302s to the PARENT directory, and that redirect
+/// carries a 0-byte body which trivially "differs" from the block page. Real
+/// scans showed `/files/admin/ 403` → `/files/admin/..;/ 302 (0B, Location:
+/// /files/)` reported as a bypass — while `/files/` was itself 403, and even a
+/// NON-EXISTENT dir produced the same 302. No access was ever gained. A genuine
+/// bypass (e.g. a server that treats `..;` literally) returns the protected
+/// CONTENT: 2xx with a body. Requiring that kills the whole false-positive
+/// class without losing a real win.
 async fn attempt_auth_bypass(
     item: &ProbeItem,
     original: &ParsedResp,
@@ -1563,8 +1605,11 @@ async fn attempt_auth_bypass(
         else {
             continue;
         };
-        // Must have actually gotten through.
-        if !matches!(p.status, 200..=399) {
+        // Must have actually gotten through AND returned content. 3xx is not a
+        // bypass (a redirect hands you no protected data — and for path
+        // mutations it usually just resolves one directory UP), and an empty
+        // body can't be content-confirmed against anything.
+        if !matches!(p.status, 200..=299) || p.raw_body.is_empty() {
             continue;
         }
         // Content must DIFFER from the original 401/403 block page (else the
@@ -2404,6 +2449,33 @@ mod tests {
         assert_eq!(bare_host("http://x.com:8080/abc"), "x.com:8080");
         assert_eq!(bare_host("https://x.com"), "x.com");
         assert_eq!(bare_host("x.com"), "x.com");
+    }
+
+    /// v0.4.7 — `x.com` and `x.com:443` must collapse to ONE host so the
+    /// wildcard fingerprint and the per-host / bypass budgets aren't split.
+    /// Non-default ports stay distinct.
+    #[test]
+    fn default_port_is_normalized_away() {
+        assert_eq!(bare_host("https://x.com:443/foo"), "x.com");
+        assert_eq!(bare_host("https://x.com:443"), "x.com");
+        assert_eq!(bare_host("http://x.com:80/abc"), "x.com");
+        // non-default ports preserved (genuinely different endpoints)
+        assert_eq!(bare_host("https://x.com:8443"), "x.com:8443");
+        assert_eq!(bare_host("http://x.com:8080"), "x.com:8080");
+        // a port that merely ENDS in 80/443 must not be mangled
+        assert_eq!(bare_host("http://x.com:8080/a"), "x.com:8080");
+        assert_eq!(bare_host("https://x.com:10443"), "x.com:10443");
+
+        assert_eq!(host_to_input("https://x.com:443"), "https://x.com");
+        assert_eq!(host_to_input("https://x.com:443/api"), "https://x.com/api");
+        assert_eq!(host_to_input("http://x.com:80"), "http://x.com");
+        assert_eq!(host_to_input("https://x.com:8443"), "https://x.com:8443");
+        // both spellings converge on one key
+        assert_eq!(
+            host_to_input("https://x.com:443"),
+            host_to_input("https://x.com")
+        );
+        assert_eq!(bare_host("https://x.com:443"), bare_host("https://x.com"));
     }
 
     #[test]
