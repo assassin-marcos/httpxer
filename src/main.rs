@@ -306,6 +306,19 @@ struct Args {
     #[arg(long = "no-live", help_heading = "Output")]
     no_live: bool,
 
+    /// (fuzz) Capture the FULL response header set for every finding: printed
+    /// under each live result on the terminal (dimmed) AND emitted as a
+    /// `response_headers` JSON object (lowercase keys; duplicate headers like
+    /// Set-Cookie folded with ", "). Off by default to keep output small.
+    /// Aliases mirror httpx muscle memory: `--rh`, `--irh`.
+    #[arg(
+        long = "response-headers",
+        visible_alias = "rh",
+        visible_alias = "irh",
+        help_heading = "Output"
+    )]
+    response_headers: bool,
+
     // ── Crawl (v0.3.7) ─────────────────────────────────────────────────
     /// Enable response crawling — parse HTML/robots.txt/sitemap.xml for
     /// endpoints and add them to the fuzz frontier. Same-host scope by
@@ -1183,6 +1196,7 @@ async fn main() -> Result<()> {
                 None => fuzz::OutputFormat::from_path(output_path),
             },
             live_findings: !args.no_live,
+            response_headers: args.response_headers,
         };
 
         fuzz::run(&hosts, &words, cfg, output_path, args.no_resume, policy).await?;

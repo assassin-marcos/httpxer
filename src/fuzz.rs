@@ -86,6 +86,15 @@ struct FuzzRecord {
     server: String,
     webserver: String,
     body_preview: String,
+    /// v0.4.9 — full response headers, emitted only under `--response-headers`
+    /// (empty otherwise → skipped, so default records stay byte-compatible).
+    /// JSON object: lowercase keys, duplicate headers folded with ", ".
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_response_headers",
+        default
+    )]
+    response_headers: Vec<(String, String)>,
     tech: Vec<String>,
     method: &'static str,
     is_wildcard: bool,
@@ -125,6 +134,37 @@ struct FuzzRecord {
 
 fn is_u8_zero(v: &u8) -> bool {
     *v == 0
+}
+
+/// Serialize captured response headers as a JSON object (v0.4.9). Keys are
+/// already lowercased at capture; duplicate header names (e.g. multiple
+/// `set-cookie`) are folded into one `", "`-joined value, first-seen order
+/// preserved. Chosen over an array of pairs so downstream `jq`
+/// (`.response_headers["content-security-policy"]`) stays trivial.
+fn serialize_response_headers<S>(headers: &[(String, String)], s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let mut order: Vec<&str> = Vec::new();
+    let mut folded: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    for (k, v) in headers {
+        match folded.get_mut(k.as_str()) {
+            Some(existing) => {
+                existing.push_str(", ");
+                existing.push_str(v);
+            }
+            None => {
+                order.push(k.as_str());
+                folded.insert(k.as_str(), v.clone());
+            }
+        }
+    }
+    let mut m = s.serialize_map(Some(order.len()))?;
+    for k in order {
+        m.serialize_entry(k, &folded[k])?;
+    }
+    m.end()
 }
 
 /// Per-(host,path) work item. Carries v0.4.0 recursion/crawl provenance
@@ -242,6 +282,10 @@ pub struct FuzzCfg {
     /// Print findings live to stderr during the scan in dirsearch-style
     /// format (v0.3.13). True by default; disable for clean log scraping.
     pub live_findings: bool,
+    /// v0.4.9 — `--response-headers`: attach the full response header set to
+    /// each emitted record (JSON `response_headers` object) and print it under
+    /// each live finding on the terminal. Off by default (keeps output small).
+    pub response_headers: bool,
 }
 
 /// Wildcard-handling policy. `strict` (default) suppresses any record whose
@@ -598,6 +642,10 @@ struct ParsedResp {
     /// crawl is disabled (caller decides whether to populate via the
     /// `keep_raw_body` param to `dispatch_one`).
     raw_body: String,
+    /// v0.4.9 — ALL response headers, lowercased names, in wire order with
+    /// duplicates preserved. Always captured; only surfaced (JSON + terminal)
+    /// when `--response-headers` is set.
+    headers: Vec<(String, String)>,
 }
 
 /// Per-host rate limiter — wraps `governor`. Off when `rps == 0.0`.
@@ -719,11 +767,16 @@ async fn dispatch_one(
 
     let status = resp.status().as_u16();
 
-    // Headers — case-insensitive lookup of the four we care about.
+    // Headers — case-insensitive lookup of the four we care about, PLUS a
+    // full ordered capture (v0.4.9) for `--response-headers`. Names lowercased
+    // (HTTP header names are case-insensitive; lowercasing makes `jq`/grep
+    // queries deterministic); order + duplicates (e.g. multiple Set-Cookie)
+    // preserved. Cheap — we already walk every header here.
     let mut content_type = String::new();
     let mut header_cl: Option<i64> = None;
     let mut location = String::new();
     let mut server = String::new();
+    let mut headers: Vec<(String, String)> = Vec::new();
     for (k, v) in resp.headers().iter() {
         let lk = k.as_str().to_ascii_lowercase();
         let vs = match v.to_str() {
@@ -741,6 +794,7 @@ async fn dispatch_one(
             "server" if server.is_empty() => server = vs.to_string(),
             _ => {}
         }
+        headers.push((lk, vs.to_string()));
     }
 
     // Body — streamed, capped at BODY_READ_CAP.
@@ -791,6 +845,7 @@ async fn dispatch_one(
             body_preview_for_output,
             snippet_md5,
             raw_body,
+            headers,
         },
         slot.tag,
         ua,
@@ -2140,6 +2195,11 @@ async fn run_probe(
                         server: bp.server.clone(),
                         webserver: bp.server.clone(),
                         body_preview: bp.body_preview_for_output.clone(),
+                        response_headers: if cfg.response_headers {
+                            bp.headers.clone()
+                        } else {
+                            Vec::new()
+                        },
                         tech: Vec::new(),
                         method: "GET",
                         is_wildcard: false,
@@ -2201,6 +2261,11 @@ async fn run_probe(
                 server: parsed.server.clone(),
                 webserver: parsed.server.clone(),
                 body_preview: parsed.body_preview_for_output.clone(),
+                response_headers: if cfg.response_headers {
+                    parsed.headers.clone()
+                } else {
+                    Vec::new()
+                },
                 tech: Vec::new(),
                 method: "GET",
                 is_wildcard,
@@ -2273,6 +2338,7 @@ async fn run_probe(
                 server: String::new(),
                 webserver: String::new(),
                 body_preview: String::new(),
+                response_headers: Vec::new(), // no response on a connect error
                 tech: Vec::new(),
                 method: "GET",
                 is_wildcard: false,
@@ -2325,6 +2391,18 @@ async fn write_record(
             eprintln!("\r\x1b[K{}", line);
         } else {
             eprintln!("{}", line);
+        }
+        // v0.4.9 — `--response-headers`: dump the header set under the finding.
+        // Non-empty only when the flag is set (populated at record build).
+        if !rec.response_headers.is_empty() {
+            for (k, v) in &rec.response_headers {
+                if is_tty {
+                    // dim grey so headers don't drown the finding lines.
+                    eprintln!("\r\x1b[K      \x1b[2m{}: {}\x1b[0m", k, v);
+                } else {
+                    eprintln!("      {}: {}", k, v);
+                }
+            }
         }
     }
 
@@ -2540,6 +2618,7 @@ mod tests {
             server: "nginx".into(),
             webserver: "nginx".into(),
             body_preview: "&#34;ok&#34;".into(),
+            response_headers: vec![],
             tech: vec![],
             method: "GET",
             is_wildcard: false,
@@ -2570,6 +2649,68 @@ mod tests {
         assert!(s.contains("\"prober\":\"httpxer/"));
         // v0.4.5 — schema compat: `bypass` absent when None (downstream-safe).
         assert!(!s.contains("\"bypass\""), "bypass must be omitted when None");
+        // v0.4.9 — response_headers omitted when empty (default records stay small).
+        assert!(
+            !s.contains("\"response_headers\""),
+            "response_headers must be omitted when empty"
+        );
+    }
+
+    /// v0.4.9 — `response_headers` serializes as a JSON OBJECT with lowercase
+    /// keys, and duplicate headers (e.g. set-cookie) fold into one ", "-joined
+    /// value in first-seen order.
+    #[test]
+    fn response_headers_serialize_as_folded_object() {
+        let mut rec = FuzzRecord {
+            url: "https://x.com/a".into(),
+            input: "https://x.com".into(),
+            path: "/a".into(),
+            host: "x.com".into(),
+            status_code: 200,
+            content_length: 42,
+            content_type: "text/plain".into(),
+            title: "T".into(),
+            location: "".into(),
+            server: "nginx".into(),
+            webserver: "nginx".into(),
+            body_preview: "".into(),
+            response_headers: vec![
+                ("content-type".into(), "text/html".into()),
+                ("set-cookie".into(), "a=1".into()),
+                ("set-cookie".into(), "b=2".into()),
+                ("x-frame-options".into(), "DENY".into()),
+            ],
+            tech: vec![],
+            method: "GET",
+            is_wildcard: false,
+            wildcard_policy: "strict".into(),
+            via_proxy: false,
+            attempts: 1,
+            elapsed_ms: 5,
+            snippet_md5: "abc".into(),
+            tls_impersonation: "chrome-131".into(),
+            user_agent: "ua".into(),
+            cf_challenge: false,
+            error: None,
+            timestamp: "2026-05-20T12:00:00.000Z".into(),
+            prober: PROBER_TAG,
+            depth: 0,
+            source: String::new(),
+            parent_url: String::new(),
+            bypass: None,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        let h = &v["response_headers"];
+        assert!(h.is_object(), "response_headers must be a JSON object");
+        assert_eq!(h["content-type"], "text/html");
+        assert_eq!(h["x-frame-options"], "DENY");
+        // duplicate set-cookie folded, order preserved
+        assert_eq!(h["set-cookie"], "a=1, b=2");
+
+        // empty → field omitted entirely
+        rec.response_headers.clear();
+        assert!(!serde_json::to_string(&rec).unwrap().contains("response_headers"));
     }
 
     /// Regression: `--rate-limit 0.1` used to round to 0, then clamp to 1
