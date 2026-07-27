@@ -883,6 +883,18 @@ fn read_hosts(path: &str) -> Result<Vec<String>> {
 }
 
 fn read_existing_subdomains(path: &str) -> HashSet<String> {
+    // v0.5.2 — resume only makes sense for a REGULAR file. `-o /dev/stdout`,
+    // `/dev/stderr`, a pipe or any char device would otherwise be opened for
+    // READING here: on a TTY that blocks on the keyboard, so the scan hung
+    // right after "[+] input: N unique hosts" with no explanation. A char
+    // device has no prior results to resume from anyway.
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        // Missing file = normal first run (read_to_string would fail below
+        // anyway); anything non-regular = nothing to resume from.
+        Ok(_) => return HashSet::new(),
+        Err(_) => return HashSet::new(),
+    }
     let Ok(content) = std::fs::read_to_string(path) else {
         return HashSet::new();
     };
