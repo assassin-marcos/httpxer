@@ -44,7 +44,40 @@ const EMBEDDED_FINGERPRINTS: &str = include_str!("../fingerprints.json");
 #[command(
     name = "httpxer",
     version,
-    about = "Native httpx-enrichment replacement — status/title/server/CL/redirect/CDN/Wappalyzer."
+    about = "HTTP probe + path fuzzer with browser-grade TLS impersonation.",
+    long_about = "HTTP probe + path fuzzer with browser-grade TLS impersonation.\n\n\
+        TWO MODES — chosen automatically:\n  \
+          ENRICH (default)  no -w  →  one probe per host: status, title, server, tech, IP, CDN\n  \
+          FUZZ              -w set →  host × wordlist path scan, with wildcard suppression",
+    after_help = "\x1b[1mQUICK START\x1b[0m\n  \
+  httpxer -u example.com                          probe one host\n  \
+  httpxer -l hosts.txt -o out.json                probe a list → NDJSON\n  \
+  httpxer -u example.com -w paths.txt             fuzz paths on one host\n\n\
+\x1b[1mFINGERPRINT / RECON (enrich)\x1b[0m\n  \
+  httpxer -u example.com --rh                     show all response headers\n  \
+  httpxer -l hosts.txt --no-cdn --no-tech         fast: skip CDN + tech-detect\n  \
+  httpxer -l hosts.txt --httpx-compat -o out.json httpx-shaped JSON (drop-in)\n  \
+  cat subs.txt | httpxer -l - -o live.json        pipe from subfinder/amass\n\n\
+\x1b[1mDIRECTORY FUZZING\x1b[0m\n  \
+  httpxer -u https://t.com -w big.txt -i 200,301,302,307,308\n  \
+  httpxer -u https://t.com -w a.txt,b.txt         multiple wordlists (comma)\n  \
+  httpxer -u https://t.com -w w.txt -r -R 3       recurse into found dirs\n  \
+  httpxer -u https://t.com -w w.txt --crawl       + crawl HTML/robots/sitemap\n  \
+  httpxer -u https://t.com -w w.txt --safe        disable 401/403 bypass probes\n\n\
+\x1b[1mAUTHENTICATED SCANS\x1b[0m  (work in BOTH modes)\n  \
+  httpxer -u https://t.com --bearer $TOKEN -w w.txt\n  \
+  httpxer -u https://t.com -H 'X-API-Key: k' --cookie 'sid=abc'\n\n\
+\x1b[1mTOO MUCH NOISE?\x1b[0m\n  \
+  --wildcard-policy strict   (default) auto-suppress catchall/soft-404 pages\n  \
+  -i 200,301,302,307,308     only these codes (hides 401/403 auth walls)\n  \
+  --exclude-root-size        drop pages the size of the homepage\n  \
+  --exclude-sizes 1234,5678  drop exact byte sizes\n\n\
+\x1b[1mOUTPUT\x1b[0m\n  \
+  -o out.json    NDJSON, one record per line (default)\n  \
+  -o out.txt     plain 'STATUS SIZE URL' lines (auto-detected from .txt)\n  \
+  --rh           add every response header to terminal + JSON\n  \
+  -q             quiet: no banner, no update check\n\n\
+Docs: https://github.com/assassin-marcos/httpxer"
 )]
 struct Args {
     /// Input file (one hostname/URL per line, "-" for stdin). Either `-l`
@@ -163,7 +196,7 @@ struct Args {
     /// (fuzz) Comma-separated status codes to emit
     #[arg(
         long = "match-codes",
-        alias = "mc",
+
         default_value = "200,301,302,307,308,401,403",
         help_heading = "Fuzz mode"
     )]
@@ -253,9 +286,14 @@ struct Args {
     #[arg(long = "max-dirs-per-host", default_value_t = 200, help_heading = "Recursion")]
     max_dirs_per_host: usize,
 
-    /// (recursion) Hard cap on total probes per input host across all rounds.
-    #[arg(long = "max-probes-per-host", default_value_t = 50_000, help_heading = "Recursion")]
-    max_probes_per_host: usize,
+    /// REMOVED in v0.5.0 — was never enforced. The counter behind it
+    /// (`HostBudget::try_inc_probe`) was only ever called from unit tests, so
+    /// the flag silently did nothing: a scan with `--max-probes-per-host 10`
+    /// still issued 1260 probes in testing. Recursion is bounded by
+    /// `--max-dirs-per-host` (which IS enforced) plus `-R`. Still parsed so
+    /// existing scripts don't hard-fail; using it prints a deprecation notice.
+    #[arg(long = "max-probes-per-host", hide = true)]
+    max_probes_per_host: Option<usize>,
 
     /// (recursion) Override the built-in --exclude-subdirs default list
     /// (asset/traversal noise). Comma-separated. Empty string = disable
@@ -306,11 +344,11 @@ struct Args {
     #[arg(long = "no-live", help_heading = "Output")]
     no_live: bool,
 
-    /// (fuzz) Capture the FULL response header set for every finding: printed
-    /// under each live result on the terminal (dimmed) AND emitted as a
-    /// `response_headers` JSON object (lowercase keys; duplicate headers like
-    /// Set-Cookie folded with ", "). Off by default to keep output small.
-    /// Aliases mirror httpx muscle memory: `--rh`, `--irh`.
+    /// Capture the FULL response header set: printed under each result on the
+    /// terminal AND emitted as a `response_headers` JSON object (lowercase
+    /// keys; duplicate headers like Set-Cookie folded with ", "). Works in
+    /// BOTH modes — enrich (`-u` / `-l`) and fuzz (`-w`). Off by default to
+    /// keep output small. Aliases mirror httpx muscle memory: `--rh`, `--irh`.
     #[arg(
         long = "response-headers",
         visible_alias = "rh",
@@ -415,43 +453,45 @@ struct Args {
     // word_count, server, location, title, tech, ip, cname in JSON). The
     // fields below are intentionally unused.
     /// httpx compat (no-op — redirects are followed by default; pass --no-follow-redirects to disable)
-    #[arg(long, help_heading = "httpx compatibility (no-ops)")]
+    #[arg(long, hide = true)]
     fr: bool,
     /// httpx compat (no-op — status_code is always in the JSON output)
-    #[arg(long, help_heading = "httpx compatibility (no-ops)")]
+    #[arg(long, hide = true)]
     sc: bool,
     /// httpx compat (no-op — content_length is always in the JSON output)
-    #[arg(long, help_heading = "httpx compatibility (no-ops)")]
+    #[arg(long, hide = true)]
     cl: bool,
     /// httpx compat (no-op — word_count is always in the JSON output)
-    #[arg(long, help_heading = "httpx compatibility (no-ops)")]
+    #[arg(long, hide = true)]
     wc: bool,
     /// httpx compat (no-op — server header is always in the JSON output)
-    #[arg(long, help_heading = "httpx compatibility (no-ops)")]
+    #[arg(long, hide = true)]
     server: bool,
     /// httpx compat (no-op — Location header is always in the JSON output)
-    #[arg(long, help_heading = "httpx compatibility (no-ops)")]
+    #[arg(long, hide = true)]
     location: bool,
     /// httpx compat (no-op — <title> is always in the JSON output)
-    #[arg(long, help_heading = "httpx compatibility (no-ops)")]
+    #[arg(long, hide = true)]
     title: bool,
     /// httpx compat (no-op — Wappalyzer tech-detect is always on; use --no-tech to disable)
-    #[arg(long, help_heading = "httpx compatibility (no-ops)")]
+    #[arg(long, hide = true)]
     td: bool,
     /// httpx compat (no-op — ip is always in the JSON output)
-    #[arg(long, help_heading = "httpx compatibility (no-ops)")]
+    #[arg(long, hide = true)]
     ip: bool,
     /// httpx compat (no-op — cname is always in the JSON output)
-    #[arg(long, help_heading = "httpx compatibility (no-ops)")]
+    #[arg(long, hide = true)]
     cname: bool,
     /// httpx compat (no-op — output is always NDJSON, one record per line)
-    #[arg(long, help_heading = "httpx compatibility (no-ops)")]
+    #[arg(long, hide = true)]
     json: bool,
-    /// httpx compat (no-op — stderr is already plain text, no ANSI)
-    #[arg(long = "no-color", help_heading = "httpx compatibility (no-ops)")]
+    /// Disable ANSI colour in terminal output (also honours the conventional
+    /// `NO_COLOR` env var). v0.5.0 — this used to be a documented no-op that
+    /// falsely claimed httpxer emitted no ANSI; it now genuinely suppresses it.
+    #[arg(long = "no-color", help_heading = "Output")]
     no_color: bool,
     /// httpx compat (no-op — httpxer doesn't print per-record stderr noise)
-    #[arg(long, help_heading = "httpx compatibility (no-ops)")]
+    #[arg(long, hide = true)]
     silent: bool,
 }
 
@@ -546,6 +586,17 @@ struct EnrichRecord {
     /// Raw response body, ≤2 MiB. Only present when --with-body is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<String>,
+
+    /// v0.4.10 — full response headers of the FINAL hop, emitted only under
+    /// `--response-headers` / `--rh` (empty otherwise → skipped, so default
+    /// enrich output is byte-identical). JSON object: lowercase keys,
+    /// duplicate headers folded with ", ". Same shape as fuzz mode.
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "fuzz::serialize_response_headers",
+        default
+    )]
+    response_headers: Vec<(String, String)>,
 
     /// Reason this record didn't enrich (dns / http). Absent on success.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -913,6 +964,23 @@ async fn main() -> Result<()> {
 
     let args = Args::parse_from(normalized_argv);
 
+    // v0.4.10 — `--max-probes-per-host` was removed: it was never enforced
+    // (the counter behind it was only called from unit tests, so the flag
+    // silently did nothing). Still parsed so existing scripts don't hard-fail;
+    // say so loudly once instead of pretending it works.
+    if args.max_probes_per_host.is_some() {
+        eprintln!(
+            "[!] --max-probes-per-host was REMOVED in v0.5.0 (it was never enforced — a no-op). \
+             Ignoring it. Recursion is bounded by --max-dirs-per-host (enforced) and -R; \
+             drop the flag from your scripts."
+        );
+    }
+
+    // v0.5.0 — honour --no-color and the conventional NO_COLOR env var.
+    if args.no_color || std::env::var_os("NO_COLOR").is_some() {
+        fuzz::set_no_color();
+    }
+
     // Self-management early-exits — handle before we touch input files / DNS / network.
     if args.update {
         return update::run_update().await;
@@ -974,6 +1042,32 @@ async fn main() -> Result<()> {
     }
     eprintln!("[+] input: {} unique hosts", initial);
 
+    // v0.5.0 — auth is built BEFORE the mode split so `-H` / `--bearer` /
+    // `--cookie` apply to BOTH enrich and fuzz. Previously `AuthCtx` was
+    // constructed inside the fuzz block, so enrich-mode probes went out
+    // unauthenticated with no warning (a silent, dangerous no-op). Syntax is
+    // validated here too, so a malformed `-H` now fails loudly in either mode.
+    let auth_ctx = auth::AuthCtx::from_cli(&args.headers, args.bearer.as_deref(), &args.cookies)?;
+    let extra_headers: Vec<(String, String)> = auth_ctx
+        .headers
+        .iter()
+        .map(|(n, v)| (n.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    let initial_cookie_header = auth_ctx.initial_cookie_header();
+    // Install for the enrich probe path (fuzz passes them via FuzzCfg instead).
+    probe::init_auth(extra_headers.clone(), initial_cookie_header.clone());
+    if auth_ctx.is_active() {
+        eprintln!(
+            "[+] auth: {} header(s){}",
+            extra_headers.len(),
+            if initial_cookie_header.is_some() {
+                " + cookie"
+            } else {
+                ""
+            }
+        );
+    }
+
     // 2a. FUZZ MODE — triggered by `-path / --paths <wordlist>`.
     //     Bypasses enrich-mode's DNS/CDN/tech-detect path entirely and
     //     issues a host × path Cartesian probe through the same wreq
@@ -1018,17 +1112,9 @@ async fn main() -> Result<()> {
             .filter_map(|s| s.trim().parse::<u16>().ok())
             .collect();
 
-        // Build the auth ctx (validates header/cookie syntax up-front).
-        let auth_ctx = auth::AuthCtx::from_cli(
-            &args.headers,
-            args.bearer.as_deref(),
-            &args.cookies,
-        )?;
-        let extra_headers: Vec<(String, String)> = auth_ctx
-            .headers
-            .iter()
-            .map(|(n, v)| (n.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
+        // Auth was already built + validated before the mode split (v0.5.0),
+        // and installed for the enrich path via `probe::init_auth`. Fuzz reads
+        // the same values out of `extra_headers` / `initial_cookie_header`.
 
         // Exclude-subdirs: built-in defaults unless --exclude-subdirs
         // override is passed; --add-excludes always appends.
@@ -1177,7 +1263,6 @@ async fn main() -> Result<()> {
             // v0.4.5 — native 401/403 bypass is auto-on unless `--safe`.
             bypass_enabled: !args.safe,
             max_dirs_per_host: args.max_dirs_per_host,
-            max_probes_per_host: args.max_probes_per_host,
             similarity_window: 2,
             crawl_enabled: args.crawl,
             crawl_depth,
@@ -1284,6 +1369,8 @@ async fn main() -> Result<()> {
     let scan_id_arc = Arc::new(args.scan_id.clone());
     let source_tools_arc = Arc::new(args.source_tools.clone());
     let with_body = args.with_body;
+    // v0.4.10 — copied out of `args` so it can move into each probe task.
+    let want_response_headers = args.response_headers;
     let via_proxy = args.proxy.is_some();
 
     eprintln!(
@@ -1374,6 +1461,7 @@ async fn main() -> Result<()> {
                 time: None,
                 via_proxy,
                 body: None,
+                response_headers: Vec::new(),
                 error: None,
                 raw_ipv4,
                 raw_ipv6,
@@ -1424,6 +1512,28 @@ async fn main() -> Result<()> {
                     if let Some(engine) = tech_engine.as_ref() {
                         let matches = engine.detect(&r.headers, &r.cookies, &r.body);
                         rec.tech = techdetect::render_tech(&matches);
+                    }
+                    // v0.4.10 — `--response-headers` in ENRICH mode. Headers were
+                    // already captured for tech-detect (probe.rs), so this costs
+                    // nothing extra; previously the flag was silently ignored
+                    // outside fuzz mode. Printed per-host to stderr as well, so
+                    // `httpxer -u https://x --rh` is useful without an -o file.
+                    if want_response_headers {
+                        if !r.headers.is_empty() {
+                            let mut out = String::new();
+                            use std::fmt::Write as _;
+                            let _ = writeln!(
+                                out,
+                                "{} [{}]",
+                                rec.final_url.as_deref().unwrap_or(&rec.subdomain),
+                                r.status_code
+                            );
+                            for (k, v) in &r.headers {
+                                let _ = writeln!(out, "      {}: {}", k, v);
+                            }
+                            eprint!("{}", out);
+                        }
+                        rec.response_headers = r.headers;
                     }
                     if with_body {
                         rec.body = Some(r.body);
@@ -1496,6 +1606,7 @@ mod tests {
             time: Some("100ms".into()),
             via_proxy: true,
             body: None,
+            response_headers: Vec::new(),
             error: None,
             raw_ipv4: vec!["1.2.3.4".into(), "1.2.3.5".into()],
             raw_ipv6: vec!["2001:db8::1".into()],

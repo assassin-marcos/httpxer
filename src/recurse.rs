@@ -228,17 +228,21 @@ pub fn build_exclude_set(
             }
         }
         None => {
-            // Use defaults + append --add-excludes.
+            // No override — start from the built-in defaults.
             for d in DEFAULT_EXCLUDE_SUBDIRS {
                 out.insert(d.to_string());
             }
-            if let Some(s) = add_list {
-                for entry in s.split(',') {
-                    let t = entry.trim().to_ascii_lowercase();
-                    if !t.is_empty() {
-                        out.insert(t);
-                    }
-                }
+        }
+    }
+    // v0.5.0 — `--add-excludes` now ALWAYS appends, in both branches. Before
+    // this it lived inside the `None` arm, so passing `--exclude-subdirs`
+    // together with `--add-excludes` silently discarded the add-list — directly
+    // contradicting its documented "doesn't replace defaults; just adds".
+    if let Some(s) = add_list {
+        for entry in s.split(',') {
+            let t = entry.trim().to_ascii_lowercase();
+            if !t.is_empty() {
+                out.insert(t);
             }
         }
     }
@@ -410,30 +414,26 @@ fn is_dir_shaped(req_url: &str) -> bool {
     !last.is_empty() && !last.contains('.')
 }
 
-/// Per-host budget tracker. Atomic counters so workers can update without
-/// contention. When `inc_probe` returns false, the host has hit its probe
-/// cap and no more probes should be issued for it.
+/// Per-host recursion budget. One atomic counter so workers can charge
+/// discoveries without contention. When `try_inc_dir` returns false the host
+/// has hit its directory cap and no further dirs enter the frontier.
+///
+/// v0.4.10 — the probe counter was deleted. It backed `--max-probes-per-host`,
+/// but `try_inc_probe` was only ever called from unit tests, so that cap never
+/// applied to a real scan (verified: `--max-probes-per-host 10` still issued
+/// 1260 probes). Keeping a counter nothing charges is worse than not having it;
+/// `max_dirs` is the enforced bound.
 pub struct HostBudget {
-    pub max_probes: usize,
     pub max_dirs: usize,
-    probes: AtomicUsize,
     dirs: AtomicUsize,
 }
 
 impl HostBudget {
-    pub fn new(max_probes: usize, max_dirs: usize) -> Self {
+    pub fn new(max_dirs: usize) -> Self {
         Self {
-            max_probes,
             max_dirs,
-            probes: AtomicUsize::new(0),
             dirs: AtomicUsize::new(0),
         }
-    }
-
-    /// Try to charge one probe. Returns false when the budget is exhausted.
-    pub fn try_inc_probe(&self) -> bool {
-        let n = self.probes.fetch_add(1, Ordering::Relaxed);
-        n < self.max_probes
     }
 
     /// Try to charge one directory discovery. Returns false when the dir
@@ -443,17 +443,9 @@ impl HostBudget {
         n < self.max_dirs
     }
 
-    pub fn probes_used(&self) -> usize {
-        self.probes.load(Ordering::Relaxed)
-    }
-
+    #[allow(dead_code)]
     pub fn dirs_used(&self) -> usize {
         self.dirs.load(Ordering::Relaxed)
-    }
-
-    pub fn exhausted(&self) -> bool {
-        self.probes.load(Ordering::Relaxed) >= self.max_probes
-            || self.dirs.load(Ordering::Relaxed) >= self.max_dirs
     }
 }
 
@@ -792,14 +784,44 @@ mod tests {
         assert!(detect_directory("https://x.com/api", 200, "", "", false, false, true).is_none());
     }
 
+    /// v0.4.10 — the dir cap is the one enforced recursion bound. Charging
+    /// past `max_dirs` must refuse, so no further directories enter the
+    /// frontier (each dir costs a full wordlist re-fuzz).
+    /// v0.5.0 regression: `--add-excludes` must append even when
+    /// `--exclude-subdirs` overrides the defaults. Before the fix the add-list
+    /// was inside the `None` arm only, so passing both SILENTLY discarded the
+    /// add-list — contradicting its documented "just adds" behaviour.
     #[test]
-    fn host_budget_caps_probes() {
-        let b = HostBudget::new(3, 100);
-        assert!(b.try_inc_probe()); // 1
-        assert!(b.try_inc_probe()); // 2
-        assert!(b.try_inc_probe()); // 3
-        assert!(!b.try_inc_probe()); // 4 → over cap
-        assert!(b.exhausted());
+    fn add_excludes_appends_even_with_override() {
+        // both set → override replaces defaults, add-list still applied
+        let set = build_exclude_set(Some("only1,only2"), Some("extra1,extra2"));
+        assert!(set.contains("only1") && set.contains("only2"), "override kept");
+        assert!(
+            set.contains("extra1") && set.contains("extra2"),
+            "--add-excludes must NOT be dropped when --exclude-subdirs is set"
+        );
+        assert!(!set.contains("assets"), "defaults replaced by override");
+        assert_eq!(set.len(), 4);
+
+        // add-list alone → defaults + additions (unchanged behaviour)
+        let d = build_exclude_set(None, Some("extra1"));
+        assert!(d.contains("extra1") && d.contains("assets"));
+
+        // empty override string disables defaults; add-list still honoured
+        let e = build_exclude_set(Some(""), Some("kept"));
+        assert!(e.contains("kept") && !e.contains("assets"));
+        assert_eq!(e.len(), 1);
+    }
+
+    #[test]
+    fn host_budget_caps_dirs() {
+        let b = HostBudget::new(3);
+        assert!(b.try_inc_dir()); // 1
+        assert!(b.try_inc_dir()); // 2
+        assert!(b.try_inc_dir()); // 3
+        assert!(!b.try_inc_dir()); // 4 → over cap
+        assert!(!b.try_inc_dir()); // stays refused
+        assert_eq!(b.max_dirs, 3);
     }
 
     #[test]

@@ -55,6 +55,12 @@ subfinder -d example.com -silent | httpxer -l - -o enriched.jsonl
 
 # Through a proxy (HTTP / HTTPS / SOCKS5)
 httpxer -l hosts.txt -o enriched.jsonl --proxy http://127.0.0.1:8080
+
+# Show every response header (terminal + a `response_headers` JSON object)
+httpxer -u example.com --rh
+
+# Authenticated probe — -H / --bearer / --cookie work in BOTH modes (v0.5.0)
+httpxer -u https://internal.example.com --bearer "$TOKEN" --rh
 ```
 
 ### Fuzz mode (single target)
@@ -129,7 +135,7 @@ Pass `-r` (recursion) and/or `--crawl` to turn the host × wordlist single pass 
 - **Auth-dir recursion** *(auto-on)* — a `401`/`403` on a **directory-shaped** path (e.g. `/api`, `/internal` — not `/x.php`) is descended into so accessible children behind a protected parent are found (the classic `/api` = 401 → `/api/actuator` = 200). The `401`/`403` itself is **never emitted** (no auth-wall noise) — only its reachable children surface. Bounded by `--max-dirs-per-host`. The legacy `--recurse-on-403` flag (recurse *any* 403) still exists.
 - **Crawl** — every response body is parsed for HTML `<a/link/script/img/form/iframe>`, robots.txt `Disallow/Allow/Sitemap`, sitemap.xml `<loc>`. Same-host scope + third-party CDN deny list + static-media filter applied. Extracted URLs probed in the next round.
 
-Both share a visited-set + per-host probe/dir budgets (`--max-probes-per-host`, `--max-dirs-per-host`) so recursion never blows up on adversarial targets.
+Both share a visited-set + a per-host **directory** budget (`--max-dirs-per-host`, default 200) so recursion never blows up on adversarial targets. Each discovered directory costs a full wordlist pass, so that cap — together with `-R` depth — is what actually bounds a recursive scan.
 
 ## 401/403 bypass (native, auto, content-confirmed)
 

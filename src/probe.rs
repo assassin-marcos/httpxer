@@ -162,6 +162,25 @@ pub struct PoolSlot {
 
 static POOL: OnceCell<Vec<PoolSlot>> = OnceCell::new();
 
+/// v0.5.0 — user auth for the ENRICH probe path (`-H`, `--bearer`, `--cookie`).
+///
+/// Before v0.5.0 these flags were parsed but reached only fuzz mode, because
+/// `AuthCtx` was built inside the fuzz block. Enrich probes went out
+/// **unauthenticated with no warning** — `httpxer -u https://internal
+/// --bearer $TOK` silently sent no Authorization header at all.
+///
+/// Stored process-globally (same shape as `POOL`) rather than threaded through
+/// `probe_hostname` → `http_probe_with_retry` → `http_probe_once`, so the fix
+/// adds no new parameters to three public signatures and their call sites.
+/// Set once at startup via `init_auth`; empty when no auth flags were given.
+static AUTH: OnceCell<(Vec<(String, String)>, Option<String>)> = OnceCell::new();
+
+/// Install the user's auth headers + initial cookie for enrich-mode probes.
+/// Idempotent — a second call is ignored (matches `init_pool` semantics).
+pub fn init_auth(headers: Vec<(String, String)>, cookie: Option<String>) {
+    let _ = AUTH.set((headers, cookie));
+}
+
 /// Build the client pool. Called once from main, before any probes fire.
 /// Each emulation profile gets one preconfigured client (no per-probe build
 /// overhead) — `wreq::Client` already handles concurrent use across tasks.
@@ -350,16 +369,25 @@ pub async fn http_probe_once(
         // The emulation profile already sets a matching UA, Accept-Encoding,
         // sec-ch-ua etc. — we just add Accept-Language for variety and a
         // browser-like Accept header for HTML targets (httpx-style).
-        let resp = match client
+        let mut req = client
             .get(&current)
             .header("Accept-Language", slot.accept_lang)
             .header(
                 "Accept",
                 "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            )
-            .send()
-            .await
-        {
+            );
+        // v0.5.0 — attach user auth (`-H` / `--bearer` / `--cookie`). Applied on
+        // EVERY hop so a redirect chain keeps carrying credentials, matching the
+        // fuzz path (`dispatch_one`). Absent when no auth flags were passed.
+        if let Some((extra, cookie)) = AUTH.get() {
+            for (n, v) in extra {
+                req = req.header(n.as_str(), v.as_str());
+            }
+            if let Some(c) = cookie {
+                req = req.header("Cookie", c.as_str());
+            }
+        }
+        let resp = match req.send().await {
             Ok(r) => r,
             Err(_) => {
                 if hop == 0 {

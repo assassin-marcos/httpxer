@@ -141,7 +141,10 @@ fn is_u8_zero(v: &u8) -> bool {
 /// `set-cookie`) are folded into one `", "`-joined value, first-seen order
 /// preserved. Chosen over an array of pairs so downstream `jq`
 /// (`.response_headers["content-security-policy"]`) stays trivial.
-fn serialize_response_headers<S>(headers: &[(String, String)], s: S) -> Result<S::Ok, S::Error>
+pub(crate) fn serialize_response_headers<S>(
+    headers: &[(String, String)],
+    s: S,
+) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
@@ -249,8 +252,11 @@ pub struct FuzzCfg {
     /// v0.4.5 — native, content-confirmed 401/403 bypass engine (auto-on;
     /// `--safe` sets this false). Bounded per host by `bypass::PER_HOST_PATH_BUDGET`.
     pub bypass_enabled: bool,
+    /// Recursion breadth cap — how many DISCOVERED directories per host get
+    /// re-fuzzed. Each dir costs a full wordlist pass, so this (with `-R`) is
+    /// what actually bounds a recursive scan. v0.4.10 removed the companion
+    /// `max_probes_per_host`, which was never enforced.
     pub max_dirs_per_host: usize,
-    pub max_probes_per_host: usize,
     /// Self-similarity window for loop detection (default 2). 0 = disabled.
     pub similarity_window: usize,
     // ── Crawl (v0.3.7) ─────────────────────────────────────────────────
@@ -461,6 +467,23 @@ impl OutputFormat {
 /// terminal display (TTY-gated, ANSI-colored) and `--format plain`
 /// file output (no ANSI). Empty when status is 0 (network error
 /// emit-errors path) so the table stays aligned at width.
+/// v0.5.0 — `--no-color` / `NO_COLOR`. Previously `--no-color` was documented
+/// as a no-op claiming "stderr is already plain text, no ANSI" — untrue: the
+/// findings lines, progress bar and catchall notices all emit ANSI. Now it
+/// genuinely suppresses every escape sequence.
+static NO_COLOR: AtomicBool = AtomicBool::new(false);
+
+/// Disable all ANSI output (called once at startup from `--no-color`, or when
+/// the conventional `NO_COLOR` env var is set).
+pub fn set_no_color() {
+    NO_COLOR.store(true, Ordering::Relaxed);
+}
+
+/// True when ANSI escapes are permitted: a TTY and colour not disabled.
+pub(crate) fn color_ok(is_tty: bool) -> bool {
+    is_tty && !NO_COLOR.load(Ordering::Relaxed)
+}
+
 fn format_finding_line(status: u16, content_length: i64, url: &str, color: bool) -> String {
     let size = format_size(content_length);
     if color {
@@ -1442,10 +1465,7 @@ pub async fn run(
                 for (canon, host, depth, parent) in new_dirs {
                     if !v.insert(canon.clone()) { continue; }
                     let budget = budgets.entry(host.clone()).or_insert_with(|| {
-                        Arc::new(crate::recurse::HostBudget::new(
-                            cfg.max_probes_per_host,
-                            cfg.max_dirs_per_host,
-                        ))
+                        Arc::new(crate::recurse::HostBudget::new(cfg.max_dirs_per_host))
                     });
                     if !budget.try_inc_dir() { continue; }
                     frontier_dirs.push((canon, host, depth, parent));
@@ -2384,7 +2404,8 @@ async fn write_record(
     // once per emitted record.
     let is_tty = std::io::stderr().is_terminal();
     if live && rec.status_code != 0 {
-        let line = format_finding_line(rec.status_code, rec.content_length, &rec.url, is_tty);
+        let line =
+            format_finding_line(rec.status_code, rec.content_length, &rec.url, color_ok(is_tty));
         if is_tty {
             // \r\x1b[K wipes the progress bar before our line lands; the
             // ticker's next ~100 ms tick redraws the bar below.
@@ -2396,9 +2417,11 @@ async fn write_record(
         // Non-empty only when the flag is set (populated at record build).
         if !rec.response_headers.is_empty() {
             for (k, v) in &rec.response_headers {
-                if is_tty {
+                if color_ok(is_tty) {
                     // dim grey so headers don't drown the finding lines.
                     eprintln!("\r\x1b[K      \x1b[2m{}: {}\x1b[0m", k, v);
+                } else if is_tty {
+                    eprintln!("\r\x1b[K      {}: {}", k, v);
                 } else {
                     eprintln!("      {}: {}", k, v);
                 }
