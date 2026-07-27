@@ -1,6 +1,6 @@
 [package]
 name = "httpxer"
-version = "0.4.7"
+version = "0.4.8"
 edition = "2021"
 description = "Native httpx-replacement: enrichment + path-fuzz with browser-grade TLS impersonation, wildcard auto-suppress, Wappalyzer tech-detect. One static binary."
 license = "MIT"

@@ -1036,12 +1036,19 @@ pub async fn run(
             .with_context(|| format!("open output {}", output_path))?,
     ));
 
-    let total_probes = hosts.len() * words.len();
+    // v0.4.8 — total is a LIVE counter, not a fixed round-0 estimate. Recursion
+    // (`-r`) and crawl (`--crawl`) enqueue MORE probes as they discover dirs /
+    // URLs, so a static `hosts × words` denominator made the progress bar sail
+    // past 100% (e.g. 359%). Seed with the round-0 cartesian count; each probe a
+    // later round actually spawns bumps it, so the bar stays ≤100% (it dips when
+    // a new round adds work — honest recursive-scan behaviour).
+    let initial_total = hosts.len() * words.len();
+    let total_probes = Arc::new(AtomicUsize::new(initial_total));
     eprintln!(
         "[+] fuzz: {} hosts × {} paths = {} probes (threads={}, retries={}, wildcard={})",
         hosts.len(),
         words.len(),
-        total_probes,
+        initial_total,
         cfg.threads,
         cfg.retries,
         wildcard_policy.as_str(),
@@ -1209,7 +1216,7 @@ pub async fn run(
     let progress_task = {
         let counter = completed_counter.clone();
         let done = progress_done.clone();
-        let total = total_probes;
+        let total = total_probes.clone();
         let started_at = started;
         tokio::spawn(async move {
             use std::io::Write as _;
@@ -1219,12 +1226,13 @@ pub async fn run(
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 let completed = counter.load(Ordering::Relaxed);
+                let total_now = total.load(Ordering::Relaxed);
                 if is_tty {
                     let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
                     let rps = completed as f64 / elapsed;
-                    let pct = (completed as f64 * 100.0 / total.max(1) as f64) as u32;
+                    let pct = (completed as f64 * 100.0 / total_now.max(1) as f64) as u32;
                     let eta_secs = if rps > 0.0 {
-                        ((total.saturating_sub(completed)) as f64 / rps) as u64
+                        ((total_now.saturating_sub(completed)) as f64 / rps) as u64
                     } else {
                         0
                     };
@@ -1232,7 +1240,7 @@ pub async fn run(
                     let _ = write!(
                         stderr,
                         "\r\x1b[K  [{}/{}] {}% | {:.0} rps | eta {}",
-                        completed, total, pct, rps, format_eta(eta_secs)
+                        completed, total_now, pct, rps, format_eta(eta_secs)
                     );
                     let _ = stderr.flush();
                 } else {
@@ -1241,7 +1249,7 @@ pub async fn run(
                     // ticker-task variant uses 500 so the cadence
                     // matches a TTY's ~100 ms refresh visually.)
                     if completed > 0 && completed % 500 == 0 {
-                        eprintln!("  [fuzz {}/{}]", completed, total);
+                        eprintln!("  [fuzz {}/{}]", completed, total_now);
                     }
                 }
             }
@@ -1439,6 +1447,8 @@ pub async fn run(
                     let disc_c = disc_tx.clone();
                     let pretries_c = panic_retries.clone();
                     let pfailed_c = panic_failed.clone();
+                    // Count this recursion probe into the live denominator.
+                    total_probes.fetch_add(1, Ordering::Relaxed);
                     let permit = sem_c.acquire_owned().await.ok();
                     tasks.push(tokio::spawn(async move {
                         let _p = permit;
@@ -1493,6 +1503,8 @@ pub async fn run(
                 let disc_c = disc_tx.clone();
                 let pretries_c = panic_retries.clone();
                 let pfailed_c = panic_failed.clone();
+                // Count this crawl probe into the live denominator.
+                total_probes.fetch_add(1, Ordering::Relaxed);
                 let permit = sem_c.acquire_owned().await.ok();
                 tasks.push(tokio::spawn(async move {
                     let _p = permit;
@@ -1525,13 +1537,14 @@ pub async fn run(
         // exited before catching the very-last counter increment).
         use std::io::Write as _;
         let final_completed = completed_counter.load(Ordering::Relaxed);
+        let final_total = total_probes.load(Ordering::Relaxed);
         let elapsed = started.elapsed().as_secs_f64().max(0.001);
         let rps = final_completed as f64 / elapsed;
         let mut stderr = std::io::stderr();
         let _ = write!(
             stderr,
             "\r\x1b[K  [{}/{}] 100% | {:.0} rps | eta 0s",
-            final_completed, total_probes, rps
+            final_completed, final_total, rps
         );
         let _ = stderr.flush();
         // Newline so the "[+] fuzz done" line doesn't get appended onto
@@ -1544,11 +1557,12 @@ pub async fn run(
         let _ = f.flush();
     }
     let elapsed = started.elapsed().as_secs_f64();
+    let executed = total_probes.load(Ordering::Relaxed);
     eprintln!(
         "[+] fuzz done: {} probes in {:.2}s ({:.0} rps avg) → {}",
-        total_probes,
+        executed,
         elapsed,
-        (total_probes as f64) / elapsed.max(0.001),
+        (executed as f64) / elapsed.max(0.001),
         output_path,
     );
     // v0.4.5 — honest accounting of the wreq pool-panic race (if any fired).
