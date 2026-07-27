@@ -58,12 +58,23 @@ const EMBEDDED_FINGERPRINTS: &str = include_str!("../fingerprints.json");
   httpxer -l hosts.txt --no-cdn --no-tech         fast: skip CDN + tech-detect\n  \
   httpxer -l hosts.txt --httpx-compat -o out.json httpx-shaped JSON (drop-in)\n  \
   cat subs.txt | httpxer -l - -o live.json        pipe from subfinder/amass\n\n\
-\x1b[1mDIRECTORY FUZZING\x1b[0m\n  \
-  httpxer -u https://t.com -w big.txt -i 200,301,302,307,308\n  \
-  httpxer -u https://t.com -w a.txt,b.txt         multiple wordlists (comma)\n  \
-  httpxer -u https://t.com -w w.txt -r -R 3       recurse into found dirs\n  \
-  httpxer -u https://t.com -w w.txt --crawl       + crawl HTML/robots/sitemap\n  \
-  httpxer -u https://t.com -w w.txt --safe        disable 401/403 bypass probes\n\n\
+\x1b[1mDIRECTORY BRUTEFORCE\x1b[0m\n  \
+  \x1b[2m# start here — sane defaults, wildcard auto-suppressed\x1b[0m\n  \
+  httpxer -u https://t.com -w common.txt -o found.txt\n\n  \
+  \x1b[2m# hide 401/403 auth walls, keep real hits\x1b[0m\n  \
+  httpxer -u https://t.com -w common.txt -i 200,301,302,307,308 -o found.txt\n\n  \
+  \x1b[2m# several wordlists at once (comma-separated, merged + deduped)\x1b[0m\n  \
+  httpxer -u https://t.com -w admin.txt,api.txt,backup.txt -o found.txt\n\n  \
+  \x1b[2m# recurse 3 levels into every directory found\x1b[0m\n  \
+  httpxer -u https://t.com -w common.txt -r -R 3 --r200 -o found.txt\n\n  \
+  \x1b[2m# full recon: recursion + crawl HTML/robots.txt/sitemap.xml\x1b[0m\n  \
+  httpxer -u https://t.com -w common.txt -r -R 3 --crawl -o found.txt\n\n  \
+  \x1b[2m# behind auth\x1b[0m\n  \
+  httpxer -u https://t.com -w common.txt --bearer $TOKEN -o found.txt\n\n  \
+  \x1b[2m# many hosts from a file, slow + polite\x1b[0m\n  \
+  httpxer -l hosts.txt -w common.txt -t 50 --rl 10 -o found.txt\n\n  \
+  \x1b[2m# out-of-scope program? turn the 401/403 bypass probes off\x1b[0m\n  \
+  httpxer -u https://t.com -w common.txt --safe -o found.txt\n\n\
 \x1b[1mAUTHENTICATED SCANS\x1b[0m  (work in BOTH modes)\n  \
   httpxer -u https://t.com --bearer $TOKEN -w w.txt\n  \
   httpxer -u https://t.com -H 'X-API-Key: k' --cookie 'sid=abc'\n\n\
@@ -72,6 +83,12 @@ const EMBEDDED_FINGERPRINTS: &str = include_str!("../fingerprints.json");
   -i 200,301,302,307,308     only these codes (hides 401/403 auth walls)\n  \
   --exclude-root-size        drop pages the size of the homepage\n  \
   --exclude-sizes 1234,5678  drop exact byte sizes\n\n\
+\x1b[1mSHORT FORMS\x1b[0m  (long names all still work)\n  \
+  --wp  wildcard-policy    --md  max-dirs-per-host   --to  timeout-ms\n  \
+  --rd  recursion-depth    --xa  add-excludes        --mr  max-redirects\n  \
+  --es  exclude-sizes      --xm  exclude-mode        --rl  rate-limit\n  \
+  --ers exclude-root-size  --cd  crawl-depth         --bp  body-preview\n  \
+  --r200/--r403 recurse-on-200/403                   --rh  response-headers\n\n\
 \x1b[1mOUTPUT\x1b[0m\n  \
   -o out.json    NDJSON, one record per line (default)\n  \
   -o out.txt     plain 'STATUS SIZE URL' lines (auto-detected from .txt)\n  \
@@ -97,28 +114,23 @@ struct Args {
     threads: usize,
 
     /// Per-probe HTTP timeout (ms)
-    #[arg(long, default_value_t = 5000)]
+    #[arg(visible_alias = "to", long, default_value_t = 5000)]
     timeout_ms: u64,
 
     /// Don't follow redirects (default: follow up to --max-redirects hops, matches httpx -fr)
-    #[arg(long)]
+    #[arg(visible_alias = "nfr", long)]
     no_follow_redirects: bool,
 
-    /// Maximum redirect hops to follow when redirect-following is on.
-    /// Matches httpx's `-mr` default of 10. Multi-hop SSO flows
-    /// (corporate-managed Google → Okta SAML, etc.) commonly need 4-6 hops
-    /// before the final auth page resolves — the previous default of 3 was
-    /// stopping at the IdP-handoff page and missing the destination tech
-    /// stack (e.g. `Okta:x.y.z`, `Nginx` on okta.com).
-    #[arg(long, default_value_t = 10)]
+    /// (enrich) Max redirect hops to chase. SSO chains often need 4-6.
+    #[arg(visible_alias = "mr", long, default_value_t = 10)]
     max_redirects: usize,
 
     /// Concurrent DNS lookups
-    #[arg(long, default_value_t = 100)]
+    #[arg(visible_alias = "dc", long, default_value_t = 100)]
     dns_concurrency: usize,
 
     /// DNS timeout per lookup (seconds)
-    #[arg(long, default_value_t = 3)]
+    #[arg(visible_alias = "dt", long, default_value_t = 3)]
     dns_timeout: u64,
 
     /// Embed in every output record under "domain"
@@ -126,11 +138,11 @@ struct Args {
     domain: Option<String>,
 
     /// Embed in every output record under "scan_id"
-    #[arg(long)]
+    #[arg(visible_alias = "sid", long)]
     scan_id: Option<String>,
 
     /// Embed in every output record under "source_tools" (e.g. "subfinder,amass")
-    #[arg(long)]
+    #[arg(visible_alias = "stools", long)]
     source_tools: Option<String>,
 
     /// Skip CDN range fetching (cdn field will always be empty)
@@ -153,14 +165,14 @@ struct Args {
     /// see a non-Chrome JA4 fingerprint, which is fine on un-fronted targets
     /// and a few % faster on cold-start. Default: impersonate Chrome/Firefox/
     /// Safari/Edge with a random profile per probe.
-    #[arg(long)]
+    #[arg(visible_alias = "ni", long)]
     no_impersonate: bool,
 
     /// Include response body (capped at 2 MiB) in each output record under
     /// the `body` field. Useful for debugging fingerprint-echo endpoints
     /// (tls.peet.ws, ja3er.com) or archiving raw HTML. Off by default —
     /// keeps output files small.
-    #[arg(long)]
+    #[arg(visible_alias = "wb", long)]
     with_body: bool,
 
     /// Emit enrich-mode records in ProjectDiscovery httpx's JSON shape
@@ -171,7 +183,7 @@ struct Args {
     /// `webserver` is emitted alongside `server`; `host_ip` is added as
     /// the first A record (or first AAAA when no A is present).
     /// Inert in fuzz mode (the fuzz schema is already httpx-shaped).
-    #[arg(long = "httpx-compat")]
+    #[arg(long = "httpx-compat", visible_alias = "hc")]
     httpx_compat: bool,
 
     // ── Fuzz-mode flags (v0.3.0+) ──────────────────────────────────────
@@ -204,7 +216,7 @@ struct Args {
 
     /// (fuzz) Body preview length in bytes (HTML-entity-encoded in output)
     #[arg(
-        long = "body-preview",
+        long = "body-preview", visible_alias = "bp",
         default_value_t = 8192,
         help_heading = "Fuzz mode"
     )]
@@ -212,7 +224,7 @@ struct Args {
 
     /// (fuzz) Wildcard suppression policy: strict|mark|off
     #[arg(
-        long = "wildcard-policy",
+        long = "wildcard-policy", visible_alias = "wp",
         default_value = "strict",
         help_heading = "Fuzz mode"
     )]
@@ -229,7 +241,7 @@ struct Args {
     safe: bool,
 
     /// (fuzz) Per-host requests/sec ceiling. 0 = disabled (default).
-    #[arg(long = "rate-limit", default_value_t = 0.0, help_heading = "Fuzz mode")]
+    #[arg(long = "rate-limit", visible_alias = "rl", default_value_t = 0.0, help_heading = "Fuzz mode")]
     rate_limit: f64,
 
     /// (fuzz) Retry count on network error
@@ -237,7 +249,7 @@ struct Args {
     retries: u32,
 
     /// (fuzz) Emit status_code=0 records (connection errors). Off by default.
-    #[arg(long = "include-errors", help_heading = "Fuzz mode")]
+    #[arg(long = "include-errors", visible_alias = "ie", help_heading = "Fuzz mode")]
     include_errors: bool,
 
     /// (fuzz) Status codes to EXCLUDE from output (default `429,503` —
@@ -268,22 +280,22 @@ struct Args {
     /// (recursion) Max depth. Default 3 when `-r` is on.
     #[arg(
         short = 'R',
-        long = "recursion-depth",
+        long = "recursion-depth", visible_alias = "rd",
         default_value_t = 3,
         help_heading = "Recursion"
     )]
     recursion_depth: u8,
 
     /// (recursion) Also recurse on 200 + autoindex marker (`Index of /`).
-    #[arg(long = "recurse-on-200", help_heading = "Recursion")]
+    #[arg(long = "recurse-on-200", visible_alias = "r200", help_heading = "Recursion")]
     recurse_on_200: bool,
 
     /// (recursion) Also recurse on 403 (off by default — WAF noise prone).
-    #[arg(long = "recurse-on-403", help_heading = "Recursion")]
+    #[arg(long = "recurse-on-403", visible_alias = "r403", help_heading = "Recursion")]
     recurse_on_403: bool,
 
     /// (recursion) Hard cap on discovered directories per input host.
-    #[arg(long = "max-dirs-per-host", default_value_t = 200, help_heading = "Recursion")]
+    #[arg(long = "max-dirs-per-host", visible_alias = "md", default_value_t = 200, help_heading = "Recursion")]
     max_dirs_per_host: usize,
 
     /// REMOVED in v0.5.0 — was never enforced. The counter behind it
@@ -298,12 +310,12 @@ struct Args {
     /// (recursion) Override the built-in --exclude-subdirs default list
     /// (asset/traversal noise). Comma-separated. Empty string = disable
     /// excludes entirely.
-    #[arg(long = "exclude-subdirs", help_heading = "Recursion")]
+    #[arg(long = "exclude-subdirs", visible_alias = "xs", help_heading = "Recursion")]
     exclude_subdirs: Option<String>,
 
     /// (recursion) Append to the built-in --exclude-subdirs list
     /// (doesn't replace defaults; just adds).
-    #[arg(long = "add-excludes", help_heading = "Recursion")]
+    #[arg(long = "add-excludes", visible_alias = "xa", help_heading = "Recursion")]
     add_excludes: Option<String>,
 
     /// (recursion) How exclude entries match: `segment` (default — last
@@ -311,13 +323,13 @@ struct Args {
     /// (any entry appears anywhere in the path). Substring is dirsearch-
     /// muscle-memory compat and catches encoded traversal noise
     /// (`%2e%2e`, `%3b`, `..//`) hidden mid-path.
-    #[arg(long = "exclude-mode", default_value = "segment", help_heading = "Recursion")]
+    #[arg(long = "exclude-mode", visible_alias = "xm", default_value = "segment", help_heading = "Recursion")]
     exclude_mode: String,
 
     /// (fuzz) Exact content-length(s) to drop from output. Comma-separated
     /// bytes — accepts trailing `B`. Mirrors dirsearch `--exclude-sizes`.
     /// Empty = no size filter.
-    #[arg(long = "exclude-sizes", default_value = "", help_heading = "Fuzz mode")]
+    #[arg(long = "exclude-sizes", visible_alias = "es", default_value = "", help_heading = "Fuzz mode")]
     exclude_sizes: String,
 
     /// (fuzz) Probe `/` once at startup and add its content-length to
@@ -325,7 +337,7 @@ struct Args {
     /// that return the homepage for every path (a pattern the wildcard
     /// detector usually catches, but this is the explicit dirsearch
     /// pattern from `ROOT_SIZE=$(curl ...)`).
-    #[arg(long = "exclude-root-size", help_heading = "Fuzz mode")]
+    #[arg(long = "exclude-root-size", visible_alias = "ers", help_heading = "Fuzz mode")]
     exclude_root_size: bool,
 
     /// Output file format. `json` (default) writes one full FuzzRecord
@@ -365,11 +377,11 @@ struct Args {
     crawl: bool,
 
     /// (crawl) Max crawl depth. Default = `--recursion-depth`.
-    #[arg(long = "crawl-depth", help_heading = "Crawl")]
+    #[arg(long = "crawl-depth", visible_alias = "cd", help_heading = "Crawl")]
     crawl_depth: Option<u8>,
 
     /// (crawl) Cap on URLs extracted per response (default 200).
-    #[arg(long = "max-links-per-page", default_value_t = 200, help_heading = "Crawl")]
+    #[arg(long = "max-links-per-page", visible_alias = "mlp", default_value_t = 200, help_heading = "Crawl")]
     max_links_per_page: usize,
 
     /// (crawl) Override the same-host default scope. Comma-separated host
@@ -382,7 +394,7 @@ struct Args {
     // ── Misc fuzz behavior (v0.3.7) ────────────────────────────────────
     /// (fuzz) Follow redirects within fuzz probes (3xx normally a finding).
     /// Auto-on when `--crawl` is set.
-    #[arg(long = "fuzz-follow-redirects", help_heading = "Fuzz mode")]
+    #[arg(long = "fuzz-follow-redirects", visible_alias = "ffr", help_heading = "Fuzz mode")]
     fuzz_follow_redirects: bool,
 
     // ── Auth (v0.3.7) ──────────────────────────────────────────────────
@@ -433,7 +445,7 @@ struct Args {
     yes: bool,
 
     /// Suppress the "update available" startup banner
-    #[arg(long, help_heading = "Self-management")]
+    #[arg(visible_alias = "nuc", long, help_heading = "Self-management")]
     no_update_check: bool,
 
     /// Quiet mode (alias for --no-update-check + --no-art — useful when piping)
