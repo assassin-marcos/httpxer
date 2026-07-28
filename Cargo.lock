@@ -1055,7 +1055,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "httpxer"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1068,6 +1068,7 @@ dependencies = [
  "ipnetwork",
  "md-5",
  "once_cell",
+ "psl",
  "regex",
  "self_update",
  "serde",
@@ -1667,6 +1668,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "psl"
+version = "2.1.223"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0dedad316e05de220cbf3fd8bfb69f3df8755dde2d7d479211827b595168a93"
+dependencies = [
+ "psl-types",
 ]
 
 [[package]]

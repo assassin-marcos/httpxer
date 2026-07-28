@@ -137,6 +137,46 @@ Pass `-r` (recursion) and/or `--crawl` to turn the host × wordlist single pass 
 
 Both share a visited-set + a per-host **directory** budget (`--max-dirs-per-host`, default 200) so recursion never blows up on adversarial targets. Each discovered directory costs a full wordlist pass, so that cap — together with `-R` depth — is what actually bounds a recursive scan.
 
+## Host-derived backup discovery (auto-on in fuzz mode)
+
+Site owners leave archives on the web root named after the site itself — `www.example.com.zip`, `example.com.sql`, `example.zip`. **No wordlist can carry these**, because the filename is a function of the target's own hostname. httpxer derives them per-host at runtime.
+
+Runs automatically whenever a wordlist is set. Pass `--no-backup-fuzz` to turn it off.
+
+```sh
+# Auto — nothing to enable
+httpxer -u https://example.com -w paths.txt
+
+# Preview candidates, send zero requests
+httpxer -u https://example.com -w paths.txt --backup-dry-run
+
+# Add a name the hostname can't reveal (internal project name)
+httpxer -u https://shop.example.io -w paths.txt --backup-tokens acmecorp,internal-portal
+```
+
+**13 token rules** per host — full host, `www.`-stripped, registrable domain (real Public Suffix List, so `abc.co.uk` doesn't collapse to `co.uk`), SLD alone, dot→underscore/hyphen/removed variants, leftmost label, sub+SLD concatenations, and the current path segment. Ports are stripped: a backup is named after the site, never the socket. Crossed with ~80 extensions across 8 classes (archive, backup marker, database, Java package, disk image, compound, separator, date-stamped).
+
+Everything is decided at runtime:
+
+- **Extension ordering follows the detected stack.** One request reads `Server`, `X-Powered-By` and a body snippet → Java / PHP / .NET / Node / Python / Unknown. Detection **reorders but never excludes** — a misread costs ordering, never a whole finding category.
+- **Budget scales with responsiveness.** <400 ms → 300 candidates, <1.2 s → 180, <3 s → 100, slower → 50. Hard ceiling 300/host, so it can't run away on a large scope.
+- **Backup directories are proven before expansion.** Two HEADs for `backup/` and `bak/`; the other 17 prefixes are only tried if one exists (200 or 403 both count).
+- **Root and current directory both probed**, deduped when identical.
+
+**Zero-false-positive gate.** Naive backup scanning drowns in soft-404s — sites that answer `200 OK` with an HTML "not found" page for any filename. Every candidate must clear all of:
+
+- Status `200`/`206` only (`401`/`403` are surfaced as REVIEW, never CONFIRMED; a `302` to a login page is not a finding — redirects aren't followed)
+- Soft-404 baseline calibrated from 3 impossible filenames per host; ≥0.95 body similarity is discarded
+- Content-Type sanity — `text/html` on a `.zip`/`.sql`/`.db` is discarded unless the bytes say otherwise
+- **Magic bytes** — ZIP `50 4B 03 04`, GZIP `1F 8B`, BZIP2, XZ, 7Z, RAR, TAR `ustar`@257, `SQLite format 3`, MS Access — or a plaintext SQL-dump marker
+- Edge-security interstitials (challenge/blocked pages) filtered out
+
+Only `status OK + size OK + (magic OR SQL text) + baseline-dissimilar` reaches **CONFIRMED**. Everything else lands in a **REVIEW** bucket instead of your findings.
+
+**Bandwidth-safe.** `HEAD` first; only a promising result earns a ranged `GET` for the first 1024 bytes. The archive itself is never downloaded — a 4 GB `backup.tar.gz` costs ~1 KB to confirm.
+
+Findings go to `<output>.backup.jsonl` (15 fields incl. `base_type`, `magic_matched`, `baseline_similarity`, `confidence`, `verdict`), plus a terminal table for CONFIRMED only.
+
 ## 401/403 bypass (native, auto, content-confirmed)
 
 When a probe hits `401`/`403`, httpxer automatically retries it with a small, conservative battery of access-control bypass techniques — **on the forbidden resource only, never on every request**:
@@ -226,6 +266,9 @@ httpxer ... --cookie "sid=abc123" --cookie "csrf=token"
 | `--bearer <TOK>` | — | `Authorization: Bearer TOK` |
 | `--cookie "K=V"` | — | Cookie (repeatable; jar persists) |
 | `--fuzz-follow-redirects` | off (auto-on with `--crawl`) | Follow redirects in fuzz mode |
+| `--no-backup-fuzz` | backup discovery on | Disable host-derived backup discovery |
+| `--backup-dry-run` | off | Print backup candidates, send no requests |
+| `--backup-tokens <LIST>` | — | Extra base-name tokens the hostname can't reveal |
 | `--httpx-compat` | off | Enrich output in httpx JSON shape |
 | `--with-body` | off | Include response body (≤2 MiB) |
 | `--no-live` | live on | Suppress live findings stream on stderr |

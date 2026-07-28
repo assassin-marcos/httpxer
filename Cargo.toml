@@ -1,6 +1,6 @@
 [package]
 name = "httpxer"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 description = "Native httpx-replacement: enrichment + path-fuzz with browser-grade TLS impersonation, wildcard auto-suppress, Wappalyzer tech-detect. One static binary."
 license = "MIT"
@@ -82,6 +82,7 @@ self_update = { version = "0.41", default-features = false, features = ["rustls"
 # --check-update to spot the "tag pushed, release CI still building"
 # window where the Releases API doesn't show the new version yet.
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+psl = "2.1.223"
 
 [profile.release]
 lto = "thin"

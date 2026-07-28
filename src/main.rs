@@ -24,6 +24,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 
 mod auth;
+mod backup_fuzz;
 mod bypass;
 mod cdn;
 mod crawl;
@@ -250,6 +251,31 @@ struct Args {
     /// (fuzz) Emit status_code=0 records (connection errors). Off by default.
     #[arg(long = "include-errors", visible_alias = "ie", help_heading = "Fuzz mode")]
     include_errors: bool,
+
+    // ── Host-derived backup discovery (v0.6.0) ──────────────────────────
+    // Runs automatically in fuzz mode. A wordlist cannot express
+    // `www.target.com.zip` because the name depends on the target's own
+    // host, so those candidates are generated per-host at runtime.
+    //
+    // Everything this mode does is decided at runtime from what the host
+    // actually is: extension ordering follows the detected stack, the
+    // candidate budget scales with how fast the host answers, and backup
+    // directories are only expanded into after one is shown to exist. The
+    // three flags below are the only decisions a human can usefully make.
+    /// (backup) Turn OFF host-derived backup probing.
+    #[arg(long = "no-backup-fuzz", help_heading = "Backup discovery")]
+    no_backup_fuzz: bool,
+
+    /// (backup) Print the candidates that would be probed and send no
+    /// requests.
+    #[arg(long = "backup-dry-run", help_heading = "Backup discovery")]
+    backup_dry_run: bool,
+
+    /// (backup) Extra base-name tokens, comma-separated. The one thing the
+    /// tool cannot infer: an internal project name unrelated to the
+    /// hostname (e.g. `--backup-tokens acmecorp,internal-portal`).
+    #[arg(long = "backup-tokens", value_name = "LIST", help_heading = "Backup discovery")]
+    backup_tokens: Option<String>,
 
     /// (fuzz) Status codes to EXCLUDE from output (default `429,503` —
     /// transient overload). Empty to disable. 403/404 are NOT in the
@@ -1126,6 +1152,12 @@ async fn main() -> Result<()> {
         let words = fuzz::read_words(paths_path)?;
         eprintln!("[+] wordlist: {} unique paths", words.len());
 
+        // Host-derived backup discovery is ON by default in fuzz mode: the
+        // per-host archive names a wordlist structurally cannot carry are
+        // exactly the ones worth trying while we are already probing this
+        // host. `--no-backup-fuzz` opts out.
+        let backup_enabled = !args.no_backup_fuzz;
+
         // Build wildcard policy from flags. `--no-wildcard` overrides.
         let policy = fuzz::WildcardPolicy::from_cli(&args.wildcard_policy, args.no_wildcard)?;
 
@@ -1136,6 +1168,40 @@ async fn main() -> Result<()> {
             eprintln!("[+] TLS impersonation: rotating real-browser JA3/JA4 + HTTP/2 fingerprints");
         } else {
             eprintln!("[+] TLS impersonation: DISABLED (--no-impersonate)");
+        }
+
+        // Backup phase runs before the wordlist sweep so a jackpot archive
+        // surfaces immediately rather than after a long path scan.
+        if backup_enabled {
+            let opts = backup_fuzz::PhaseOpts {
+                cfg: backup_fuzz::BackupCfg {
+                    token_extra: args
+                        .backup_tokens
+                        .as_deref()
+                        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
+                        .unwrap_or_default(),
+                    current_year: chrono::Utc::now().format("%Y").to_string().parse().unwrap_or(2026),
+                    ..Default::default()
+                },
+                dry_run: args.backup_dry_run,
+                concurrency: args.threads,
+            };
+            eprintln!(
+                "[+] backup discovery: host-derived candidates, auto-tuned per host{}",
+                if args.backup_dry_run { " [dry-run]" } else { "" }
+            );
+            let found = backup_fuzz::run_phase(&hosts, &opts).await;
+            if !found.is_empty() {
+                backup_fuzz::print_confirmed_table(&found);
+                let path = format!("{}.backup.jsonl", output_path);
+                let mut buf = String::new();
+                for f in &found {
+                    buf.push_str(&serde_json::to_string(f)?);
+                    buf.push('\n');
+                }
+                std::fs::write(&path, buf)?;
+                eprintln!("[+] backup findings: {} → {}", found.len(), path);
+            }
         }
 
         // -i / --include is a dirsearch-style alias for --match-codes.
