@@ -1,23 +1,27 @@
-//! Recursion guards — strict directory detection + loop prevention.
+//! Recursion guards — strict directory detection + recursion bounds.
 //!
-//! Three concerns this module owns:
+//! Two concerns this module owns:
 //!   1. **Directory detection** — given a probe response, decide whether
 //!      it signals "I'm a directory worth recursing into". Conservative
 //!      by default (only 301/302/307/308 with `Location == URL+"/"` parity).
-//!   2. **Self-similarity loop detection** — before enqueueing a new dir,
-//!      check that the tail K path segments don't repeat an existing
-//!      visited pattern. Catches `/admin/admin/admin/` cycles and
-//!      `/foo/bar/foo/bar/` mutual-recursion patterns.
-//!   3. **Per-host probe + dir budgets** — atomic counters that hard-cap
-//!      total HTTP requests and discovered directories per input host.
-//!      When hit, recursion stops for that host with a stderr warning.
+//!   2. **Per-host dir budget** — an atomic counter that hard-caps how many
+//!      discovered directories per input host enter the recursion frontier
+//!      (`--max-dirs-per-host`). When hit, recursion stops for that host with
+//!      a stderr warning.
+//!
+//! NOT provided: self-similarity / path-loop detection. A `/admin/admin/…`
+//! or `/foo/bar/foo/bar/…` cycle is NOT specifically detected. What actually
+//! bounds a runaway recursion is the combination of `--recursion-depth`
+//! (hard depth ceiling), `--max-dirs-per-host` (breadth ceiling), and the
+//! visited-URL dedupe in `fuzz.rs`. An earlier self-similarity detector
+//! existed here but was never wired into the scan path, so it is gone rather
+//! than left as a guard that looks live and isn't.
 //!
 //! The smart `--exclude-subdirs` default list lives here too — built-in
 //! asset/traversal noise that the user shouldn't have to specify.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 /// Built-in default exclude list — paths we never recurse into AND
 /// (when `ExcludeMode::Substring` is active) never even probe.
@@ -250,96 +254,13 @@ pub fn build_exclude_set(
 }
 
 /// Inspect a URL's path and return its last non-empty segment, lowercased.
-/// Used by the exclude check + the self-similarity detector.
+/// Used by the `--exclude-subdirs` segment-mode check.
 pub fn last_path_segment(url: &str) -> Option<String> {
     let path = url::Url::parse(url).ok()?.path().to_string();
     path.trim_matches('/')
         .rsplit('/')
         .find(|s| !s.is_empty())
         .map(|s| s.to_ascii_lowercase())
-}
-
-/// Self-similarity loop detector. Returns `true` if the last `window` path
-/// segments of `candidate` repeat any consecutive `window` segments that
-/// have already been seen in any previously-enqueued URL for this host.
-///
-/// Catches:
-///   - `/admin/admin/admin/` (window=1 catches this)
-///   - `/foo/bar/foo/bar/` (window=2 catches this)
-///   - `/api/v1/api/v1/users/` (window=2 catches this)
-///
-/// `visited_segments_index` is a precomputed index of `(host, segment_pair)`
-/// from prior enqueues — caller maintains it.
-pub fn is_self_similar(
-    candidate_url: &str,
-    visited_segments_index: &Mutex<HashSet<Vec<String>>>,
-    window: usize,
-) -> bool {
-    let Some(segs) = path_segments(candidate_url) else {
-        return false;
-    };
-    if segs.len() < window {
-        // Tail doesn't even exist — can't form a window to compare.
-        return false;
-    }
-    let tail: Vec<String> = segs[segs.len() - window..]
-        .iter()
-        .map(|s| s.to_ascii_lowercase())
-        .collect();
-    // Within-URL self-repeat check — needs at least two windows of
-    // segments (one for the tail + one earlier slot to compare against).
-    if segs.len() >= window * 2 {
-        for start in 0..=segs.len() - window * 2 {
-            let earlier: Vec<String> = segs[start..start + window]
-                .iter()
-                .map(|s| s.to_ascii_lowercase())
-                .collect();
-            if earlier == tail {
-                return true;
-            }
-        }
-    }
-    // Cross-URL check — independent of within-URL length; if the tail
-    // matches any window-pair we've seen from a different URL, that's a
-    // sibling-loop signal.
-    if let Ok(idx) = visited_segments_index.lock() {
-        if idx.contains(&tail) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Index update — call after enqueueing a URL so future self-similarity
-/// checks can detect cross-URL loops.
-pub fn index_segments(url: &str, visited_segments_index: &Mutex<HashSet<Vec<String>>>, window: usize) {
-    let Some(segs) = path_segments(url) else { return };
-    if segs.len() < window {
-        return;
-    }
-    let mut idx = match visited_segments_index.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    for start in 0..=segs.len().saturating_sub(window) {
-        let pair: Vec<String> = segs[start..start + window]
-            .iter()
-            .map(|s| s.to_ascii_lowercase())
-            .collect();
-        idx.insert(pair);
-    }
-}
-
-fn path_segments(url: &str) -> Option<Vec<String>> {
-    let parsed = url::Url::parse(url).ok()?;
-    let path = parsed.path().to_string();
-    let segs: Vec<String> = path
-        .trim_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
-    Some(segs)
 }
 
 /// Strict directory detector. Returns `Some(dir_url_with_trailing_slash)`
@@ -655,46 +576,6 @@ mod tests {
             last_path_segment("https://x.com/").as_deref(),
             None
         );
-    }
-
-    #[test]
-    fn self_similar_within_url_detected() {
-        let idx = Mutex::new(HashSet::new());
-        // /admin/admin/admin/ has tail "admin" repeating earlier "admin"
-        assert!(is_self_similar(
-            "https://x.com/admin/admin/admin/",
-            &idx,
-            1
-        ));
-        // /foo/bar/foo/bar/ — tail "foo/bar" repeats earlier
-        assert!(is_self_similar(
-            "https://x.com/foo/bar/foo/bar/",
-            &idx,
-            2
-        ));
-        // /admin/users/posts/ — no repeat
-        assert!(!is_self_similar(
-            "https://x.com/admin/users/posts/",
-            &idx,
-            2
-        ));
-    }
-
-    #[test]
-    fn index_then_detect_cross_url_loop() {
-        let idx = Mutex::new(HashSet::new());
-        index_segments("https://x.com/admin/api/", &idx, 2);
-        // Different URL but the tail matches an indexed pair → loop.
-        // Actually only detected when the tail of the candidate matches
-        // exactly the indexed window. /api/admin/ has tail "admin" or
-        // "api/admin" depending on window; we used window=2 so the tail
-        // would be the last 2 segs.
-        // /a/b/admin/api → tail [admin, api] — matches indexed pair.
-        assert!(is_self_similar(
-            "https://x.com/something/admin/api",
-            &idx,
-            2
-        ));
     }
 
     #[test]

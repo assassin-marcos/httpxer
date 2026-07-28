@@ -3,10 +3,14 @@
 //! Three knobs the user can drive:
 //!   - `-H / --header "Name: Value"` — repeatable static header
 //!   - `--bearer TOKEN` — shortcut for `Authorization: Bearer TOKEN`
-//!   - `--cookie "Name=Value"` — repeatable, attaches as the initial cookie
-//!     jar contents. The wreq client is built with `.cookie_store(true)` so
-//!     Set-Cookie responses persist for subsequent requests to the same
-//!     domain within one scan.
+//!   - `--cookie "Name=Value"` — repeatable; all pairs are joined into ONE
+//!     fixed `Cookie:` header replayed verbatim on every request.
+//!
+//! There is no cookie jar. The wreq clients in `probe::init_pool` are built
+//! WITHOUT `.cookie_store(true)`, so a `Set-Cookie` in a response is never
+//! ingested and never sent back on a later request. `--cookie` is therefore a
+//! static credential replay, not a session: if the target hands out a session
+//! cookie mid-scan, subsequent probes will NOT carry it.
 //!
 //! The parsed headers/cookies are stored once on the `AuthCtx` and applied
 //! at request-build time inside `dispatch_one`. Validation happens at CLI
@@ -22,9 +26,9 @@ use wreq::header::{HeaderMap, HeaderName, HeaderValue};
 pub struct AuthCtx {
     /// Pre-validated headers ready to splat onto every request.
     pub headers: HeaderMap,
-    /// Initial cookie pairs — wreq's cookie_store ingests these on the
-    /// first request that matches the cookie's domain (or the request
-    /// URL's domain when no domain is set on the cookie).
+    /// Cookie pairs from `--cookie`. Joined into a single `Cookie:` header
+    /// (see `initial_cookie_header`) and sent unchanged on every request —
+    /// no jar, no per-domain matching, no `Set-Cookie` ingestion.
     pub initial_cookies: Vec<(String, String)>,
 }
 

@@ -95,6 +95,14 @@ struct FuzzRecord {
         default
     )]
     response_headers: Vec<(String, String)>,
+    /// ALWAYS an empty array in fuzz mode. Wappalyzer tech-detect is an
+    /// enrich-mode-only stage; fuzz mode never loads the fingerprint engine,
+    /// so there is nothing to populate this with and `--no-tech` /
+    /// `--fingerprints` have no effect on it. The key is still emitted (rather
+    /// than `skip_serializing_if`-gated) purely for schema stability —
+    /// downstream consumers have always seen `"tech":[]` on fuzz records and
+    /// dropping the key would break anyone indexing it unconditionally.
+    /// If you need tech data for a path, re-run that URL through enrich mode.
     tech: Vec<String>,
     method: &'static str,
     is_wildcard: bool,
@@ -130,6 +138,21 @@ struct FuzzRecord {
     /// JSON byte-compatible for the common (non-bypass) case.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     bypass: Option<String>,
+
+    // ── Pipeline provenance tags (`--domain` / `--scan-id` / `--source-tools`)
+    // Enrich mode has always embedded these; fuzz mode used to drop them
+    // silently. All three are `skip_serializing_if`-gated, so a run that
+    // passes none of the flags emits byte-identical JSON to before.
+    /// `--domain` — apex/root domain this scan belongs to.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    domain: Option<String>,
+    /// `--scan-id` — caller-supplied correlation id for the whole run.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    scan_id: Option<String>,
+    /// `--source-tools` — upstream tools that produced the input list
+    /// (e.g. "subfinder,amass").
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    source_tools: Option<String>,
 }
 
 fn is_u8_zero(v: &u8) -> bool {
@@ -214,13 +237,19 @@ enum Discovery {
 
 /// All fuzz-mode configuration unfurled from CLI flags.
 ///
-/// `wildcard_policy` and `timeout_ms` are kept in this struct (rather than
-/// inlined at the call site) so future extensions to fuzz mode have a
-/// single place to plug new knobs. They are intentionally not read in the
-/// current call path — `wildcard_policy` is passed separately to `run()`
-/// for clearer ownership, and `timeout_ms` is baked into the wreq pool
-/// before this struct is constructed.
-#[allow(dead_code)]
+/// Every field here is READ somewhere in the fuzz call path. There is
+/// deliberately no `#[allow(dead_code)]` on this struct: that attribute used
+/// to be here and it hid several write-only knobs from the compiler (a
+/// `max_probes_per_host` cap that nothing charged, a `similarity_window` that
+/// no loop detector consumed, and `exclude_subdirs` / `exclude_mode` /
+/// `wildcard_policy` copies that were shadowed by other call paths). A flag
+/// that reaches this struct and stops there is a silently-ignored flag, so
+/// let the dead-code lint be the tripwire.
+///
+/// Knobs that intentionally do NOT live here:
+///   - the working `WildcardPolicy` — passed as its own `run()` parameter;
+///   - `--exclude-subdirs` / `--exclude-mode` — applied in `main.rs` to the
+///     wordlist itself before `run()` is called, so fuzz never re-checks them.
 pub struct FuzzCfg {
     pub match_codes: Vec<u16>,
     /// Status codes to EXCLUDE from output even when they're in match_codes.
@@ -228,7 +257,6 @@ pub struct FuzzCfg {
     /// real findings. Empty = exclude nothing.
     pub exclude_codes: Vec<u16>,
     pub body_preview_bytes: usize,
-    pub wildcard_policy: WildcardPolicy,
     /// Wildcard pre-flight sample count. v0.3.7 default 3; all must agree
     /// on `(content_length, content_type, snippet_md5)` to trust the
     /// fingerprint. Disagreement → mark dir path-sensitive → skip recursion.
@@ -257,8 +285,6 @@ pub struct FuzzCfg {
     /// what actually bounds a recursive scan. v0.4.10 removed the companion
     /// `max_probes_per_host`, which was never enforced.
     pub max_dirs_per_host: usize,
-    /// Self-similarity window for loop detection (default 2). 0 = disabled.
-    pub similarity_window: usize,
     // ── Crawl (v0.3.7) ─────────────────────────────────────────────────
     pub crawl_enabled: bool,
     pub crawl_depth: u8,
@@ -266,17 +292,21 @@ pub struct FuzzCfg {
     pub crawl_sitemap: bool,
     pub max_links_per_page: usize,
     pub scope_hosts: Vec<String>,
-    /// Built-in + user-overridden subdirectory exclude list (lowercased).
-    pub exclude_subdirs: std::collections::HashSet<String>,
-    /// How exclude entries match — segment (default) or substring (v0.3.10).
-    pub exclude_mode: crate::recurse::ExcludeMode,
     /// Exact content-lengths to drop from output (v0.3.10 — dirsearch
     /// `--exclude-sizes` parity). Empty = no size filter.
     pub exclude_sizes: Vec<i64>,
     // ── Misc behavior (v0.3.7) ─────────────────────────────────────────
     /// Follow redirects within fuzz probes (default off — 3xx is a finding).
-    /// Auto-on when crawl_enabled (crawl needs terminal URL + body).
+    /// Auto-on when crawl_enabled (crawl needs terminal URL + body), unless
+    /// `--no-follow-redirects` was passed explicitly (that wins).
     pub fuzz_follow_redirects: bool,
+    /// Max redirect HOPS to chase when `fuzz_follow_redirects` is on — the
+    /// user's `--max-redirects` (default 10). Same unit as the enrich path
+    /// (`probe::http_probe_once`): `n` means "fetch the URL, then follow up
+    /// to `n` further 3xx". 0 = don't follow at all (the 3xx is returned as a
+    /// finding rather than surfacing as a TooManyRedirects error).
+    /// See `dispatch_one` for why this becomes `Policy::limited(n + 1)`.
+    pub max_redirects: usize,
     /// Cookie header to attach to every request (initial-state seed).
     /// Built from `--cookie name=value` entries.
     pub initial_cookie_header: Option<String>,
@@ -292,6 +322,14 @@ pub struct FuzzCfg {
     /// each emitted record (JSON `response_headers` object) and print it under
     /// each live finding on the terminal. Off by default (keeps output small).
     pub response_headers: bool,
+    // ── Pipeline provenance tags ───────────────────────────────────────
+    /// `--domain`, embedded in every emitted record. `None` = flag absent →
+    /// the JSON field is omitted entirely.
+    pub domain: Option<String>,
+    /// `--scan-id`, embedded in every emitted record. `None` = omitted.
+    pub scan_id: Option<String>,
+    /// `--source-tools`, embedded in every emitted record. `None` = omitted.
+    pub source_tools: Option<String>,
 }
 
 /// Wildcard-handling policy. `strict` (default) suppresses any record whose
@@ -749,6 +787,7 @@ async fn dispatch_one(
     extra_headers: &[(String, String)],
     initial_cookie_header: Option<&str>,
     follow_redirects: bool,
+    max_redirects: usize,
 ) -> Result<(ParsedResp, &'static str, String), String> {
     // Pin one TLS profile per host so the wildcard fingerprint computed at
     // pre-flight (snippet_md5 etc.) matches what the actual fuzz probes
@@ -759,8 +798,24 @@ async fn dispatch_one(
     // Redirect policy: per-request override. Crawl mode wants the terminal
     // body (so we can parse links from the final landing page); fuzz mode
     // default keeps 3xx as a finding.
-    let redirect_policy = if follow_redirects {
-        Policy::limited(10)
+    // Hop budget comes from the caller (`--max-redirects`). A 0 budget maps to
+    // "don't follow" so the 3xx stays a finding instead of surfacing as a
+    // TooManyRedirects error.
+    //
+    // `+ 1` is NOT a fudge factor. wreq's `Policy::limited(max)` compares
+    // against `attempt.previous.len()`, and `previous` already contains the
+    // ORIGINAL request URL when the first 3xx is evaluated
+    // (wreq-5.3.0/src/redirect.rs:136 — `if attempt.previous.len() >= max`),
+    // so `limited(n)` chases only `n - 1` hops. Verified against a local
+    // 2-hop chain (`/r1`→`/r2`→`/r3`): `limited(1)` errored on the FIRST
+    // redirect, `limited(2)` on the second, `limited(3)` was the first value
+    // that reached `/r3`. `--max-redirects` is documented (and implemented in
+    // `probe::http_probe_once`) as a count of redirect HOPS, so hops → limit
+    // is `hops + 1`. Without this, `--max-redirects 1 --crawl` turned every
+    // single 3xx into a "too many redirects" error record, which the default
+    // (no `--include-errors`) then dropped — silently losing findings.
+    let redirect_policy = if follow_redirects && max_redirects > 0 {
+        Policy::limited(max_redirects.saturating_add(1))
     } else {
         Policy::none()
     };
@@ -778,11 +833,12 @@ async fn dispatch_one(
     for (n, v) in extra_headers {
         req = req.header(n.as_str(), v.as_str());
     }
-    // Initial cookie seed — user-supplied via --cookie. Once wreq's
-    // cookie_store is enabled the response Set-Cookie persists for follow-up
-    // requests to the same domain. (v0.3.7 ships header-attach only;
-    // cookie_store wiring lands in v0.3.8 when the pool builder gets a
-    // .cookie_store(true) toggle.)
+    // User-supplied cookies via --cookie, attached as a fixed header. This is
+    // the WHOLE cookie story: the pool clients are built without
+    // `.cookie_store(true)`, so response Set-Cookie is never captured and the
+    // same static value goes out on every probe. (An earlier comment here
+    // promised jar wiring "in v0.3.8"; it was never implemented, and the
+    // stale promise was reading as if session persistence already worked.)
     if let Some(c) = initial_cookie_header {
         req = req.header("Cookie", c);
     }
@@ -931,6 +987,7 @@ async fn wildcard_preflight_probe(
         extra_headers,
         initial_cookie_header,
         false,
+        0, // unused: follow_redirects=false
     )
     .await
     {
@@ -1406,7 +1463,21 @@ pub async fn run(
             tasks.push(tokio::spawn(async move {
                 let _p = permit;
                 if limiter.enabled() {
-                    limiter.acquire(&item.host_input).await;
+                    // Key on the BARE host, never the raw `host_input`: for
+                    // recursion probes `host_input` is the discovered directory
+                    // URL, so keying on it would hand every discovered dir its
+                    // own independent quota bucket (50 dirs × `--rate-limit 10`
+                    // = ~500 req/s at the target).
+                    //
+                    // `bare_host(host_input)` — not `item.host` — because
+                    // `item.host` is derived differently per spawn site: crawl
+                    // items take it from `Url::host_str()`, which drops the
+                    // port, so on a non-default port (`:8080`) crawl probes
+                    // would land in a SECOND bucket ("x.com") while round-0 and
+                    // recursion probes use "x.com:8080". Deriving it from the
+                    // URL here is uniform across all three sites and equals
+                    // `item.host` in every default-port case.
+                    limiter.acquire(&bare_host(&item.host_input)).await;
                 }
                 run_probe_resilient(
                     item, &cfg, &wildcards, &catchall, &out_file, *policy, &disc, &pretries,
@@ -1528,7 +1599,10 @@ pub async fn run(
                     tasks.push(tokio::spawn(async move {
                         let _p = permit;
                         if limiter_c.enabled() {
-                            limiter_c.acquire(&item.host_input).await;
+                            // Bare host derived from the URL (`host_input` is
+                            // the discovered dir URL here) — one quota bucket
+                            // per host. See the round-0 spawn loop for why.
+                            limiter_c.acquire(&bare_host(&item.host_input)).await;
                         }
                         run_probe_resilient(
                             item, &cfg_c, &wildcards_c, &catchall_c, &out_file_c, *policy_c,
@@ -1584,7 +1658,11 @@ pub async fn run(
                 tasks.push(tokio::spawn(async move {
                     let _p = permit;
                     if limiter_c.enabled() {
-                        limiter_c.acquire(&item.host_input).await;
+                        // Bare host derived from the URL — keeps crawl probes in
+                        // the SAME bucket as this host's round-0 / recursion
+                        // probes even on a non-default port (`item.host` is
+                        // port-less for crawl items). See the round-0 spawn loop.
+                        limiter_c.acquire(&bare_host(&item.host_input)).await;
                     }
                     run_probe_resilient(
                         item, &cfg_c, &wildcards_c, &catchall_c, &out_file_c, *policy_c,
@@ -1689,6 +1767,7 @@ async fn attempt_auth_bypass(
             &headers,
             cfg.initial_cookie_header.as_deref(),
             false,
+            0, // unused: follow_redirects=false (a 3xx is never a bypass win)
         )
         .await
         else {
@@ -2081,6 +2160,7 @@ async fn run_probe(
             &cfg.extra_headers,
             cfg.initial_cookie_header.as_deref(),
             cfg.fuzz_follow_redirects,
+            cfg.max_redirects,
         )
         .await
         {
@@ -2238,6 +2318,9 @@ async fn run_probe(
                         source: "bypass".to_string(),
                         parent_url: url.clone(),
                         bypass: Some(technique),
+                        domain: cfg.domain.clone(),
+                        scan_id: cfg.scan_id.clone(),
+                        source_tools: cfg.source_tools.clone(),
                     };
                     write_record(out_file, &rec, cfg.output_format, cfg.live_findings).await;
                 }
@@ -2304,6 +2387,9 @@ async fn run_probe(
                 source: item.source.clone(),
                 parent_url: item.parent_url.clone(),
                 bypass: None,
+                domain: cfg.domain.clone(),
+                scan_id: cfg.scan_id.clone(),
+                source_tools: cfg.source_tools.clone(),
             };
             write_record(out_file, &rec, cfg.output_format, cfg.live_findings).await;
 
@@ -2377,6 +2463,9 @@ async fn run_probe(
                 source: item.source.clone(),
                 parent_url: item.parent_url.clone(),
                 bypass: None,
+                domain: cfg.domain.clone(),
+                scan_id: cfg.scan_id.clone(),
+                source_tools: cfg.source_tools.clone(),
             };
             write_record(out_file, &rec, cfg.output_format, cfg.live_findings).await;
         }
@@ -2660,6 +2749,9 @@ mod tests {
             source: String::new(),
             parent_url: String::new(),
             bypass: None,
+            domain: None,
+            scan_id: None,
+            source_tools: None,
         };
         let s = serde_json::to_string(&rec).unwrap();
         assert!(s.contains("\"status_code\":200"));
@@ -2721,6 +2813,9 @@ mod tests {
             source: String::new(),
             parent_url: String::new(),
             bypass: None,
+            domain: None,
+            scan_id: None,
+            source_tools: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -2748,6 +2843,82 @@ mod tests {
         assert!(HostRateLimiter::new(0.5).enabled(), "0.5 rps must enable");
         assert!(HostRateLimiter::new(1.0).enabled(), "1 rps must enable");
         assert!(HostRateLimiter::new(50.0).enabled(), "50 rps must enable");
+    }
+
+    /// Minimal FuzzRecord for schema tests. Provenance tags default to `None`
+    /// (i.e. the flags were not passed).
+    fn provenance_test_record() -> FuzzRecord {
+        FuzzRecord {
+            url: "https://x.com/a".into(),
+            input: "https://x.com".into(),
+            path: "/a".into(),
+            host: "x.com".into(),
+            status_code: 200,
+            content_length: 42,
+            content_type: "text/plain".into(),
+            title: "T".into(),
+            location: "".into(),
+            server: "nginx".into(),
+            webserver: "nginx".into(),
+            body_preview: "".into(),
+            response_headers: vec![],
+            tech: vec![],
+            method: "GET",
+            is_wildcard: false,
+            wildcard_policy: "strict".into(),
+            via_proxy: false,
+            attempts: 1,
+            elapsed_ms: 5,
+            snippet_md5: "abc".into(),
+            tls_impersonation: "chrome-131".into(),
+            user_agent: "ua".into(),
+            cf_challenge: false,
+            error: None,
+            timestamp: "2026-05-20T12:00:00.000Z".into(),
+            prober: PROBER_TAG,
+            depth: 0,
+            source: String::new(),
+            parent_url: String::new(),
+            bypass: None,
+            domain: None,
+            scan_id: None,
+            source_tools: None,
+        }
+    }
+
+    /// Schema compat: a run that passes none of `--domain` / `--scan-id` /
+    /// `--source-tools` must emit exactly the JSON it emitted before those
+    /// fields existed — all three keys absent, not `null`.
+    #[test]
+    fn provenance_tags_omitted_when_unset() {
+        let s = serde_json::to_string(&provenance_test_record()).unwrap();
+        for key in ["domain", "scan_id", "source_tools"] {
+            assert!(
+                !s.contains(&format!("\"{}\"", key)),
+                "{} must be omitted when the flag was not passed, got: {}",
+                key,
+                s
+            );
+        }
+        // `tech` is the opposite case — always emitted, always empty in fuzz
+        // mode (tech-detect is enrich-only). Guards the documented contract.
+        assert!(s.contains("\"tech\":[]"), "tech must stay present-and-empty");
+    }
+
+    /// The three pipeline provenance flags must round-trip into every emitted
+    /// record. Regression guard: fuzz mode used to drop them silently because
+    /// they were only ever wired into the enrich-mode record.
+    #[test]
+    fn provenance_tags_serialised_when_set() {
+        let mut rec = provenance_test_record();
+        rec.domain = Some("target.com".into());
+        rec.scan_id = Some("scan_1".into());
+        rec.source_tools = Some("subfinder,amass".into());
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert_eq!(v["domain"], "target.com");
+        assert_eq!(v["scan_id"], "scan_1");
+        assert_eq!(v["source_tools"], "subfinder,amass");
     }
 
     #[test]

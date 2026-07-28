@@ -105,8 +105,7 @@ struct Args {
     input: Option<String>,
 
     /// Output NDJSON file
-    #[arg(short = 'o', long, alias = "output",
-          required_unless_present_any = ["update", "check_update", "uninstall"])]
+    #[arg(short = 'o', long, alias = "output")]
     output: Option<String>,
 
     /// Concurrent HTTP probes (matches httpx -t default)
@@ -406,8 +405,9 @@ struct Args {
     #[arg(long = "bearer", help_heading = "Auth")]
     bearer: Option<String>,
 
-    /// Cookie to attach (initial seed). Repeatable. Format `"Name=Value"`.
-    /// wreq's cookie jar persists `Set-Cookie` responses across requests.
+    /// Cookie to attach. Repeatable. Format `"Name=Value"`.
+    /// Sent as a fixed `Cookie:` header on every request — there is NO cookie
+    /// jar, so `Set-Cookie` from responses is never captured or replayed.
     #[arg(long = "cookie", help_heading = "Auth")]
     cookies: Vec<String>,
 
@@ -1044,7 +1044,20 @@ async fn main() -> Result<()> {
         }
     }
 
-    let output_path = args.output.as_deref().context("missing -o/--output path")?;
+    // v0.5.3 — `-o` is OPTIONAL. With no output file, records stream to stdout
+    // so `httpxer -u host --rh` works standalone and stays pipeable into jq.
+    // Resume already skips non-regular paths (v0.5.2), so pointing at the
+    // stdout device can't block on a read.
+    let stdout_sink = if cfg!(windows) { "CON" } else { "/dev/stdout" };
+    let output_path = args.output.as_deref().unwrap_or(stdout_sink);
+    // `--no-resume` truncates the output by deleting it first. Only ever delete
+    // a path the USER named: when `-o` is omitted the sink above is
+    // `/dev/stdout`, which on Linux is a symlink to `/proc/self/fd/1`, and
+    // `unlink(2)` never follows the final symlink component — it would remove
+    // the `/dev/stdout` link itself (silently EACCES as a normal user, but
+    // succeeding, system-wide, when httpxer is run as root). Nothing to
+    // truncate on a stream anyway.
+    let user_named_output = args.output.is_some();
 
     // 1. Read + dedupe input. `-u TARGET` is a one-host shortcut that
     //    short-circuits the file read entirely. When BOTH `-u` and `-l`
@@ -1089,6 +1102,17 @@ async fn main() -> Result<()> {
             } else {
                 ""
             }
+        );
+    }
+
+    // `--fingerprints` is only consulted when the tech-detect engine is built,
+    // which `--no-tech` skips entirely — so passing both means the custom
+    // fingerprint file is silently ignored. Warn instead of no-op'ing quietly.
+    // Placed BEFORE the mode split so it fires in fuzz mode too.
+    if args.no_tech && args.fingerprints.is_some() {
+        eprintln!(
+            "[!] --fingerprints is ignored because --no-tech was passed \
+             (tech-detect is off, so no fingerprint file is loaded)"
         );
     }
 
@@ -1264,14 +1288,22 @@ async fn main() -> Result<()> {
         let recursion_depth = if args.recursive { args.recursion_depth } else { 0 };
         // Crawl-depth defaults to recursion-depth (so a single -R bumps both).
         let crawl_depth = args.crawl_depth.unwrap_or(args.recursion_depth);
-        // Crawl auto-follows redirects to capture terminal-page bodies.
-        let fuzz_follow_redirects = args.fuzz_follow_redirects || args.crawl;
+        // Crawl auto-follows redirects to capture terminal-page bodies —
+        // but an explicit `--no-follow-redirects` is a kill switch and wins
+        // over both that auto-enable and `--fuzz-follow-redirects`.
+        let fuzz_follow_redirects =
+            !args.no_follow_redirects && (args.fuzz_follow_redirects || args.crawl);
+        if args.no_follow_redirects && (args.fuzz_follow_redirects || args.crawl) {
+            eprintln!(
+                "[!] --no-follow-redirects overrides redirect-following in fuzz mode \
+                 (3xx stays a finding; crawl only sees pre-redirect bodies)"
+            );
+        }
 
         let cfg = fuzz::FuzzCfg {
             match_codes,
             exclude_codes,
             body_preview_bytes: args.body_preview,
-            wildcard_policy: policy,
             wildcard_samples: 3,
             include_errors: args.include_errors,
             retries: args.retries,
@@ -1287,17 +1319,17 @@ async fn main() -> Result<()> {
             // v0.4.5 — native 401/403 bypass is auto-on unless `--safe`.
             bypass_enabled: !args.safe,
             max_dirs_per_host: args.max_dirs_per_host,
-            similarity_window: 2,
             crawl_enabled: args.crawl,
             crawl_depth,
             crawl_robots: true,
             crawl_sitemap: true,
             max_links_per_page: args.max_links_per_page,
             scope_hosts,
-            exclude_subdirs,
-            exclude_mode,
             exclude_sizes,
             fuzz_follow_redirects,
+            // Honour `--max-redirects` in fuzz mode too (was hardcoded to 10;
+            // 10 is also the flag's default, so unchanged unless passed).
+            max_redirects: args.max_redirects,
             initial_cookie_header: auth_ctx.initial_cookie_header(),
             extra_headers,
             output_format: match args.format.as_deref() {
@@ -1306,9 +1338,25 @@ async fn main() -> Result<()> {
             },
             live_findings: !args.no_live,
             response_headers: args.response_headers,
+            // Pipeline provenance tags — enrich mode already embedded these in
+            // every record; fuzz mode used to drop them because the FuzzCfg is
+            // built (and `run` returns) before the enrich path is reached.
+            domain: args.domain.clone(),
+            scan_id: args.scan_id.clone(),
+            source_tools: args.source_tools.clone(),
         };
 
-        fuzz::run(&hosts, &words, cfg, output_path, args.no_resume, policy).await?;
+        // `no_resume` only drives the truncate-by-delete inside `run`; gate it
+        // on the user having named an output file (see `user_named_output`).
+        fuzz::run(
+            &hosts,
+            &words,
+            cfg,
+            output_path,
+            args.no_resume && user_named_output,
+            policy,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1323,7 +1371,7 @@ async fn main() -> Result<()> {
                 hosts.len()
             );
         }
-    } else {
+    } else if user_named_output {
         let _ = std::fs::remove_file(output_path);
     }
     if hosts.is_empty() {
