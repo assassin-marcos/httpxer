@@ -1141,6 +1141,202 @@ fn bare_host(s: &str) -> String {
     hostport.to_string()
 }
 
+// ─── Progress accounting ────────────────────────────────────────────────
+//
+// Post-v0.5.3 hardening. Why this is a type and not two loose atomics:
+//
+// The progress bar used to print percentages far above 100% — a real
+// recursive scan reported `[18000258/1255126] 1434%`. Pre-v0.4.8 the
+// denominator was a fixed round-0 `hosts × words` estimate captured BY VALUE
+// into the ticker (`let total = total_probes;`), while the numerator counted
+// EVERY probe, including the ones recursion/crawl enqueue. One side of the
+// fraction grew, the other could not.
+//
+// v0.4.8 made the denominator a live `Arc<AtomicUsize>` and hand-bumped it at
+// the two later-round spawn sites. Correct — but only by convention: the
+// `total.fetch_add()` and its matching `completed.fetch_add()` sat ~15 lines
+// apart at three separate spawn sites, and round 0 had no `fetch_add` at all
+// (it leaned on a pre-seeded constant that happened to equal the loop trip
+// count). A fourth spawn site added without its paired increment silently
+// reinstates the same lie.
+//
+// `Progress` makes the invariant structural rather than conventional:
+//
+//   * `completed` is private and can only be bumped by consuming a
+//     `ProbeTicket`;
+//   * a `ProbeTicket` can only be minted by `Progress::reserve`, which has
+//     already accounted for that probe in `total`;
+//   * `Progress::spawn_probe` is the only way probe tasks are created, and it
+//     does both in the same call.
+//
+// So every unit of numerator is preceded — in program order, on the spawning
+// thread — by its unit of denominator, and `completed <= total` holds at every
+// observable point. A new spawn site cannot forget to count itself: it has no
+// route to the completion counter without a ticket.
+
+/// Live `completed / total` accounting for one fuzz run. See the module-level
+/// note above for the invariant this type exists to enforce.
+struct Progress {
+    /// Probes whose task future has resolved. Private — only `ProbeTicket`
+    /// touches it. `Release` on every increment so a reader that `Acquire`s
+    /// this value is guaranteed to also see the `total` bump that preceded it.
+    completed: AtomicUsize,
+    /// Probes accounted for. Seeded with the round-0 cartesian estimate and
+    /// grown by every reservation past it.
+    total: AtomicUsize,
+    /// Slots already counted into `total` up front (the round-0
+    /// `hosts × words` cartesian) that no ticket has drawn yet. `reserve()`
+    /// spends these before growing `total`, so the bar reads against the
+    /// honest round-0 denominator from the very first tick instead of
+    /// climbing from `0/0` — while later rounds, which have no up-front
+    /// estimate, grow it.
+    ///
+    /// Invariant: `total >= prepaid + tickets_minted`. A prepaid slot has no
+    /// ticket and therefore can never produce a completion, so
+    /// `settle_prepaid()` can retire the unspent remainder with no risk of
+    /// `total` dropping below `completed`.
+    prepaid: AtomicUsize,
+}
+
+/// Both counters read as one pair. Constructed only by `Progress::snapshot`,
+/// which reads them in the order that keeps the pair honest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProgressSnapshot {
+    completed: usize,
+    total: usize,
+}
+
+impl ProgressSnapshot {
+    /// Percent complete. Never exceeds 100.
+    fn pct(self) -> u32 {
+        let pct = (self.completed as f64 * 100.0 / self.total.max(1) as f64) as u32;
+        // Unreachable given the structural invariant — kept because a
+        // progress bar must never print `1434%` again even if some future
+        // refactor breaks it upstream. A capped bar is a display bug; an
+        // uncapped one is the bug users report.
+        pct.min(100)
+    }
+
+    /// Probes still outstanding.
+    fn remaining(self) -> usize {
+        self.total.saturating_sub(self.completed)
+    }
+
+    /// Seconds left at the observed rate; 0 when we have no rate yet.
+    fn eta_secs(self, rps: f64) -> u64 {
+        if rps > 0.0 {
+            (self.remaining() as f64 / rps) as u64
+        } else {
+            0
+        }
+    }
+}
+
+impl Progress {
+    /// `prepaid` is the round-0 `hosts × words` cartesian, counted into
+    /// `total` up front so the denominator is meaningful from tick one.
+    fn new(prepaid: usize) -> Self {
+        Self {
+            completed: AtomicUsize::new(0),
+            total: AtomicUsize::new(prepaid),
+            prepaid: AtomicUsize::new(prepaid),
+        }
+    }
+
+    /// Account for exactly one probe and hand back the only token allowed to
+    /// report it finished. Draws from the prepaid round-0 pool while one is
+    /// left; otherwise this is new work (recursion / crawl) and it grows the
+    /// denominator.
+    fn reserve(self: &Arc<Self>) -> ProbeTicket {
+        let mut left = self.prepaid.load(Ordering::Relaxed);
+        loop {
+            if left == 0 {
+                self.total.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            match self.prepaid.compare_exchange_weak(
+                left,
+                left - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                // Spent a prepaid slot — `total` already covers this probe.
+                Ok(_) => break,
+                Err(now) => left = now,
+            }
+        }
+        ProbeTicket { progress: Arc::clone(self) }
+    }
+
+    /// Reserve a slot and spawn the probe in ONE call, so the denominator is
+    /// bumped at exactly the place the task is created. The task owns the
+    /// ticket, so the numerator moves when — and only when — that future
+    /// resolves. This is the only probe-spawning entry point.
+    fn spawn_probe<F>(self: &Arc<Self>, fut: F) -> tokio::task::JoinHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let ticket = self.reserve();
+        tokio::spawn(async move {
+            fut.await;
+            ticket.complete();
+        })
+    }
+
+    /// Retire round-0 slots that were counted up front but never handed to a
+    /// probe, so the denominator equals the work actually queued. Safe
+    /// whenever no reservation is mid-flight: an unspent prepaid slot has no
+    /// ticket, so it can never produce a completion.
+    fn settle_prepaid(&self) {
+        let unspent = self.prepaid.swap(0, Ordering::Relaxed);
+        if unspent > 0 {
+            self.total.fetch_sub(unspent, Ordering::Relaxed);
+        }
+    }
+
+    /// Read both counters — numerator FIRST, deliberately.
+    ///
+    /// The two loads are racy against running workers, but `Acquire` on
+    /// `completed` synchronises-with the `Release` increments that produced
+    /// it, so every `total` bump that preceded those completions is visible
+    /// to the `total` load that follows. A probe that slips in between the
+    /// two loads can therefore only inflate `total`. The opposite order would
+    /// pair a fresh `completed` with a stale `total` — which is precisely how
+    /// a progress bar comes to print more than 100%.
+    fn snapshot(&self) -> ProgressSnapshot {
+        let completed = self.completed.load(Ordering::Acquire);
+        let total = self.total.load(Ordering::Relaxed);
+        ProgressSnapshot { completed, total }
+    }
+}
+
+/// Permission to report exactly one probe finished. Minted only by
+/// [`Progress::reserve`], which has already counted that probe into `total`.
+/// Deliberately not `Clone`: a slot resolves exactly once.
+///
+/// Completion happens in `Drop`, so a task whose future is dropped before it
+/// finishes (cancellation, runtime shutdown) still resolves its slot instead
+/// of wedging the bar below 100% forever.
+#[must_use = "a reserved probe slot is counted into the denominator; drop it and the probe \
+              is reported complete without ever having run"]
+struct ProbeTicket {
+    progress: Arc<Progress>,
+}
+
+impl ProbeTicket {
+    /// Explicit completion. Identical to letting the ticket fall out of
+    /// scope; spelled out at the spawn site so the pairing is visible.
+    fn complete(self) {}
+}
+
+impl Drop for ProbeTicket {
+    fn drop(&mut self) {
+        // `Release`: publishes this thread's earlier `total` bump to any
+        // reader that `Acquire`s `completed`. See `Progress::snapshot`.
+        self.progress.completed.fetch_add(1, Ordering::Release);
+    }
+}
+
 /// Fuzz-mode orchestrator. Drives wildcard pre-flight + the host×path
 /// Cartesian probe + JSONL output.
 ///
@@ -1174,11 +1370,16 @@ pub async fn run(
     // v0.4.8 — total is a LIVE counter, not a fixed round-0 estimate. Recursion
     // (`-r`) and crawl (`--crawl`) enqueue MORE probes as they discover dirs /
     // URLs, so a static `hosts × words` denominator made the progress bar sail
-    // past 100% (e.g. 359%). Seed with the round-0 cartesian count; each probe a
-    // later round actually spawns bumps it, so the bar stays ≤100% (it dips when
-    // a new round adds work — honest recursive-scan behaviour).
+    // past 100% (e.g. 359%, and 1434% on a 1000-dir run). Seed with the round-0
+    // cartesian count; each probe a later round actually spawns bumps it, so the
+    // bar stays ≤100% (it dips when a new round adds work — honest
+    // recursive-scan behaviour).
+    //
+    // Post-v0.5.3 — both counters now live inside `Progress`, which mints a
+    // `ProbeTicket` at spawn time and only lets THAT ticket bump the numerator.
+    // The pairing is no longer a convention a new spawn site can forget.
     let initial_total = hosts.len() * words.len();
-    let total_probes = Arc::new(AtomicUsize::new(initial_total));
+    let progress = Arc::new(Progress::new(initial_total));
     eprintln!(
         "[+] fuzz: {} hosts × {} paths = {} probes (threads={}, retries={}, wildcard={})",
         hosts.len(),
@@ -1337,21 +1538,19 @@ pub async fn run(
     // each spawned future, so we can't reach into it from the outer loop.
     let spawn_backlog_cap = cfg.threads * 4;
 
-    // v0.3.12 — live progress bar. Workers atomically bump `completed`
-    // when each probe finishes; a separate ticker task reads it every
-    // 100 ms and redraws the progress line. Counter is needed because
-    // the in-loop `while tasks.len() > spawn_backlog_cap` drains tasks
+    // v0.3.12 — live progress bar. Each probe's `ProbeTicket` bumps the
+    // numerator when the probe finishes; a separate ticker task reads the
+    // pair every 100 ms and redraws the progress line. Counters are needed
+    // because the in-loop `while tasks.len() > spawn_backlog_cap` drains tasks
     // DURING the spawn loop — the post-spawn drain only sees the final
     // ~backlog_cap tasks, so the earlier code's drain-counting strategy
     // never saw the bulk of completions.
-    let completed_counter = Arc::new(AtomicUsize::new(0));
     let progress_done = Arc::new(AtomicBool::new(false));
     let is_tty = std::io::stderr().is_terminal();
     // Debug print removed v0.3.12 — kept the comment as a marker.
     let progress_task = {
-        let counter = completed_counter.clone();
+        let progress = progress.clone();
         let done = progress_done.clone();
-        let total = total_probes.clone();
         let started_at = started;
         tokio::spawn(async move {
             use std::io::Write as _;
@@ -1360,22 +1559,22 @@ pub async fn run(
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                let completed = counter.load(Ordering::Relaxed);
-                let total_now = total.load(Ordering::Relaxed);
+                // One consistent read of both counters — never two
+                // independently-timed loads (that pairing is what let the
+                // numerator overtake the denominator on screen).
+                let snap = progress.snapshot();
                 if is_tty {
                     let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
-                    let rps = completed as f64 / elapsed;
-                    let pct = (completed as f64 * 100.0 / total_now.max(1) as f64) as u32;
-                    let eta_secs = if rps > 0.0 {
-                        ((total_now.saturating_sub(completed)) as f64 / rps) as u64
-                    } else {
-                        0
-                    };
+                    let rps = snap.completed as f64 / elapsed;
                     let mut stderr = std::io::stderr();
                     let _ = write!(
                         stderr,
                         "\r\x1b[K  [{}/{}] {}% | {:.0} rps | eta {}",
-                        completed, total_now, pct, rps, format_eta(eta_secs)
+                        snap.completed,
+                        snap.total,
+                        snap.pct(),
+                        rps,
+                        format_eta(snap.eta_secs(rps))
                     );
                     let _ = stderr.flush();
                 } else {
@@ -1383,8 +1582,8 @@ pub async fn run(
                     // (Was per-200 in v0.3.7 drain-loop counter; the
                     // ticker-task variant uses 500 so the cadence
                     // matches a TTY's ~100 ms refresh visually.)
-                    if completed > 0 && completed % 500 == 0 {
-                        eprintln!("  [fuzz {}/{}]", completed, total_now);
+                    if snap.completed > 0 && snap.completed % 500 == 0 {
+                        eprintln!("  [fuzz {}/{}]", snap.completed, snap.total);
                     }
                 }
             }
@@ -1450,7 +1649,6 @@ pub async fn run(
             let catchall = catchall.clone();
             let out_file = out_file.clone();
             let policy = wildcard_policy_arc.clone();
-            let counter = completed_counter.clone();
             let disc = disc_tx.clone();
             let pretries = panic_retries.clone();
             let pfailed = panic_failed.clone();
@@ -1460,7 +1658,11 @@ pub async fn run(
             // of allocating one tokio::task per (host,path) eagerly.
             let permit = sem.acquire_owned().await.ok();
 
-            tasks.push(tokio::spawn(async move {
+            // `spawn_probe` reserves the denominator slot here, at the spawn,
+            // and hands the numerator increment to the task's ticket. Round 0
+            // draws from the prepaid `hosts × words` pool, so the displayed
+            // total stays at the announced figure.
+            tasks.push(progress.spawn_probe(async move {
                 let _p = permit;
                 if limiter.enabled() {
                     // Key on the BARE host, never the raw `host_input`: for
@@ -1484,7 +1686,6 @@ pub async fn run(
                     &pfailed,
                 )
                 .await;
-                counter.fetch_add(1, Ordering::Relaxed);
             }));
 
             // Throttle the spawn queue if we hit a backlog of completed
@@ -1496,9 +1697,14 @@ pub async fn run(
         }
     }
 
-    // Drain round-0 tasks. Workers update the atomic counter; the
-    // ticker task reads it.
+    // Drain round-0 tasks. Each task's ticket bumps the numerator; the
+    // ticker task reads the pair.
     while tasks.next().await.is_some() {}
+    // Round 0 is fully spawned and drained, so any prepaid slot still unspent
+    // was never turned into a probe. Retire it: from here on the denominator
+    // is the exact count of probes queued, not an estimate. (Normally a
+    // no-op — the round-0 loop spends the pool exactly.)
+    progress.settle_prepaid();
 
     // ── v0.4.0: multi-round drain ─────────────────────────────────────
     // After round 0 completes, collect Discovery messages (dirs from
@@ -1589,14 +1795,14 @@ pub async fn run(
                     let catchall_c = catchall.clone();
                     let out_file_c = out_file.clone();
                     let policy_c = wildcard_policy_arc.clone();
-                    let counter_c = completed_counter.clone();
                     let disc_c = disc_tx.clone();
                     let pretries_c = panic_retries.clone();
                     let pfailed_c = panic_failed.clone();
-                    // Count this recursion probe into the live denominator.
-                    total_probes.fetch_add(1, Ordering::Relaxed);
                     let permit = sem_c.acquire_owned().await.ok();
-                    tasks.push(tokio::spawn(async move {
+                    // Recursion probe: past the prepaid round-0 pool, so this
+                    // reservation grows the live denominator — at the spawn,
+                    // inseparably from the completion it authorises.
+                    tasks.push(progress.spawn_probe(async move {
                         let _p = permit;
                         if limiter_c.enabled() {
                             // Bare host derived from the URL (`host_input` is
@@ -1609,7 +1815,6 @@ pub async fn run(
                             &disc_c, &pretries_c, &pfailed_c,
                         )
                         .await;
-                        counter_c.fetch_add(1, Ordering::Relaxed);
                     }));
                     while tasks.len() > spawn_backlog_cap {
                         tasks.next().await;
@@ -1648,14 +1853,12 @@ pub async fn run(
                 let catchall_c = catchall.clone();
                 let out_file_c = out_file.clone();
                 let policy_c = wildcard_policy_arc.clone();
-                let counter_c = completed_counter.clone();
                 let disc_c = disc_tx.clone();
                 let pretries_c = panic_retries.clone();
                 let pfailed_c = panic_failed.clone();
-                // Count this crawl probe into the live denominator.
-                total_probes.fetch_add(1, Ordering::Relaxed);
                 let permit = sem_c.acquire_owned().await.ok();
-                tasks.push(tokio::spawn(async move {
+                // Crawl probe: same deal — reservation and spawn are one call.
+                tasks.push(progress.spawn_probe(async move {
                     let _p = permit;
                     if limiter_c.enabled() {
                         // Bare host derived from the URL — keeps crawl probes in
@@ -1669,7 +1872,6 @@ pub async fn run(
                         &disc_c, &pretries_c, &pfailed_c,
                     )
                     .await;
-                    counter_c.fetch_add(1, Ordering::Relaxed);
                 }));
                 while tasks.len() > spawn_backlog_cap {
                     tasks.next().await;
@@ -1689,15 +1891,20 @@ pub async fn run(
         // Final redraw at 100% before the newline (ticker may have
         // exited before catching the very-last counter increment).
         use std::io::Write as _;
-        let final_completed = completed_counter.load(Ordering::Relaxed);
-        let final_total = total_probes.load(Ordering::Relaxed);
+        let snap = progress.snapshot();
         let elapsed = started.elapsed().as_secs_f64().max(0.001);
-        let rps = final_completed as f64 / elapsed;
+        let rps = snap.completed as f64 / elapsed;
         let mut stderr = std::io::stderr();
+        // `snap.pct()` rather than a hardcoded "100%": every task has been
+        // joined and every ticket therefore resolved, so this reads 100 — and
+        // if it ever doesn't, the bar says so instead of lying.
         let _ = write!(
             stderr,
-            "\r\x1b[K  [{}/{}] 100% | {:.0} rps | eta 0s",
-            final_completed, final_total, rps
+            "\r\x1b[K  [{}/{}] {}% | {:.0} rps | eta 0s",
+            snap.completed,
+            snap.total,
+            snap.pct(),
+            rps
         );
         let _ = stderr.flush();
         // Newline so the "[+] fuzz done" line doesn't get appended onto
@@ -1710,7 +1917,10 @@ pub async fn run(
         let _ = f.flush();
     }
     let elapsed = started.elapsed().as_secs_f64();
-    let executed = total_probes.load(Ordering::Relaxed);
+    // The TRUE executed count: probes whose task future actually resolved, not
+    // the number of slots reserved. Every task has been joined by now, so the
+    // two agree — but `completed` is the one that means "ran".
+    let executed = progress.snapshot().completed;
     eprintln!(
         "[+] fuzz done: {} probes in {:.2}s ({:.0} rps avg) → {}",
         executed,
@@ -2544,6 +2754,183 @@ async fn write_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Progress accounting: the "never above 100%" invariant ────────────
+    //
+    // Regression cover for the reported bar `[18000258/1255126] 1434%` — a
+    // numerator that outran a denominator frozen at the round-0 estimate.
+
+    #[test]
+    fn round0_probes_read_against_the_announced_denominator() {
+        // 1 host × 60 words. The bar must read against 60 from the first
+        // tick — spawning round-0 probes may not inflate the denominator,
+        // because those slots were already counted when it was announced.
+        let p = Arc::new(Progress::new(60));
+        assert_eq!(p.snapshot(), ProgressSnapshot { completed: 0, total: 60 });
+
+        let tickets: Vec<ProbeTicket> = (0..60).map(|_| p.reserve()).collect();
+        assert_eq!(
+            p.snapshot(),
+            ProgressSnapshot { completed: 0, total: 60 },
+            "round-0 spawns draw from the prepaid pool; the total must not move"
+        );
+
+        for (i, t) in tickets.into_iter().enumerate() {
+            t.complete();
+            let s = p.snapshot();
+            assert_eq!(s.completed, i + 1);
+            assert!(s.completed <= s.total, "{:?}", s);
+            assert!(s.pct() <= 100, "{:?} → {}%", s, s.pct());
+        }
+        assert_eq!(p.snapshot().pct(), 100);
+    }
+
+    #[test]
+    fn recursion_probes_grow_the_denominator_instead_of_overflowing_it() {
+        // The v0.4.7 shape of the bug, scaled down: a 60-probe round 0 that
+        // recursion expands with 20 discovered dirs × 60 words. Pre-fix the
+        // denominator stayed 60 while the numerator climbed to 1260 —
+        // `[1260/60] 2100%`. Every probe past the prepaid pool must move the
+        // denominator, so the fraction lands exactly on 1260/1260.
+        let p = Arc::new(Progress::new(60));
+        for _ in 0..60 {
+            p.reserve().complete();
+        }
+        p.settle_prepaid();
+        assert_eq!(p.snapshot(), ProgressSnapshot { completed: 60, total: 60 });
+
+        for _ in 0..(20 * 60) {
+            let t = p.reserve();
+            let s = p.snapshot();
+            assert!(s.completed <= s.total, "denominator lagged the spawn: {:?}", s);
+            t.complete();
+        }
+        let s = p.snapshot();
+        assert_eq!(s, ProgressSnapshot { completed: 1260, total: 1260 });
+        assert_eq!(s.pct(), 100);
+    }
+
+    #[test]
+    fn a_new_round_dips_the_bar_and_never_overshoots_it() {
+        // Reserving a whole round up-front (1000 discovered dirs' worth of
+        // work) must pull the percentage DOWN — that dip is the honest
+        // recursive-scan behaviour — never push it past 100.
+        let p = Arc::new(Progress::new(100));
+        for _ in 0..100 {
+            p.reserve().complete();
+        }
+        assert_eq!(p.snapshot().pct(), 100);
+
+        let pending: Vec<ProbeTicket> = (0..900).map(|_| p.reserve()).collect();
+        let s = p.snapshot();
+        assert_eq!(s, ProgressSnapshot { completed: 100, total: 1000 });
+        assert_eq!(s.pct(), 10, "new work dips the bar");
+
+        drop(pending);
+        assert_eq!(p.snapshot().pct(), 100);
+    }
+
+    #[test]
+    fn settle_prepaid_retires_unspent_round0_slots_only() {
+        // If round 0 ever queues fewer probes than the announced cartesian,
+        // the leftover estimate is retired — the denominator becomes the
+        // exact queued count and can never fall below the numerator.
+        let p = Arc::new(Progress::new(1_000));
+        for _ in 0..10 {
+            p.reserve().complete();
+        }
+        p.settle_prepaid();
+        let s = p.snapshot();
+        assert_eq!(s, ProgressSnapshot { completed: 10, total: 10 });
+        assert!(s.completed <= s.total);
+        // Idempotent — a second call must not shrink the total again.
+        p.settle_prepaid();
+        assert_eq!(p.snapshot(), ProgressSnapshot { completed: 10, total: 10 });
+    }
+
+    #[test]
+    fn dropped_ticket_resolves_its_slot_so_the_bar_still_reaches_100() {
+        // A probe task whose future is dropped before it finishes must not
+        // wedge the bar below 100% forever.
+        let p = Arc::new(Progress::new(0));
+        let t = p.reserve();
+        assert_eq!(p.snapshot(), ProgressSnapshot { completed: 0, total: 1 });
+        drop(t);
+        assert_eq!(p.snapshot(), ProgressSnapshot { completed: 1, total: 1 });
+    }
+
+    #[test]
+    fn pct_is_capped_even_if_the_pair_is_nonsense() {
+        // Belt-and-braces on the display path itself: the reported bar was
+        // 1434%, and no snapshot may ever render above 100 regardless of how
+        // the counters got there.
+        assert_eq!(ProgressSnapshot { completed: 18_000_258, total: 1_255_126 }.pct(), 100);
+        assert_eq!(ProgressSnapshot { completed: 0, total: 0 }.pct(), 0);
+        assert_eq!(ProgressSnapshot { completed: 5, total: 0 }.pct(), 100);
+        assert_eq!(ProgressSnapshot { completed: 1, total: 4 }.pct(), 25);
+        assert_eq!(ProgressSnapshot { completed: 3, total: 4 }.remaining(), 1);
+        assert_eq!(ProgressSnapshot { completed: 9, total: 4 }.remaining(), 0);
+        // ETA never divides by a zero rate.
+        assert_eq!(ProgressSnapshot { completed: 0, total: 100 }.eta_secs(0.0), 0);
+        assert_eq!(ProgressSnapshot { completed: 0, total: 100 }.eta_secs(10.0), 10);
+    }
+
+    #[test]
+    fn snapshot_never_shows_completed_above_total_under_concurrency() {
+        // The reported failure surfaced as a DISPLAY race: a numerator from
+        // one moment paired with a denominator from another. Hammer both
+        // counters from 8 threads (16k probes, only 1k of them prepaid, so
+        // 15k reservations grow the total live) while a reader snapshots in
+        // a tight loop and asserts the invariant on every read.
+        let p = Arc::new(Progress::new(1_000));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let reader = {
+            let p = Arc::clone(&p);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut worst_pct = 0u32;
+                let mut reads = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let s = p.snapshot();
+                    assert!(
+                        s.completed <= s.total,
+                        "completed {} > total {}",
+                        s.completed,
+                        s.total
+                    );
+                    worst_pct = worst_pct.max(s.pct());
+                    reads += 1;
+                    std::hint::spin_loop();
+                }
+                (worst_pct, reads)
+            })
+        };
+
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let p = Arc::clone(&p);
+                std::thread::spawn(move || {
+                    for _ in 0..2_000 {
+                        p.reserve().complete();
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        let (worst_pct, reads) = reader.join().unwrap();
+        assert!(worst_pct <= 100, "progress bar rendered {}%", worst_pct);
+        assert!(reads > 0, "reader thread never observed the run");
+        assert_eq!(
+            p.snapshot(),
+            ProgressSnapshot { completed: 16_000, total: 16_000 },
+            "1000 prepaid slots absorbed + 15000 grown"
+        );
+    }
 
     // ── v0.4.6 per-directory catchall helpers ────────────────────────────
 
