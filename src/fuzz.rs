@@ -998,7 +998,21 @@ async fn wildcard_preflight_probe(
     if !matches!(parsed.status, 200..=399) {
         return None;
     }
-    if parsed.content_length == 0 || parsed.snippet_md5.is_empty() {
+    // v0.6.1 — a bodyless response carries no content fingerprint, EXCEPT on
+    // 2xx, where "no body at all" IS the signature: a host that answers every
+    // random path with `200` + 0 bytes is a catchall, and dropping those
+    // samples here is why pre-flight reported `no fingerprints recorded` and
+    // let the flood through to the per-directory detector (which only catches
+    // it after K paths have already been emitted). Keeping them lets Layer 1
+    // agree on `(ct, md5(""), cl=0)` and suppress from the very first probe.
+    //
+    // 3xx keeps the old behaviour: an empty redirect body is the norm and says
+    // nothing about the target, so it must not seed a fingerprint.
+    let bodyless = parsed.content_length == 0 || parsed.raw_body.is_empty();
+    if bodyless && !matches!(parsed.status, 200..=299) {
+        return None;
+    }
+    if parsed.snippet_md5.is_empty() {
         return None;
     }
     Some(crate::wildcard::ProbeSample {
@@ -1283,7 +1297,30 @@ impl Progress {
         })
     }
 
-    /// Retire round-0 slots that were counted up front but never handed to a
+    /// Count a whole round's PLANNED work into the denominator up front, the
+    /// way `new()` seeds round 0.
+    ///
+    /// Without this, a later round grows `total` one reservation at a time —
+    /// and since a reservation happens only AFTER the concurrency permit is
+    /// acquired, `total` could never lead `completed` by more than the
+    /// in-flight window. The bar sat at 99% with `eta 0s` for the entire
+    /// round while millions of probes were still queued, and the denominator
+    /// visibly crept upward instead of standing still (v0.6.1 report:
+    /// `[10480035/10480186] 99% | eta 0s` at threads=150 — a gap of exactly
+    /// the concurrency window).
+    ///
+    /// `planned` is an upper bound: paths the visited-set dedups away never
+    /// draw their slot, and `settle_prepaid()` retires the remainder when the
+    /// round drains.
+    fn prepay(&self, planned: usize) {
+        if planned == 0 {
+            return;
+        }
+        self.total.fetch_add(planned, Ordering::Relaxed);
+        self.prepaid.fetch_add(planned, Ordering::Relaxed);
+    }
+
+    /// Retire prepaid slots that were counted up front but never handed to a
     /// probe, so the denominator equals the work actually queued. Safe
     /// whenever no reservation is mid-flight: an unspent prepaid slot has no
     /// ticket, so it can never produce a completion.
@@ -1762,6 +1799,31 @@ pub async fn run(
                 "[+] round {}: fuzz {} discovered dirs + probe {} crawl-extracted URLs",
                 round, frontier_dirs.len(), frontier_urls.len()
             );
+            // NAME the dirs. Most recursion targets are 401/403 auth-dirs
+            // (`recurse_on_auth`), whose statuses the emit filter drops — so a
+            // bare count told the user a round had expanded into N unnamed
+            // directories with no way to see which, or to judge whether the
+            // expansion (dirs × wordlist) was worth the hours it costs.
+            for (dir_url, _, depth, _) in frontier_dirs.iter().take(RECURSE_DIR_LOG_CAP) {
+                eprintln!("  [recurse] d{} {}", depth, dir_url);
+            }
+            if frontier_dirs.len() > RECURSE_DIR_LOG_CAP {
+                eprintln!(
+                    "  [recurse] … +{} more (capped by --max-dirs-per-host)",
+                    frontier_dirs.len() - RECURSE_DIR_LOG_CAP
+                );
+            }
+
+            // Count this round's PLANNED work into the denominator BEFORE
+            // spawning any of it. Reservations happen behind the concurrency
+            // semaphore, so growing `total` per-spawn left the bar pinned at
+            // ~99% with `eta 0s` for the whole round. See `Progress::prepay`.
+            progress.prepay(
+                frontier_dirs
+                    .len()
+                    .saturating_mul(words.len())
+                    .saturating_add(frontier_urls.len()),
+            );
             // Per-directory catchall detection now happens LIVE inside
             // `run_probe` via the hybrid `CatchallCache` (v0.4.6): each new
             // prefix's shell is learned on demand (frequency + sibling-probe,
@@ -1879,6 +1941,11 @@ pub async fn run(
             }
             // Drain this round before moving to next.
             while tasks.next().await.is_some() {}
+            // Retire the prepaid slots the visited-set dedup skipped, so the
+            // denominator equals the work actually queued before the next
+            // round prepays its own. No reservation is in flight here — the
+            // round's tasks have all resolved.
+            progress.settle_prepaid();
         }
     }
     // Close the discovery channel so any remaining workers don't block.
@@ -2031,6 +2098,11 @@ const FREQ_CL_TOL: i64 = 24;
 /// Per-host cap on distinct parents the sibling-probe detector may sample,
 /// bounding added traffic / WAF exposure on huge wordlists.
 const MAX_CATCHALL_PARENTS_PER_HOST: usize = 256;
+
+/// How many recursion targets a round names on stderr before summarising the
+/// rest. Recursion is mostly 401/403 auth-dirs the emit filter hides, so the
+/// list is the only place a user can see what a round expanded into.
+const RECURSE_DIR_LOG_CAP: usize = 25;
 
 /// Frequency-detector bucket: the set of DISTINCT paths that returned a given
 /// `(content_type, normalized_body_hash)`, plus a representative sig to promote.
@@ -2904,6 +2976,46 @@ mod tests {
 
         drop(pending);
         assert_eq!(p.snapshot().pct(), 100);
+    }
+
+    #[test]
+    fn prepay_makes_a_round_denominator_lead_the_concurrency_window() {
+        // The v0.6.0 bug: a later round grew `total` one reservation at a
+        // time, and reservations sit behind the concurrency semaphore — so
+        // `total` could only ever lead `completed` by the in-flight window
+        // and the bar read ~99% with `eta 0s` for the whole round.
+        // Round 0 drains cleanly.
+        let p = Arc::new(Progress::new(100));
+        for _ in 0..100 {
+            p.reserve().complete();
+        }
+        p.settle_prepaid();
+        assert_eq!(p.snapshot(), ProgressSnapshot { completed: 100, total: 100 });
+
+        // Round 1 plans 20 dirs × 500 words up front.
+        p.prepay(20 * 500);
+        let s = p.snapshot();
+        assert_eq!(s, ProgressSnapshot { completed: 100, total: 10_100 });
+        assert_eq!(s.pct(), 0, "a freshly-prepaid round starts near zero");
+
+        // Simulate a concurrency window of 150 in flight: the denominator
+        // must already cover the WHOLE round, not just what has spawned.
+        let inflight: Vec<ProbeTicket> = (0..150).map(|_| p.reserve()).collect();
+        let s = p.snapshot();
+        assert_eq!(s.total, 10_100, "prepaid work does not re-grow the total");
+        assert!(
+            s.remaining() > 9_000,
+            "remaining must reflect queued work, not the in-flight window (got {})",
+            s.remaining()
+        );
+        drop(inflight);
+
+        // Dedup skipped the rest of the round; settling retires them so the
+        // denominator equals what actually ran.
+        p.settle_prepaid();
+        let s = p.snapshot();
+        assert_eq!(s, ProgressSnapshot { completed: 250, total: 250 });
+        assert_eq!(s.pct(), 100);
     }
 
     #[test]

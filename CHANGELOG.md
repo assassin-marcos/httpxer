@@ -2,6 +2,59 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.6.2] — 2026-07-29
+
+### Fixed
+- **Progress bar pinned at 99% with `eta 0s` for entire recursion rounds.**
+  A real run reported `[10480035/10480186] 99% | 605 rps | eta 0s` with the
+  denominator creeping upward and never arriving. Rounds past round 0 grew
+  `total` one reservation at a time, and a reservation is taken only *after*
+  the concurrency permit is acquired — so the denominator could never lead the
+  numerator by more than the in-flight window (the reported gap was exactly
+  151, at `threads=150`). Each round now counts its planned
+  `dirs × wordlist + crawl URLs` into the denominator up front, the way round 0
+  always did, and retires the slots deduplication skipped when the round
+  drains. The bar shows real percentages and a real ETA for the whole round.
+- **Bodyless `200` catchalls are now suppressed from the first probe.**
+  v0.6.1 caught them only after `K = 3` distinct paths, so two findings per
+  bucket still leaked, and pre-flight still printed `no fingerprints recorded`.
+  Pre-flight discarded every zero-length sample, which is why it learned
+  nothing. It now keeps bodyless **2xx** samples, so Layer 1 agrees on
+  `(content_type, md5(""), cl=0)` and suppression starts at probe one. `3xx`
+  keeps the old behaviour — an empty redirect body is normal and says nothing
+  about the target, so it must not seed a fingerprint.
+
+### Added
+- **Recursion targets are now named on stderr.** A round printed
+  `fuzz 20 discovered dirs` without saying which. Most recursion targets come
+  from `recurse_on_auth` — `401`/`403` on directory-shaped paths — whose
+  statuses the emit filter drops, so the expansion was invisible: 20 unnamed
+  directories, each costing a full wordlist pass. Each round now lists its
+  dirs (`[recurse] d1 https://host/api/`), capped at 25 with a `+N more`
+  summary.
+
+### Unchanged
+- A lone legitimate empty `200` is still emitted — verified against a host
+  whose random paths 404 and which serves one bodyless `200` at `/ping`.
+- Real pages are never suppressed by the bodyless signature: matching is on
+  the body fingerprint, so even a 3-byte body inside the CL tolerance window
+  survives.
+- CLI flags and output schemas are unchanged.
+
+### Verified
+- Recursion repro (`401` on every dir-shaped path, 300-word list, 20 dirs,
+  `threads=150`): before, the round-1 bar read `[300/450] → [360/504] →
+  [434/584]`, denominator trailing the numerator by the concurrency window;
+  after, it holds a fixed `6300` denominator and climbs `5% → 99%` with a
+  falling ETA (`11s → 8s → 6s → …`).
+- Bodyless-catchall repro: findings emitted drop from 2 to **0**, with
+  `[wildcard L1] cl=0 md5=d41d8cd9… (8/8 samples agreed)` at pre-flight.
+- Live regressions on a public test target — enrich, plus a 180-probe fuzz at
+  recursion depth 2 under `--wildcard-policy strict` — produced identical
+  finding sets before and after.
+- `cargo test`: 142 passing (140 + two covering round prepayment and the
+  bodyless pre-flight signature).
+
 ## [0.6.1] — 2026-07-29
 
 ### Fixed

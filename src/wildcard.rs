@@ -836,6 +836,42 @@ mod tests {
         assert_eq!(sig.content_type, "text/html");
     }
 
+    /// Bodyless `200` catchall (v0.6.1). Pre-flight now keeps zero-length 2xx
+    /// samples, so `detect()` must turn them into a signature that actually
+    /// MATCHES at runtime — an empty-but-inert sig would be a silent no-op —
+    /// while leaving real pages alone.
+    #[test]
+    fn detect_bodyless_2xx_yields_a_sig_that_matches_only_empty_bodies() {
+        let empty_md5 = md5_hex("");
+        let samples = vec![
+            sb(0, "text/html", &empty_md5, 17, ""),
+            sb(0, "text/html", &empty_md5, 33, ""),
+            sb(0, "text/html", &empty_md5, 65, ""),
+        ];
+        let sig = detect(&samples, 10).expect("bodyless 2xx catchall should be detected");
+        assert_eq!(sig.content_length, 0);
+        assert_eq!(sig.content_type, "text/html");
+
+        // Suppresses another bodyless 200 on any path length.
+        assert!(
+            sig.matches_probe(0, "text/html", &empty_md5, 12, ""),
+            "a further bodyless 200 must match the learned catchall"
+        );
+        // A real page of the same content type is NOT suppressed — the sig
+        // matches on the exact body fingerprint, never on size alone.
+        let real = "<html><title>Admin</title><body>real content</body></html>";
+        assert!(
+            !sig.matches_probe(58, "text/html", "some-other-md5", 12, real),
+            "a real page must never match the bodyless catchall"
+        );
+        // A tiny real body inside the CL tolerance window still differs by
+        // fingerprint, so it survives too.
+        assert!(
+            !sig.matches_probe(3, "text/html", &md5_hex("abc"), 12, "abc"),
+            "a 3-byte real body must not be swallowed by the CL tolerance"
+        );
+    }
+
     /// Content-aware L1b tolerates small CL drift while bodies normalize equal.
     #[test]
     fn detect_layer1b_tolerates_cl_drift() {
