@@ -2047,6 +2047,11 @@ struct CatchallCache {
     learned: Vec<crate::wildcard::WildcardSig>,
     /// (content_type, normalized_snippet_md5) → distinct paths seen + a sig.
     freq: std::collections::HashMap<(String, String), FreqEntry>,
+    /// Detector C (v0.6.1, bodyless catchall): (host_input, status,
+    /// content_type) → distinct paths that answered with NO body at all.
+    empty_freq: std::collections::HashMap<(String, u16, String), std::collections::HashSet<String>>,
+    /// Buckets already promoted to a confirmed bodyless catchall.
+    empty_learned: std::collections::HashSet<(String, u16, String)>,
     /// Parents already sibling-sampled (probed to completion / no-catchall).
     probed_parents: std::collections::HashSet<String>,
     /// Parents whose sibling-probe is IN FLIGHT right now. Concurrent hits under
@@ -2128,6 +2133,41 @@ impl CatchallCache {
         }
         Some(sig)
     }
+
+    /// Detector C (bodyless catchall, zero traffic). Detectors A and B both
+    /// fingerprint by body CONTENT, so a server that answers every path with
+    /// `2xx` + zero bytes is invisible to them — there is nothing to hash.
+    /// A 0-byte body is not a page, though: `2xx` + no body repeated across K
+    /// DISTINCT paths is itself a reliable catchall signature, so bucket on
+    /// `(host, status, content_type)` and promote at the same K as Detector A.
+    ///
+    /// Scoped per host (the key carries no body entropy, so a cross-host bucket
+    /// could let one host's shell suppress another's real empty response) and
+    /// split by content_type (extension-driven CT stays in its own bucket).
+    ///
+    /// Returns `None` while the bucket is below K — a lone legitimate empty
+    /// 200 is emitted normally. Returns `Some(true)` on the promoting hit
+    /// (caller logs once) and `Some(false)` for every later hit in the bucket.
+    fn note_empty_body(
+        &mut self,
+        host: &str,
+        status: u16,
+        ct: &str,
+        path: &str,
+    ) -> Option<bool> {
+        let key = (host.to_string(), status, ct.to_string());
+        if self.empty_learned.contains(&key) {
+            return Some(false);
+        }
+        let paths = self.empty_freq.entry(key.clone()).or_default();
+        paths.insert(path.to_string());
+        if paths.len() < FREQ_PROMOTE_K {
+            return None;
+        }
+        self.empty_freq.remove(&key);
+        self.empty_learned.insert(key);
+        Some(true)
+    }
 }
 
 /// Reduce a full URL to its immediate parent prefix (the directory containing
@@ -2162,9 +2202,45 @@ async fn catchall_suppresses(
     cfg: &FuzzCfg,
     cache: &Arc<Mutex<CatchallCache>>,
 ) -> bool {
-    // Only content-bearing 2xx shells; redirects/empties are out of scope.
-    if !matches!(parsed.status, 200..=299) || parsed.raw_body.is_empty() {
+    // Only 2xx shells; redirects are out of scope.
+    if !matches!(parsed.status, 200..=299) {
         return false;
+    }
+
+    // (0) Bodyless catchall (Detector C, zero traffic). Steps (a)-(c) below all
+    //     fingerprint by body content and cannot see a 0-byte response, which
+    //     let hosts answering `200` + no body for EVERY path flood the output
+    //     (v0.6.0 bug). Handled here on its own frequency rule, then out —
+    //     content matching has nothing to work with.
+    if parsed.raw_body.is_empty() {
+        let promoted = {
+            let mut c = cache.lock().await;
+            c.note_empty_body(
+                &item.host_input,
+                parsed.status,
+                &parsed.content_type,
+                &item.path,
+            )
+        };
+        return match promoted {
+            Some(newly) => {
+                if newly {
+                    eprintln!(
+                        "  [catchall] {} status={} ct={} bodyless ({} paths, frequency)",
+                        item.host_input,
+                        parsed.status,
+                        if parsed.content_type.is_empty() {
+                            "-"
+                        } else {
+                            &parsed.content_type
+                        },
+                        FREQ_PROMOTE_K
+                    );
+                }
+                true
+            }
+            None => false,
+        };
     }
 
     // (a) Match against already-learned sigs (content-aware, zero probes).
@@ -2986,6 +3062,46 @@ mod tests {
         assert!(c2.note_frequency("text/html", "h1", 800, "/p1").is_none());
         assert!(c2.note_frequency("text/html", "h2", 800, "/p2").is_none());
         assert!(c2.note_frequency("text/html", "h3", 800, "/p3").is_none());
+    }
+
+    #[test]
+    fn bodyless_catchall_promotes_only_at_k_distinct_paths() {
+        let mut c = CatchallCache::new(1);
+        let h = "https://spring.example";
+        // A lone legitimate empty 200 (and a second one) must still be emitted.
+        assert!(c.note_empty_body(h, 200, "text/html", "/management/env").is_none());
+        assert!(c.note_empty_body(h, 200, "text/html", "/management/heapdump").is_none());
+        // The K-th (3rd) distinct path promotes the bucket → suppress, log once.
+        assert_eq!(
+            c.note_empty_body(h, 200, "text/html", "/beans"),
+            Some(true),
+            "K-th distinct bodyless path promotes"
+        );
+        // Every later hit in the bucket is suppressed WITHOUT re-logging.
+        assert_eq!(c.note_empty_body(h, 200, "text/html", "/metrics"), Some(false));
+        assert_eq!(c.note_empty_body(h, 200, "text/html", "/env"), Some(false));
+
+        // A repeat of an already-seen path must NOT advance the count.
+        let mut c2 = CatchallCache::new(1);
+        assert!(c2.note_empty_body(h, 200, "text/html", "/x").is_none());
+        assert!(c2.note_empty_body(h, 200, "text/html", "/x").is_none());
+        assert!(c2.note_empty_body(h, 200, "text/html", "/x").is_none());
+
+        // Buckets are per (host, status, content_type): one host's shell can
+        // never suppress another host's real empty 200, and a 204 endpoint
+        // does not accumulate toward a 200 bucket.
+        let mut c3 = CatchallCache::new(2);
+        assert!(c3.note_empty_body("https://a.example", 200, "text/html", "/p1").is_none());
+        assert!(c3.note_empty_body("https://a.example", 200, "text/html", "/p2").is_none());
+        assert!(c3.note_empty_body("https://b.example", 200, "text/html", "/p3").is_none());
+        assert!(c3.note_empty_body("https://a.example", 204, "text/html", "/p4").is_none());
+        assert!(c3.note_empty_body("https://a.example", 200, "application/json", "/p5").is_none());
+        // Only the (a.example, 200, text/html) bucket reaches K.
+        assert_eq!(
+            c3.note_empty_body("https://a.example", 200, "text/html", "/p6"),
+            Some(true)
+        );
+        assert!(c3.note_empty_body("https://b.example", 200, "text/html", "/p7").is_none());
     }
 
     #[test]

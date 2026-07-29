@@ -2,6 +2,43 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.6.1] — 2026-07-29
+
+### Fixed
+- **Bodyless (`200` + 0-byte) catchalls are no longer emitted as findings.**
+  Hosts that answer every path with a `2xx` and an empty body flooded the output
+  with one fake finding per wordlist entry — `/management/env`,
+  `/management/heapdump`, `/env`, `/beans`, `/metrics` and hundreds more, all at
+  `0B`. Both suppression layers were blind to it by construction: the
+  per-directory catchall detector returned early on an empty body (there is no
+  content to fingerprint), and the host pre-flight discards zero-length samples,
+  so it reported `no fingerprints recorded` and learned nothing.
+  A new zero-traffic detector treats `2xx` + no body across `K = 3` distinct
+  paths as the signature itself, bucketed per `(host, status, content_type)`,
+  and suppresses matching probes from the promoting hit onward.
+
+### Unchanged
+- A lone legitimate empty `200` (a `/ping`-style endpoint) stays below the
+  threshold and is still emitted — suppression needs 3 distinct paths sharing
+  the pattern on the same host.
+- Buckets never cross hosts, status codes or content types, so one host's shell
+  can't suppress another host's real empty response.
+- `--wildcard-policy off` / `--no-wildcard` disables the new detector along with
+  the rest; CLI flags and output schemas are unchanged.
+- The `--exclude-sizes 0` workaround still works and is no longer needed.
+
+### Verified
+- Local repro (`200` + `Content-Length: 0` for every path): v0.6.0 emitted 18/19
+  bodyless paths as findings; v0.6.1 emits 2 (the pre-threshold learning window)
+  and logs `[catchall] … bodyless (3 paths, frequency)`. With `-r -R 2
+  --recurse-on-200 --wildcard-policy strict`, findings drop 19 → 3.
+- A host with exactly one legitimate bodyless `200` emits that finding
+  identically before and after.
+- Live regressions on a public test target — enrich, plus a 180-probe fuzz with
+  recursion depth 2 under `--wildcard-policy strict` — produced identical
+  finding sets before and after.
+- `cargo test`: 140 passing (139 + one covering the new detector).
+
 ## [0.4.4] — 2026-06-02
 
 ### Fixed
