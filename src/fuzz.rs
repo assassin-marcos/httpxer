@@ -969,13 +969,25 @@ fn decoy_preflight_paths() -> Vec<String> {
 /// Run ONE wildcard pre-flight probe against an explicit `path`. Returns a
 /// `ProbeSample` for the layered detector, or `None` when the probe didn't
 /// yield a usable body (status outside 200-399 / empty body / network error).
+/// What one pre-flight probe yielded. A random path tells us one of two useful
+/// things, and they need different treatment.
+enum PreflightOutcome {
+    /// Usable for wildcard content fingerprinting.
+    Sample(crate::wildcard::ProbeSample),
+    /// A `401`/`403` on a random (directory-shaped) path. Useless for content
+    /// fingerprinting, but it proves the host answers *nothing* differently —
+    /// so a later `401` on a dir-shaped word marks no real directory. See
+    /// [`crate::wildcard::AuthCatchall`].
+    Auth(crate::wildcard::AuthCatchall),
+}
+
 async fn wildcard_preflight_probe(
     host_input: &str,
     body_preview_bytes: usize,
     extra_headers: &[(String, String)],
     initial_cookie_header: Option<&str>,
     path: &str,
-) -> Option<crate::wildcard::ProbeSample> {
+) -> Option<PreflightOutcome> {
     let url = format!("{}{}", host_input, path);
     // Pre-flight ALWAYS uses follow_redirects=false: a 3xx to e.g. /login
     // would otherwise let the wildcard fingerprint reflect the login page
@@ -994,6 +1006,17 @@ async fn wildcard_preflight_probe(
         Ok(v) => v,
         Err(_) => return None,
     };
+    // A random path that comes back 401/403 fingerprints the host's blanket
+    // auth response — the signal that tells recursion this status marks
+    // nothing. Captured before the 200-399 gate that drops everything else.
+    if matches!(parsed.status, 401 | 403) {
+        return Some(PreflightOutcome::Auth(crate::wildcard::AuthCatchall {
+            status: parsed.status,
+            content_length: parsed.content_length,
+            content_type: parsed.content_type,
+            snippet_md5: parsed.snippet_md5,
+        }));
+    }
     // Match donor: only 200-399 with body counts.
     if !matches!(parsed.status, 200..=399) {
         return None;
@@ -1015,7 +1038,7 @@ async fn wildcard_preflight_probe(
     if parsed.snippet_md5.is_empty() {
         return None;
     }
-    Some(crate::wildcard::ProbeSample {
+    Some(PreflightOutcome::Sample(crate::wildcard::ProbeSample {
         status: parsed.status,
         content_length: parsed.content_length,
         content_type: parsed.content_type,
@@ -1024,7 +1047,7 @@ async fn wildcard_preflight_probe(
         // v0.4.5: carry the body so the content-aware Layer 1b can fingerprint
         // by normalized content (already captured by dispatch_one — no extra IO).
         raw_body: parsed.raw_body,
-    })
+    }))
 }
 
 /// Best-effort UA reconstruction from the TLS profile tag — for the
@@ -1468,12 +1491,44 @@ pub async fn run(
                     p,
                 )
             });
-            let samples: Vec<crate::wildcard::ProbeSample> =
-                futures::future::join_all(futs)
-                    .await
-                    .into_iter()
-                    .flatten()
-                    .collect();
+            let mut samples: Vec<crate::wildcard::ProbeSample> = Vec::new();
+            let mut auth_probes: Vec<crate::wildcard::AuthCatchall> = Vec::new();
+            for outcome in futures::future::join_all(futs).await.into_iter().flatten() {
+                match outcome {
+                    PreflightOutcome::Sample(s) => samples.push(s),
+                    PreflightOutcome::Auth(a) => auth_probes.push(a),
+                }
+            }
+
+            // Auth-catchall (v0.6.3): random paths are directory-shaped by
+            // construction, so a CONSTANT 401/403 across ≥2 of them proves the
+            // status marks nothing on this host. Recursion consults this before
+            // treating a 401/403 word as a protected directory — otherwise the
+            // first N dir-shaped words each expand to a full wordlist pass for
+            // the coverage of one. Two agreeing probes required so a single
+            // random 401 can't disable auth-recursion on a normal host.
+            if let Some(first) = auth_probes.first() {
+                let agree = auth_probes
+                    .iter()
+                    .filter(|a| {
+                        a.matches(
+                            first.status,
+                            first.content_length,
+                            &first.content_type,
+                            &first.snippet_md5,
+                        )
+                    })
+                    .count();
+                if agree >= 2 {
+                    eprintln!(
+                        "  [auth-catchall] {} status={} cl={} — every random path is {}; \
+                         auth-dir recursion disabled for this host",
+                        host, first.status, first.content_length, first.status
+                    );
+                    wildcard_map.insert_auth(input.clone(), first.clone());
+                }
+            }
+
             match wildcard::detect(&samples, 10) {
                 Some(sig) if sig.k.is_some() => {
                     eprintln!(
@@ -2363,8 +2418,19 @@ async fn catchall_suppresses(
                     p,
                 )
             });
+            // Content fingerprinting only — a 401/403 sibling says nothing
+            // about THIS prefix's 2xx shell (the host-level auth-catchall
+            // check handles that status class).
             let samples: Vec<crate::wildcard::ProbeSample> =
-                futures::future::join_all(futs).await.into_iter().flatten().collect();
+                futures::future::join_all(futs)
+                    .await
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|o| match o {
+                        PreflightOutcome::Sample(s) => Some(s),
+                        PreflightOutcome::Auth(_) => None,
+                    })
+                    .collect();
             // Require ≥2 agreeing samples so a single random 200 (a real page)
             // can't be mistaken for a catchall.
             let learned_sig = if samples.len() >= 2 {
@@ -2605,6 +2671,21 @@ async fn run_probe(
             // --max-dirs-per-host in the orchestrator.
             let next_depth = item.depth.saturating_add(1);
             if cfg.recursion_depth > 0 && next_depth <= cfg.recursion_depth {
+                // v0.6.3 — a 401/403 indistinguishable from what this host
+                // returns for a RANDOM path marks no directory. Descending it
+                // multiplies the wordlist by a directory that doesn't exist,
+                // and since the status is filtered out of the output the user
+                // never sees where the expansion came from. A 401 that DIFFERS
+                // from the blanket response is real signal and still recurses,
+                // which is the `/api`=401 → `/api/actuator`=200 case this rule
+                // exists to serve.
+                let auth_noise = wildcards.is_auth_catchall(
+                    &item.host_input,
+                    parsed.status,
+                    parsed.content_length,
+                    &parsed.content_type,
+                    &parsed.snippet_md5,
+                );
                 if let Some(dir_url) = crate::recurse::detect_directory(
                     &url,
                     parsed.status,
@@ -2613,7 +2694,9 @@ async fn run_probe(
                     cfg.recurse_on_200,
                     cfg.recurse_on_403,
                     cfg.recurse_on_auth,
-                ) {
+                )
+                .filter(|_| !auth_noise)
+                {
                     let _ = disc_tx.send(Discovery::Directory {
                         canonical_url: crate::recurse::canonical_url_key(&dir_url),
                         host: item.host.clone(),

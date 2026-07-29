@@ -2,6 +2,41 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.6.3] — 2026-07-29
+
+### Fixed
+- **Phantom recursion targets on hosts that answer every path `401`/`403`.**
+  Auth-dir recursion treats a `401`/`403` on a directory-shaped path as a
+  protected directory worth descending into. On a host that returns a blanket
+  `401` for *everything* — including paths that cannot exist — the first N
+  directory-shaped words all became recursion targets, expanding to
+  `N × wordlist` probes for exactly the coverage of one. The statuses are
+  filtered out of the output, so the expansion was invisible: a real run turned
+  a dead host into 20 unnamed directories and ~28M queued probes.
+
+  The discriminator is not the status — it is whether the response is
+  *distinguishable from what a random path returns*. Pre-flight already probes
+  random hex paths, which are directory-shaped by construction; a constant
+  `401`/`403` across ≥2 of them is recorded as the host's auth-catchall
+  fingerprint, and a discovered "auth dir" matching it is not descended.
+
+  **A `401` that differs from the blanket response still recurses** — that is
+  the `/api` = 401 → `/api/actuator` = 200 case auth-dir recursion exists for,
+  and it is covered by a test and an end-to-end repro.
+
+### Verified
+- Blanket-`401` host (300-word list, `--max-dirs-per-host 20`): **6300 → 300
+  probes**, no findings lost, with
+  `[auth-catchall] host status=401 cl=69 — every random path is 401` at
+  pre-flight.
+- Real protected directory (`/api` = 401 with its own realm body, random paths
+  404): still recursed, and `/api/actuator` (200) still found.
+- Live regressions on a public test target — enrich, plus a 180-probe fuzz at
+  recursion depth 2 under `--wildcard-policy strict` — produced identical
+  finding sets before and after; the bodyless-catchall and lone-legitimate-
+  empty-`200` cases from v0.6.2 both still hold.
+- `cargo test`: 143 passing.
+
 ## [0.6.2] — 2026-07-29
 
 ### Fixed

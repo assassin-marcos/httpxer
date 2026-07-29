@@ -435,17 +435,63 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
     })
 }
 
+/// Host-level **auth-catchall** fingerprint (v0.6.3).
+///
+/// Some hosts answer *every* path — real or invented — with a constant
+/// `401`/`403`. Recursion treats a `401`/`403` on a directory-shaped path as a
+/// protected directory worth descending into, which is correct on a normal
+/// host: there, random paths `404`, so a `401` genuinely marks something that
+/// exists (`/api` = 401 while `/api/actuator` = 200 is the case that rule
+/// exists for). On an auth-catchall host the `401` carries no information at
+/// all, and the first N dir-shaped words all become recursion targets that
+/// expand to `N × wordlist` probes for exactly the coverage of one.
+///
+/// The discriminator is therefore not the status — it is whether the response
+/// is *distinguishable from what a random path returns*. Pre-flight already
+/// probes random hex paths, which are directory-shaped by construction; if
+/// they come back `401`/`403` with a constant fingerprint, that fingerprint is
+/// recorded here and a discovered "auth dir" matching it is not descended.
+/// A `401` that differs from it (different body, length, or realm) is real
+/// signal and still recurses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthCatchall {
+    pub status: u16,
+    pub content_length: i64,
+    pub content_type: String,
+    pub snippet_md5: String,
+}
+
+impl AuthCatchall {
+    /// True if a probe response is indistinguishable from this host's
+    /// blanket auth response. Exact body fingerprint + content type; content
+    /// length within `tolerance` so a per-request nonce doesn't defeat it.
+    /// Never size-only — a different body is a different response.
+    pub fn matches(&self, status: u16, cl: i64, ct: &str, md5: &str) -> bool {
+        const CL_TOL: i64 = 24;
+        self.status == status
+            && self.content_type == ct
+            && self.snippet_md5 == md5
+            && (self.content_length - cl).abs() <= CL_TOL
+    }
+}
+
 /// In-memory map of host → wildcard signature. Constructed once at fuzz
 /// pre-flight then handed out to workers as `Arc<WildcardMap>`.
 #[derive(Debug, Default)]
 pub struct WildcardMap {
     inner: HashMap<String, WildcardSig>,
+    /// host → blanket `401`/`403` fingerprint. Separate from `inner` because
+    /// it suppresses *recursion targets*, not findings: an auth-catchall host
+    /// still emits and probes normally, it just stops manufacturing phantom
+    /// directories. See [`AuthCatchall`].
+    auth: HashMap<String, AuthCatchall>,
 }
 
 impl WildcardMap {
     pub fn new() -> Self {
         Self {
             inner: HashMap::new(),
+            auth: HashMap::new(),
         }
     }
 
@@ -499,6 +545,32 @@ impl WildcardMap {
         // Per-sig content-aware match (shared with the per-directory catchall
         // cache in fuzz.rs). Layers L1b / L1 / L2 in order.
         sig.matches_probe(cl, ct, md5, probe_path_len, raw_body)
+    }
+
+    /// Record this host's blanket `401`/`403` fingerprint (see [`AuthCatchall`]).
+    pub fn insert_auth(&mut self, host: String, sig: AuthCatchall) {
+        self.auth.insert(host, sig);
+    }
+
+    /// True if this `401`/`403` is indistinguishable from what the host
+    /// returns for a random path — i.e. it marks nothing, and descending into
+    /// it would multiply the wordlist by a directory that does not exist.
+    ///
+    /// Same exact-key-then-base-key lookup as [`Self::matches_body`]: recursion
+    /// passes a discovered dir URL as `host`, while the fingerprint is stored
+    /// under the round-0 base input.
+    pub fn is_auth_catchall(&self, host: &str, status: u16, cl: i64, ct: &str, md5: &str) -> bool {
+        if !matches!(status, 401 | 403) {
+            return false;
+        }
+        let sig = match self.auth.get(host) {
+            Some(s) => s,
+            None => match self.auth.get(&base_input_key(host)) {
+                Some(s) => s,
+                None => return false,
+            },
+        };
+        sig.matches(status, cl, ct, md5)
     }
 
     #[allow(dead_code)]
@@ -870,6 +942,44 @@ mod tests {
             !sig.matches_probe(3, "text/html", &md5_hex("abc"), 12, "abc"),
             "a 3-byte real body must not be swallowed by the CL tolerance"
         );
+    }
+
+    /// Auth-catchall (v0.6.3). A host that answers every random path with a
+    /// constant 401 must stop manufacturing recursion targets — but a 401 that
+    /// DIFFERS from that blanket response is real signal and must still
+    /// recurse, because `/api`=401 → `/api/actuator`=200 is exactly what
+    /// auth-dir recursion exists for.
+    #[test]
+    fn auth_catchall_suppresses_blanket_401_but_not_a_distinguishable_one() {
+        let mut m = WildcardMap::new();
+        let blanket = AuthCatchall {
+            status: 401,
+            content_length: 0,
+            content_type: String::new(),
+            snippet_md5: md5_hex(""),
+        };
+        m.insert_auth("https://api.example".into(), blanket);
+
+        // The blanket response itself — recursion into this marks nothing.
+        assert!(m.is_auth_catchall("https://api.example", 401, 0, "", &md5_hex("")));
+        // Same host, but a REAL protected dir answering with its own body
+        // (a login realm page) — distinguishable, so it still recurses.
+        let realm = "<html><title>Sign in</title><body>Authentication required</body></html>";
+        assert!(
+            !m.is_auth_catchall("https://api.example", 401, 71, "text/html", &md5_hex(realm)),
+            "a 401 with its own body is signal, not blanket noise"
+        );
+        // A 403 is a different status class than the recorded 401.
+        assert!(!m.is_auth_catchall("https://api.example", 403, 0, "", &md5_hex("")));
+        // Non-auth statuses are never suppressed by this rule.
+        assert!(!m.is_auth_catchall("https://api.example", 200, 0, "", &md5_hex("")));
+        // A host with no recorded auth catchall recurses normally — this is
+        // the ordinary case and must not regress.
+        assert!(!m.is_auth_catchall("https://other.example", 401, 0, "", &md5_hex("")));
+
+        // Recursion passes a DISCOVERED DIR URL as the host; the fingerprint
+        // is stored under the base input, so the base-key fallback must hit.
+        assert!(m.is_auth_catchall("https://api.example/internal", 401, 0, "", &md5_hex("")));
     }
 
     /// Content-aware L1b tolerates small CL drift while bodies normalize equal.
