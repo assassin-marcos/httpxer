@@ -2697,12 +2697,50 @@ async fn run_probe(
                 )
                 .filter(|_| !auth_noise)
                 {
-                    let _ = disc_tx.send(Discovery::Directory {
-                        canonical_url: crate::recurse::canonical_url_key(&dir_url),
-                        host: item.host.clone(),
-                        depth: next_depth,
-                        parent: url.clone(),
-                    });
+                    // v0.6.4 — for 401/403 auth-dir candidates, verify the
+                    // directory is real by probing a random child. If the
+                    // child matches the HOST WILDCARD, this "directory" is a
+                    // one-off 403 for that exact path (e.g. `/aws/credentials`
+                    // returns 403 but `/aws/credentials/{random}` returns the
+                    // normal 200 wildcard). Recursing would multiply the
+                    // wordlist against responses that wildcard detection
+                    // already suppresses. A real protected directory's
+                    // children return something different from the host
+                    // wildcard (404, a distinct 401, etc.).
+                    let skip = if matches!(parsed.status, 401 | 403) {
+                        let canary = format!("{}{:08x}", dir_url, fastrand::u32(..));
+                        match dispatch_one(
+                            &canary,
+                            &item.host_input,
+                            cfg.body_preview_bytes,
+                            &cfg.extra_headers,
+                            cfg.initial_cookie_header.as_deref(),
+                            false,
+                            0,
+                        )
+                        .await
+                        {
+                            Ok((child, _, _)) => wildcards.matches_body(
+                                &item.host_input,
+                                child.content_length,
+                                &child.content_type,
+                                &child.snippet_md5,
+                                0,
+                                &child.raw_body,
+                            ),
+                            Err(_) => false,
+                        }
+                    } else {
+                        false
+                    };
+                    if !skip {
+                        let _ = disc_tx.send(Discovery::Directory {
+                            canonical_url: crate::recurse::canonical_url_key(&dir_url),
+                            host: item.host.clone(),
+                            depth: next_depth,
+                            parent: url.clone(),
+                        });
+                    }
                 }
             }
 

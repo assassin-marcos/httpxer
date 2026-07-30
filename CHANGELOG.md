@@ -2,6 +2,23 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.6.4] — 2026-07-30
+
+### Fixed
+- **Auth-dir recursion on wildcard hosts with one-off 403 paths.**
+  v0.6.3 blocked recursion on blanket-403 hosts (pre-flight returns 403). But
+  a host can return 200-wildcard normally yet 403 for specific paths like
+  `/aws/credentials` — children of that path still return the normal wildcard,
+  proving it is not a real protected directory. Recursing into it multiplied
+  the wordlist against wildcard-suppressed responses, expanding 8K paths to 58K
+  with zero useful output.
+
+  Now, when a 403/401 triggers auth-dir recursion, a verification probe checks
+  one random child (`{dir}/{hex}`). If the child matches the host wildcard, the
+  "directory" is a one-off 403 and recursion is skipped. Real protected
+  directories (children return 404 or their own 401, not the wildcard) still
+  recurse normally.
+
 ## [0.6.3] — 2026-07-29
 
 ### Fixed
