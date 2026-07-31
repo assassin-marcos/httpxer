@@ -17,7 +17,7 @@
 //! scheme-flip wrapper. Identical reliability characteristics.
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
@@ -45,134 +45,143 @@ const EMBEDDED_FINGERPRINTS: &str = include_str!("../fingerprints.json");
 #[command(
     name = "httpxer",
     version,
-    about = "HTTP probe + path fuzzer with browser-grade TLS impersonation.",
-    long_about = "HTTP probe + path fuzzer with browser-grade TLS impersonation.\n\n\
-        TWO MODES — chosen automatically:\n  \
-          ENRICH (default)  no -w  →  one probe per host: status, title, server, tech, IP, CDN\n  \
-          FUZZ              -w set →  host × wordlist path scan, with wildcard suppression",
-    after_help = "\x1b[1mQUICK START\x1b[0m\n  \
-  httpxer -u example.com                          probe one host\n  \
-  httpxer -l hosts.txt -o out.json                probe a list → NDJSON\n  \
-  httpxer -u example.com -w paths.txt             fuzz paths on one host\n\n\
-\x1b[1mFINGERPRINT / RECON (enrich)\x1b[0m\n  \
-  httpxer -u example.com --rh                     show all response headers\n  \
-  httpxer -l hosts.txt --no-cdn --no-tech         fast: skip CDN + tech-detect\n  \
-  httpxer -l hosts.txt --httpx-compat -o out.json httpx-shaped JSON (drop-in)\n  \
-  cat subs.txt | httpxer -l - -o live.json        pipe from subfinder/amass\n\n\
-\x1b[1mDIRECTORY BRUTEFORCE\x1b[0m\n  \
-  \x1b[2m# start here — sane defaults, wildcard auto-suppressed\x1b[0m\n  \
-  httpxer -u https://t.com -w common.txt -o found.txt\n\n  \
-  \x1b[2m# hide 401/403 auth walls, keep real hits\x1b[0m\n  \
-  httpxer -u https://t.com -w common.txt -i 200,301,302,307,308 -o found.txt\n\n  \
-  \x1b[2m# several wordlists at once (comma-separated, merged + deduped)\x1b[0m\n  \
-  httpxer -u https://t.com -w admin.txt,api.txt,backup.txt -o found.txt\n\n  \
-  \x1b[2m# recurse 3 levels into every directory found\x1b[0m\n  \
-  httpxer -u https://t.com -w common.txt -r -R 3 --r200 -o found.txt\n\n  \
-  \x1b[2m# full recon: recursion + crawl HTML/robots.txt/sitemap.xml\x1b[0m\n  \
-  httpxer -u https://t.com -w common.txt -r -R 3 --crawl -o found.txt\n\n  \
-  \x1b[2m# behind auth\x1b[0m\n  \
-  httpxer -u https://t.com -w common.txt --bearer $TOKEN -o found.txt\n\n  \
-  \x1b[2m# many hosts from a file, slow + polite\x1b[0m\n  \
-  httpxer -l hosts.txt -w common.txt -t 50 --rl 10 -o found.txt\n\n  \
-  \x1b[2m# out-of-scope program? turn the 401/403 bypass probes off\x1b[0m\n  \
-  httpxer -u https://t.com -w common.txt --safe -o found.txt\n\n\
-\x1b[1mAUTHENTICATED SCANS\x1b[0m  (work in BOTH modes)\n  \
-  httpxer -u https://t.com --bearer $TOKEN -w w.txt\n  \
-  httpxer -u https://t.com -H 'X-API-Key: k' --cookie 'sid=abc'\n\n\
-\x1b[1mTOO MUCH NOISE?\x1b[0m\n  \
-  --wildcard-policy strict   (default) auto-suppress catchall/soft-404 pages\n  \
-  -i 200,301,302,307,308     only these codes (hides 401/403 auth walls)\n  \
-  --exclude-root-size        drop pages the size of the homepage\n  \
-  --exclude-sizes 1234,5678  drop exact byte sizes\n\n\
-\x1b[1mSHORT FORMS\x1b[0m  (long names all still work)\n  \
-  --wp  wildcard-policy    --md  max-dirs-per-host   --to  timeout-ms\n  \
-  --rd  recursion-depth    --xa  add-excludes        --mr  max-redirects\n  \
-  --es  exclude-sizes      --xm  exclude-mode        --rl  rate-limit\n  \
-  --ers exclude-root-size  --cd  crawl-depth         --bp  body-preview\n  \
-  --r200/--r403 recurse-on-200/403                   --rh  response-headers\n\n\
-\x1b[1mOUTPUT\x1b[0m\n  \
-  -o out.json    NDJSON, one record per line (default)\n  \
-  -o out.txt     plain 'STATUS SIZE URL' lines (auto-detected from .txt)\n  \
-  --rh           add every response header to terminal + JSON\n  \
-  -q             quiet: no banner, no update check\n\n\
-Docs: https://github.com/assassin-marcos/httpxer"
+    about = "Fast HTTP probing, technology detection, and smart path fuzzing.",
+    long_about = r#"Fast HTTP probing, technology detection, and smart path fuzzing.
+
+MODE
+  No -w    Probe hosts: status, title, headers, technology, IP, and CDN
+  With -w  Fuzz paths: wildcard filtering, backup checks, recursion, and crawl"#,
+    after_help = r#"QUICK EXAMPLES
+  [PROBE]    httpxer -u https://example.com
+  [TECH]     httpxer -u https://example.com --tech default
+  [HEADERS]  httpxer -u https://example.com --rh
+  [FUZZ]     httpxer -u https://example.com -w common.txt -o hits.txt
+  [DEEP]     httpxer -u https://example.com -w common.txt --deep 3
+  [AUTH]     httpxer -u https://example.com --bearer "$TOKEN"
+  [PROXY]    httpxer -u https://example.com --proxy proxies.txt
+  [BACKUP]   httpxer -u https://example.com -w common.txt --backup dry-run
+
+Use `httpxer --help` for advanced options and more examples."#,
+    after_long_help = r#"PRACTICAL EXAMPLES
+
+  PROBE AND TECHNOLOGY
+    httpxer -u https://example.com
+    httpxer -l hosts.txt --tech default -o hosts.jsonl
+    httpxer -l hosts.txt --tech off -o hosts.jsonl
+
+  HEADERS AND BODY
+    httpxer -u https://example.com --rh
+    httpxer -u https://example.com --rh --with-body -o response.jsonl
+
+  PATH FUZZING
+    httpxer -u https://example.com -w common.txt -o hits.txt
+    httpxer -u https://example.com -w admin.txt,api.txt --status '2xx,3xx,!429,!503'
+    httpxer -l hosts.txt -w common.txt -t 50 --rate-limit 10 -o hits.jsonl
+
+  RECURSION AND CRAWL
+    httpxer -u https://example.com -w common.txt --recurse 3
+    httpxer -u https://example.com -w common.txt --crawl 3
+    httpxer -u https://example.com -w common.txt --deep 3
+
+  AUTHENTICATION
+    httpxer -u https://example.com --bearer "$TOKEN"
+    httpxer -u https://example.com -H 'X-API-Key: secret' --cookie 'sid=abc'
+
+  PROXY AND ROTATION
+    httpxer -u https://example.com --proxy http://user:pass@127.0.0.1:8080
+    httpxer -l hosts.txt --proxy proxies.txt -o hosts.jsonl
+
+  BACKUP AND WILDCARD REVIEW
+    httpxer -u https://example.com -w common.txt --backup dry-run
+    httpxer -u https://example.com -w common.txt --wildcard mark -o review.jsonl
+    httpxer -u https://example.com -w common.txt --safe
+
+  PIPELINES AND OUTPUT
+    cat hosts.txt | httpxer -l - --httpx-compat -o hosts.jsonl
+    httpxer -u https://example.com -w common.txt -o hits.txt
+
+`.txt` output is plain `STATUS SIZE URL`; other extensions use JSONL.
+Full recipes: https://github.com/assassin-marcos/httpxer"#
 )]
 struct Args {
-    /// Input file (one hostname/URL per line, "-" for stdin). Either `-l`
-    /// or `-u` is required (mutually compatible — `-u` is a one-host
-    /// shortcut).
+    /// Host/URL file, or `-` for stdin (alternative: `-u`)
     #[arg(short = 'l', long, alias = "list",
-          required_unless_present_any = ["update", "check_update", "uninstall", "target"])]
+          required_unless_present_any = ["update", "check_update", "uninstall", "target"],
+          help_heading = "Targets")]
     input: Option<String>,
 
-    /// Output NDJSON file
-    #[arg(short = 'o', long, alias = "output")]
+    /// Save results (`.txt` is plain text; other extensions use JSONL)
+    #[arg(short = 'o', long, alias = "output", help_heading = "Output")]
     output: Option<String>,
 
-    /// Concurrent HTTP probes (matches httpx -t default)
-    #[arg(short = 't', long, default_value_t = 250)]
+    /// Concurrent HTTP requests
+    #[arg(short = 't', long, default_value_t = 250, help_heading = "Network")]
     threads: usize,
 
-    /// Per-probe HTTP timeout (ms)
-    #[arg(visible_alias = "to", long, default_value_t = 5000)]
+    /// Request timeout in milliseconds
+    #[arg(visible_alias = "to", long, default_value_t = 5000, help_heading = "Network")]
     timeout_ms: u64,
 
     /// Don't follow redirects (default: follow up to --max-redirects hops, matches httpx -fr)
-    #[arg(visible_alias = "nfr", long)]
+    #[arg(visible_alias = "nfr", long, hide_short_help = true, help_heading = "Network")]
     no_follow_redirects: bool,
 
     /// (enrich) Max redirect hops to chase. SSO chains often need 4-6.
-    #[arg(visible_alias = "mr", long, default_value_t = 10)]
+    #[arg(visible_alias = "mr", long, default_value_t = 10, hide_short_help = true, help_heading = "Network")]
     max_redirects: usize,
 
     /// Concurrent DNS lookups
-    #[arg(visible_alias = "dc", long, default_value_t = 100)]
+    #[arg(visible_alias = "dc", long, default_value_t = 100, hide_short_help = true, help_heading = "Network")]
     dns_concurrency: usize,
 
     /// DNS timeout per lookup (seconds)
-    #[arg(visible_alias = "dt", long, default_value_t = 3)]
+    #[arg(visible_alias = "dt", long, default_value_t = 3, hide_short_help = true, help_heading = "Network")]
     dns_timeout: u64,
 
     /// Embed in every output record under "domain"
-    #[arg(long)]
+    #[arg(long, hide_short_help = true, help_heading = "Output")]
     domain: Option<String>,
 
     /// Embed in every output record under "scan_id"
-    #[arg(visible_alias = "sid", long)]
+    #[arg(visible_alias = "sid", long, hide_short_help = true, help_heading = "Output")]
     scan_id: Option<String>,
 
     /// Embed in every output record under "source_tools" (e.g. "subfinder,amass")
-    #[arg(visible_alias = "stools", long)]
+    #[arg(visible_alias = "stools", long, hide_short_help = true, help_heading = "Output")]
     source_tools: Option<String>,
 
-    /// Skip CDN range fetching (cdn field will always be empty)
-    #[arg(long)]
+    /// Disable CDN detection in probe mode
+    #[arg(long, help_heading = "Probe mode")]
     no_cdn: bool,
 
-    /// Skip Wappalyzer tech-detect (faster + smaller output; tech field will be empty)
-    #[arg(long)]
+    /// Skip tech detection (legacy spelling; prefer `--tech off`)
+    #[arg(long, hide_short_help = true, help_heading = "Probe mode")]
     no_tech: bool,
 
-    /// Load fingerprints from this path instead of the embedded snapshot
-    #[arg(long)]
+    /// Load a fingerprint JSON file (legacy spelling; prefer `--tech FILE`)
+    #[arg(long, hide_short_help = true, help_heading = "Probe mode")]
     fingerprints: Option<String>,
 
+    /// Technology detection: `default`, `off`, or a fingerprint JSON file
+    #[arg(long, value_name = "MODE|FILE", help_heading = "Probe mode")]
+    tech: Option<String>,
+
     /// Don't resume — overwrite output file (default: skip hosts already in output)
-    #[arg(long)]
+    #[arg(long, hide_short_help = true, help_heading = "Output")]
     no_resume: bool,
 
     /// Disable browser TLS impersonation (use a plain wreq client). WAFs will
     /// see a non-Chrome JA4 fingerprint, which is fine on un-fronted targets
     /// and a few % faster on cold-start. Default: impersonate Chrome/Firefox/
     /// Safari/Edge with a random profile per probe.
-    #[arg(visible_alias = "ni", long)]
+    #[arg(visible_alias = "ni", long, hide_short_help = true, help_heading = "Network")]
     no_impersonate: bool,
 
     /// Include response body (capped at 2 MiB) in each output record under
     /// the `body` field. Useful for debugging fingerprint-echo endpoints
     /// (tls.peet.ws, ja3er.com) or archiving raw HTML. Off by default —
     /// keeps output files small.
-    #[arg(visible_alias = "wb", long)]
+    #[arg(visible_alias = "wb", long, hide_short_help = true, help_heading = "Output")]
     with_body: bool,
 
     /// Emit enrich-mode records in ProjectDiscovery httpx's JSON shape
@@ -183,17 +192,14 @@ struct Args {
     /// `webserver` is emitted alongside `server`; `host_ip` is added as
     /// the first A record (or first AAAA when no A is present).
     /// Inert in fuzz mode (the fuzz schema is already httpx-shaped).
-    #[arg(long = "httpx-compat", visible_alias = "hc")]
+    #[arg(long = "httpx-compat", visible_alias = "hc", hide_short_help = true, help_heading = "Output")]
     httpx_compat: bool,
 
     // ── Fuzz-mode flags (v0.3.0+) ──────────────────────────────────────
     // Presence of `-path / --paths` switches the binary from enrich mode
     // (1 probe per host) into fuzz mode (host × wordlist Cartesian probe).
     // All flags below are inert in enrich mode.
-    /// Wordlist file (one path per line) — when set, switches to fuzz mode
-    /// (host × path probe). Empty paths and `#` comments are skipped.
-    /// v0.3.7 also accepts `-w` / `--wordlist` / `--wordlists` for
-    /// dirsearch-muscle-memory compat (all aliases point at the same flag).
+    /// Wordlist file(s); setting `-w` enables fuzz mode
     #[arg(
         short = 'p',
         long = "paths",
@@ -205,51 +211,49 @@ struct Args {
     )]
     paths: Option<String>,
 
-    /// (fuzz) Comma-separated status codes to emit
-    #[arg(
-        long = "match-codes",
+    /// (fuzz) Legacy include-only status list; prefer `--status`
+    #[arg(long = "match-codes", hide_short_help = true, help_heading = "Fuzz mode")]
+    match_codes: Option<String>,
 
-        default_value = "200,301,302,307,308,401,403",
-        help_heading = "Fuzz mode"
-    )]
-    match_codes: String,
+    /// Statuses to keep, for example `2xx,3xx,!429`
+    #[arg(long = "status", value_name = "SELECTOR", help_heading = "Fuzz mode")]
+    status: Option<String>,
 
     /// (fuzz) Body preview length in bytes (HTML-entity-encoded in output)
     #[arg(
         long = "body-preview", visible_alias = "bp",
         default_value_t = 8192,
+        hide_short_help = true,
         help_heading = "Fuzz mode"
     )]
     body_preview: usize,
 
-    /// (fuzz) Wildcard suppression policy: strict|mark|off
+    /// Catchall handling: `strict`, `mark`, or `off`
     #[arg(
-        long = "wildcard-policy", visible_alias = "wp",
+        long = "wildcard", visible_alias = "wildcard-policy", alias = "wp",
         default_value = "strict",
         help_heading = "Fuzz mode"
     )]
     wildcard_policy: String,
 
     /// (fuzz) Shortcut for `--wildcard-policy off`
-    #[arg(long = "no-wildcard", help_heading = "Fuzz mode")]
+    #[arg(long = "no-wildcard", hide = true)]
     no_wildcard: bool,
 
-    /// (fuzz) Safe mode: disable the native, auto 401/403 bypass engine
-    /// (path-override headers + path mutations on forbidden responses).
-    /// Use on programs/targets where bypass attempts are out of scope.
+    /// Disable automatic 401/403 bypass checks
     #[arg(long = "safe", help_heading = "Fuzz mode")]
     safe: bool,
 
-    /// (fuzz) Per-host requests/sec ceiling. 0 = disabled (default).
+    /// Maximum requests per second per host; `0` disables the limit
     #[arg(long = "rate-limit", visible_alias = "rl", default_value_t = 0.0, help_heading = "Fuzz mode")]
     rate_limit: f64,
 
     /// (fuzz) Retry count on network error
-    #[arg(long = "retries", default_value_t = 1, help_heading = "Fuzz mode")]
+    #[arg(long = "retries", default_value_t = 1, hide_short_help = true, help_heading = "Fuzz mode")]
     retries: u32,
 
     /// (fuzz) Emit status_code=0 records (connection errors). Off by default.
-    #[arg(long = "include-errors", visible_alias = "ie", help_heading = "Fuzz mode")]
+    #[arg(long = "include-errors", visible_alias = "ie", hide_short_help = true, help_heading = "Fuzz mode")]
     include_errors: bool,
 
     // ── Host-derived backup discovery (v0.6.0) ──────────────────────────
@@ -262,65 +266,78 @@ struct Args {
     // candidate budget scales with how fast the host answers, and backup
     // directories are only expanded into after one is shown to exist. The
     // three flags below are the only decisions a human can usefully make.
-    /// (backup) Turn OFF host-derived backup probing.
-    #[arg(long = "no-backup-fuzz", help_heading = "Backup discovery")]
+    /// Automatic backup checks: `auto`, `off`, or `dry-run`
+    #[arg(
+        long = "backup",
+        default_value = "auto",
+        value_parser = ["auto", "off", "dry-run"],
+        help_heading = "Backup discovery"
+    )]
+    backup: String,
+
+    /// Legacy shortcut for `--backup off`.
+    #[arg(long = "no-backup-fuzz", hide = true)]
     no_backup_fuzz: bool,
 
-    /// (backup) Print the candidates that would be probed and send no
-    /// requests.
-    #[arg(long = "backup-dry-run", help_heading = "Backup discovery")]
+    /// Legacy shortcut for `--backup dry-run`.
+    #[arg(long = "backup-dry-run", hide = true)]
     backup_dry_run: bool,
 
     /// (backup) Extra base-name tokens, comma-separated. The one thing the
     /// tool cannot infer: an internal project name unrelated to the
     /// hostname (e.g. `--backup-tokens acmecorp,internal-portal`).
-    #[arg(long = "backup-tokens", value_name = "LIST", help_heading = "Backup discovery")]
+    #[arg(long = "backup-tokens", value_name = "LIST", hide_short_help = true, help_heading = "Backup discovery")]
     backup_tokens: Option<String>,
 
-    /// (fuzz) Status codes to EXCLUDE from output (default `429,503` —
-    /// transient overload). Empty to disable. 403/404 are NOT in the
-    /// default because they can be real findings (Apache reveal-on-403,
-    /// stack-trace 404s).
+    /// (fuzz) Legacy status-code exclusions; prefer `--status '2xx,!429'`.
     #[arg(
         long = "exclude",
         alias = "exclude-codes",
         alias = "exclude-status",
-        default_value = "429,503",
+        hide_short_help = true,
         help_heading = "Fuzz mode"
     )]
-    exclude_codes: String,
+    exclude_codes: Option<String>,
 
     /// (fuzz) Alias of `--match-codes` for dirsearch-muscle-memory users.
-    #[arg(short = 'i', long = "include", help_heading = "Fuzz mode")]
+    #[arg(short = 'i', long = "include", hide_short_help = true, help_heading = "Fuzz mode")]
     include_status: Option<String>,
 
     // ── Recursion (v0.3.7) ─────────────────────────────────────────────
-    /// Enable recursive fuzz — discovered directories get re-fuzzed with
-    /// the same wordlist up to `-R` levels deep. Per-directory multi-sample
-    /// wildcard fingerprinting prevents soft-404 / catchall cascades.
-    /// Default: off (single-round, v0.3.6 behavior).
-    #[arg(short = 'r', long = "recursive", help_heading = "Recursion")]
+    /// Re-fuzz discovered directories (default depth: 3)
+    #[arg(
+        long = "recurse",
+        visible_alias = "recursive",
+        value_name = "DEPTH",
+        num_args = 0..=1,
+        default_missing_value = "3",
+        help_heading = "Recursion"
+    )]
+    recurse: Option<u8>,
+
+    /// Legacy short spelling for `--recurse` (default depth 3)
+    #[arg(short = 'r', hide = true)]
     recursive: bool,
 
-    /// (recursion) Max depth. Default 3 when `-r` is on.
+    /// Legacy recursion depth spelling; using it alone enables recursion
     #[arg(
         short = 'R',
         long = "recursion-depth", visible_alias = "rd",
-        default_value_t = 3,
+        hide_short_help = true,
         help_heading = "Recursion"
     )]
-    recursion_depth: u8,
+    recursion_depth: Option<u8>,
 
     /// (recursion) Also recurse on 200 + autoindex marker (`Index of /`).
-    #[arg(long = "recurse-on-200", visible_alias = "r200", help_heading = "Recursion")]
+    #[arg(long = "recurse-on-200", visible_alias = "r200", hide_short_help = true, help_heading = "Recursion")]
     recurse_on_200: bool,
 
     /// (recursion) Also recurse on 403 (off by default — WAF noise prone).
-    #[arg(long = "recurse-on-403", visible_alias = "r403", help_heading = "Recursion")]
+    #[arg(long = "recurse-on-403", visible_alias = "r403", hide_short_help = true, help_heading = "Recursion")]
     recurse_on_403: bool,
 
     /// (recursion) Hard cap on discovered directories per input host.
-    #[arg(long = "max-dirs-per-host", visible_alias = "md", default_value_t = 200, help_heading = "Recursion")]
+    #[arg(long = "max-dirs-per-host", visible_alias = "md", default_value_t = 200, hide_short_help = true, help_heading = "Recursion")]
     max_dirs_per_host: usize,
 
     /// REMOVED in v0.5.0 — was never enforced. The counter behind it
@@ -335,12 +352,12 @@ struct Args {
     /// (recursion) Override the built-in --exclude-subdirs default list
     /// (asset/traversal noise). Comma-separated. Empty string = disable
     /// excludes entirely.
-    #[arg(long = "exclude-subdirs", visible_alias = "xs", help_heading = "Recursion")]
+    #[arg(long = "exclude-subdirs", visible_alias = "xs", hide_short_help = true, help_heading = "Recursion")]
     exclude_subdirs: Option<String>,
 
     /// (recursion) Append to the built-in --exclude-subdirs list
     /// (doesn't replace defaults; just adds).
-    #[arg(long = "add-excludes", visible_alias = "xa", help_heading = "Recursion")]
+    #[arg(long = "add-excludes", visible_alias = "xa", hide_short_help = true, help_heading = "Recursion")]
     add_excludes: Option<String>,
 
     /// (recursion) How exclude entries match: `segment` (default — last
@@ -348,13 +365,13 @@ struct Args {
     /// (any entry appears anywhere in the path). Substring is dirsearch-
     /// muscle-memory compat and catches encoded traversal noise
     /// (`%2e%2e`, `%3b`, `..//`) hidden mid-path.
-    #[arg(long = "exclude-mode", visible_alias = "xm", default_value = "segment", help_heading = "Recursion")]
+    #[arg(long = "exclude-mode", visible_alias = "xm", default_value = "segment", hide_short_help = true, help_heading = "Recursion")]
     exclude_mode: String,
 
     /// (fuzz) Exact content-length(s) to drop from output. Comma-separated
     /// bytes — accepts trailing `B`. Mirrors dirsearch `--exclude-sizes`.
     /// Empty = no size filter.
-    #[arg(long = "exclude-sizes", visible_alias = "es", default_value = "", help_heading = "Fuzz mode")]
+    #[arg(long = "exclude-sizes", visible_alias = "es", default_value = "", hide_short_help = true, help_heading = "Fuzz mode")]
     exclude_sizes: String,
 
     /// (fuzz) Probe `/` once at startup and add its content-length to
@@ -362,7 +379,7 @@ struct Args {
     /// that return the homepage for every path (a pattern the wildcard
     /// detector usually catches, but this is the explicit dirsearch
     /// pattern from `ROOT_SIZE=$(curl ...)`).
-    #[arg(long = "exclude-root-size", visible_alias = "ers", help_heading = "Fuzz mode")]
+    #[arg(long = "exclude-root-size", visible_alias = "ers", hide_short_help = true, help_heading = "Fuzz mode")]
     exclude_root_size: bool,
 
     /// Output file format. `json` (default) writes one full FuzzRecord
@@ -370,7 +387,7 @@ struct Args {
     /// `STATUS  SIZE  URL` per finding — much smaller files, human-
     /// readable, no body_preview. Auto-detected from `-o` extension when
     /// this flag isn't passed (`.txt` → `plain`, anything else → `json`).
-    #[arg(long = "format", help_heading = "Output")]
+    #[arg(long = "format", hide_short_help = true, help_heading = "Output")]
     format: Option<String>,
 
     /// Suppress the live findings display on stderr (v0.3.13). By
@@ -378,14 +395,10 @@ struct Args {
     /// dirsearch-style format (`STATUS SIZE URL`, color-coded by status
     /// class) above the progress bar. Pass this to silence and rely on
     /// the output file only — useful for log scrapers / tee invocations.
-    #[arg(long = "no-live", help_heading = "Output")]
+    #[arg(long = "no-live", hide_short_help = true, help_heading = "Output")]
     no_live: bool,
 
-    /// Capture the FULL response header set: printed under each result on the
-    /// terminal AND emitted as a `response_headers` JSON object (lowercase
-    /// keys; duplicate headers like Set-Cookie folded with ", "). Works in
-    /// BOTH modes — enrich (`-u` / `-l`) and fuzz (`-w`). Off by default to
-    /// keep output small. Aliases mirror httpx muscle memory: `--rh`, `--irh`.
+    /// Print response headers and include them in JSONL output
     #[arg(
         long = "response-headers",
         visible_alias = "rh",
@@ -395,92 +408,105 @@ struct Args {
     response_headers: bool,
 
     // ── Crawl (v0.3.7) ─────────────────────────────────────────────────
-    /// Enable response crawling — parse HTML/robots.txt/sitemap.xml for
-    /// endpoints and add them to the fuzz frontier. Same-host scope by
-    /// default; static assets + third-party CDNs filtered out.
-    #[arg(long = "crawl", help_heading = "Crawl")]
-    crawl: bool,
+    /// Discover paths from HTML, robots.txt, and sitemaps
+    #[arg(
+        long = "crawl",
+        value_name = "DEPTH",
+        num_args = 0..=1,
+        default_missing_value = "3",
+        help_heading = "Crawl"
+    )]
+    crawl: Option<u8>,
+
+    /// Enable recursion and crawling together
+    #[arg(
+        long = "deep",
+        value_name = "DEPTH",
+        num_args = 0..=1,
+        default_missing_value = "3",
+        help_heading = "Crawl"
+    )]
+    deep: Option<u8>,
 
     /// (crawl) Max crawl depth. Default = `--recursion-depth`.
-    #[arg(long = "crawl-depth", visible_alias = "cd", help_heading = "Crawl")]
+    #[arg(long = "crawl-depth", visible_alias = "cd", hide_short_help = true, help_heading = "Crawl")]
     crawl_depth: Option<u8>,
 
     /// (crawl) Cap on URLs extracted per response (default 200).
-    #[arg(long = "max-links-per-page", visible_alias = "mlp", default_value_t = 200, help_heading = "Crawl")]
+    #[arg(long = "max-links-per-page", visible_alias = "mlp", default_value_t = 200, hide_short_help = true, help_heading = "Crawl")]
     max_links_per_page: usize,
 
     /// (crawl) Override the same-host default scope. Comma-separated host
     /// patterns. Supports `*.example.com` wildcard suffix.
     /// Built-in third-party deny list (Google/Cloudflare/CDN hosts) still
     /// applies regardless.
-    #[arg(long = "scope", help_heading = "Crawl")]
+    #[arg(long = "scope", hide_short_help = true, help_heading = "Crawl")]
     scope: Option<String>,
 
     // ── Misc fuzz behavior (v0.3.7) ────────────────────────────────────
-    /// (fuzz) Follow redirects within fuzz probes (3xx normally a finding).
-    /// Auto-on when `--crawl` is set.
-    #[arg(long = "fuzz-follow-redirects", visible_alias = "ffr", help_heading = "Fuzz mode")]
+    /// (fuzz) Follow redirects and classify the terminal response (advanced)
+    #[arg(long = "fuzz-follow-redirects", visible_alias = "ffr", hide_short_help = true, help_heading = "Fuzz mode")]
     fuzz_follow_redirects: bool,
 
     // ── Auth (v0.3.7) ──────────────────────────────────────────────────
-    /// Custom request header. Repeatable. Format `"Name: Value"`.
+    /// Add a request header; repeatable (`Name: Value`)
     #[arg(short = 'H', long = "header", help_heading = "Auth")]
     headers: Vec<String>,
 
-    /// `Authorization: Bearer TOKEN` shortcut.
+    /// Add `Authorization: Bearer TOKEN`
     #[arg(long = "bearer", help_heading = "Auth")]
     bearer: Option<String>,
 
-    /// Cookie to attach. Repeatable. Format `"Name=Value"`.
-    /// Sent as a fixed `Cookie:` header on every request — there is NO cookie
-    /// jar, so `Set-Cookie` from responses is never captured or replayed.
-    #[arg(long = "cookie", help_heading = "Auth")]
+    /// Add a cookie; repeatable (`Name=Value`)
+    #[arg(
+        long = "cookie",
+        help_heading = "Auth",
+        long_help = "Add a fixed cookie; repeatable (`Name=Value`). Response cookies are not stored or replayed."
+    )]
     cookies: Vec<String>,
 
     // ── Convenience ─────────────────────────────────────────────────────
-    /// Single-target shortcut (alternative to `-l file`). Equivalent to
-    /// passing a one-line input file.
-    #[arg(short = 'u', long = "target")]
+    /// One target URL or hostname (alternative to `-l`)
+    #[arg(short = 'u', long = "target", help_heading = "Targets")]
     target: Option<String>,
 
-    /// HTTP / HTTPS / SOCKS5 proxy URL. Applied to EVERY client in the
-    /// 16-slot pool, so both enrich and fuzz modes route through the same
-    /// upstream. Accepts `http://host:port`, `https://host:port`,
-    /// `socks5://host:port`, and `socks5h://host:port`. Invalid URLs fail
-    /// loudly at startup. Sets `via_proxy:true` on every output record.
-    #[arg(long = "proxy")]
+    /// Use one proxy URL or rotate entries from a proxy file
+    #[arg(
+        long = "proxy",
+        value_name = "URL|FILE",
+        help_heading = "Network",
+        long_help = "Use one proxy URL or rotate a file per request. Files use one endpoint per line; blank lines and `#` comments are ignored. Mixed `http://`, `https://`, `socks4[a]://`, and `socks5[h]://` entries are accepted. Put HTTP/HTTPS/SOCKS5 credentials in the URL (`scheme://user:pass@host:port`); SOCKS4 authentication is unsupported. A bare `host:port` defaults to HTTP; prefix a path with `@` to force file mode."
+    )]
     proxy: Option<String>,
 
     // ── Self-management ────────────────────────────────────────────────
-    /// Install the latest release (replaces this binary in place).
-    /// Short flag is `-U` (uppercase) — `-u` was reclaimed for `--target`
-    /// in v0.3.7 for dirsearch-muscle-memory compat.
+    /// Install the latest published release
     #[arg(short = 'U', long, help_heading = "Self-management")]
     update: bool,
 
-    /// Check for updates and exit (no install)
+    /// Check for a newer release
     #[arg(short = 'c', long, help_heading = "Self-management")]
     check_update: bool,
 
     /// Uninstall httpxer (deletes this binary + the version-check cache)
-    #[arg(short = 'X', long, help_heading = "Self-management")]
+    #[arg(short = 'X', long, hide_short_help = true, help_heading = "Self-management")]
     uninstall: bool,
 
     /// Skip the uninstall confirmation prompt
-    #[arg(short = 'y', long, help_heading = "Self-management")]
+    #[arg(short = 'y', long, hide_short_help = true, help_heading = "Self-management")]
     yes: bool,
 
     /// Suppress the "update available" startup banner
-    #[arg(visible_alias = "nuc", long, help_heading = "Self-management")]
+    #[arg(visible_alias = "nuc", long, hide_short_help = true, help_heading = "Self-management")]
     no_update_check: bool,
 
-    /// Quiet mode (alias for --no-update-check + --no-art — useful when piping)
+    /// Hide banner, live findings, and progress
     #[arg(short = 'q', long, help_heading = "Self-management")]
     quiet: bool,
 
     /// Suppress the ASCII-art startup banner (banner is always skipped when
     /// stderr is not a TTY, so piped output is never polluted regardless)
-    #[arg(long, help_heading = "Self-management")]
+    #[arg(long, hide_short_help = true, help_heading = "Self-management")]
     no_art: bool,
 
     // ── httpx compatibility no-ops ───────────────────────────────────────
@@ -526,43 +552,53 @@ struct Args {
     /// Disable ANSI colour in terminal output (also honours the conventional
     /// `NO_COLOR` env var). v0.5.0 — this used to be a documented no-op that
     /// falsely claimed httpxer emitted no ANSI; it now genuinely suppresses it.
-    #[arg(long = "no-color", help_heading = "Output")]
+    #[arg(long = "no-color", hide_short_help = true, help_heading = "Output")]
     no_color: bool,
     /// httpx compat (no-op — httpxer doesn't print per-record stderr noise)
     #[arg(long, hide = true)]
     silent: bool,
 }
 
-/// Convert Go-style single-dash long flags (`-fr`, `-sc`, `-no-color`) into
-/// clap's double-dash form (`--fr`, `--sc`, `--no-color`) so the user can
-/// paste their existing httpx invocation verbatim. Single-char short flags
-/// (`-l`, `-o`, `-t`) and negative numbers are left untouched. argv[0]
-/// (the binary path) is always passed through unchanged.
+/// Convert known Go-style single-dash long flags (`-fr`, `-sc`, `-no-color`)
+/// into clap's double-dash form. Only names registered with clap are rewritten:
+/// this preserves valid attached short values (`-t150`, `-R3`) and short-flag
+/// clusters (`-rq`). Everything after `--` is passed through verbatim.
 fn normalize_args<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
-    args.into_iter()
-        .enumerate()
-        .map(|(i, a)| {
-            if i == 0 {
-                return a;
-            }
-            let bytes = a.as_bytes();
-            // Match: starts with single `-`, has ≥3 chars total, first char
-            // after the dash is alpha (rules out `-3.5`-style negatives),
-            // and the rest is identifier-ish.
-            if bytes.len() >= 3
-                && bytes[0] == b'-'
-                && bytes[1] != b'-'
-                && bytes[1].is_ascii_alphabetic()
-                && a[1..]
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
-                format!("-{}", a)
-            } else {
-                a
-            }
-        })
-        .collect()
+    let command = Args::command();
+    let mut known_long_names: HashSet<String> = HashSet::new();
+    for arg in command.get_arguments() {
+        if let Some(name) = arg.get_long() {
+            known_long_names.insert(name.to_string());
+        }
+        if let Some(aliases) = arg.get_all_aliases() {
+            known_long_names.extend(aliases.into_iter().map(str::to_string));
+        }
+    }
+
+    let mut normalized = Vec::new();
+    let mut positional_only = false;
+    for (index, arg) in args.into_iter().enumerate() {
+        if index == 0 {
+            normalized.push(arg);
+            continue;
+        }
+        if positional_only {
+            normalized.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            normalized.push(arg);
+            continue;
+        }
+        let replacement = arg
+            .strip_prefix('-')
+            .filter(|name| !name.starts_with('-'))
+            .filter(|name| known_long_names.contains(*name))
+            .map(|name| format!("--{}", name));
+        normalized.push(replacement.unwrap_or(arg));
+    }
+    normalized
 }
 
 #[derive(Serialize)]
@@ -941,6 +977,318 @@ fn read_existing_subdomains(path: &str) -> HashSet<String> {
     out
 }
 
+const DEFAULT_MATCH_CODES: &str = "200,301,302,307,308,401,403";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TechSelection {
+    enabled: bool,
+    fingerprints_path: Option<String>,
+}
+
+fn resolve_tech_selection(
+    tech: Option<&str>,
+    no_tech: bool,
+    fingerprints: Option<&str>,
+) -> Result<TechSelection> {
+    if tech.is_some() && (no_tech || fingerprints.is_some()) {
+        anyhow::bail!(
+            "--tech cannot be combined with legacy --no-tech or --fingerprints"
+        );
+    }
+    if let Some(value) = tech {
+        return match value.trim().to_ascii_lowercase().as_str() {
+            "default" | "embedded" => Ok(TechSelection {
+                enabled: true,
+                fingerprints_path: None,
+            }),
+            "off" | "none" => Ok(TechSelection {
+                enabled: false,
+                fingerprints_path: None,
+            }),
+            _ if value.trim().is_empty() => anyhow::bail!(
+                "--tech needs `default`, `off`, or a fingerprint JSON path"
+            ),
+            _ => Ok(TechSelection {
+                enabled: true,
+                fingerprints_path: Some(value.trim().to_string()),
+            }),
+        };
+    }
+    Ok(TechSelection {
+        enabled: !no_tech,
+        fingerprints_path: if no_tech {
+            None
+        } else {
+            fingerprints.map(str::to_string)
+        },
+    })
+}
+
+fn parse_exact_status_list(value: &str, flag: &str) -> Result<Vec<u16>> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut codes = HashSet::new();
+    for raw in value.split(',') {
+        let token = raw.trim();
+        if token.is_empty() {
+            anyhow::bail!("{} contains an empty status token", flag);
+        }
+        let code = token
+            .parse::<u16>()
+            .with_context(|| format!("{} contains invalid status '{}'", flag, token))?;
+        if !(100..=999).contains(&code) {
+            anyhow::bail!("{} status {} is outside 100..999", flag, code);
+        }
+        codes.insert(code);
+    }
+    let mut codes: Vec<u16> = codes.into_iter().collect();
+    codes.sort_unstable();
+    Ok(codes)
+}
+
+fn expand_status_selector(token: &str) -> Result<Vec<u16>> {
+    let lower = token.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    if bytes.len() == 3
+        && (b'1'..=b'9').contains(&bytes[0])
+        && bytes[1] == b'x'
+        && bytes[2] == b'x'
+    {
+        let start = u16::from(bytes[0] - b'0') * 100;
+        return Ok((start..=start + 99).collect());
+    }
+    let code = lower
+        .parse::<u16>()
+        .with_context(|| format!("invalid status selector '{}'", token))?;
+    if !(100..=999).contains(&code) {
+        anyhow::bail!("status selector {} is outside 100..999", code);
+    }
+    Ok(vec![code])
+}
+
+fn parse_status_selector(value: &str) -> Result<(Vec<u16>, Vec<u16>)> {
+    let mut included = HashSet::new();
+    let mut excluded = HashSet::new();
+    for raw in value.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            anyhow::bail!("--status contains an empty selector");
+        }
+        let (negated, token) = match raw.strip_prefix('!') {
+            Some(token) if !token.is_empty() => (true, token),
+            Some(_) => anyhow::bail!("--status contains a bare '!'") ,
+            None => (false, raw),
+        };
+        for code in expand_status_selector(token)? {
+            if negated {
+                excluded.insert(code);
+            } else {
+                included.insert(code);
+            }
+        }
+    }
+    if included.is_empty() {
+        anyhow::bail!("--status needs at least one positive code or class");
+    }
+    let mut included: Vec<u16> = included.into_iter().collect();
+    let mut excluded: Vec<u16> = excluded.into_iter().collect();
+    included.sort_unstable();
+    excluded.sort_unstable();
+    Ok((included, excluded))
+}
+
+fn resolve_status_filters(
+    status: Option<&str>,
+    match_codes: Option<&str>,
+    include_status: Option<&str>,
+    exclude_codes: Option<&str>,
+) -> Result<(Vec<u16>, Vec<u16>)> {
+    if let Some(selector) = status {
+        if match_codes.is_some() || include_status.is_some() || exclude_codes.is_some() {
+            anyhow::bail!(
+                "--status cannot be combined with --match-codes, --include, or --exclude"
+            );
+        }
+        return parse_status_selector(selector);
+    }
+    let include = include_status
+        .or(match_codes)
+        .unwrap_or(DEFAULT_MATCH_CODES);
+    let match_codes = parse_exact_status_list(include, "--include/--match-codes")?;
+    if match_codes.is_empty() {
+        anyhow::bail!("the status include list cannot be empty");
+    }
+    let exclude_codes = parse_exact_status_list(exclude_codes.unwrap_or(""), "--exclude")?;
+    Ok((match_codes, exclude_codes))
+}
+
+fn parse_exclude_sizes(value: &str) -> Result<Vec<i64>> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut sizes = HashSet::new();
+    for raw in value.split(',') {
+        let token = raw.trim().trim_end_matches(['B', 'b']);
+        if token.is_empty() {
+            anyhow::bail!("--exclude-sizes contains an empty size");
+        }
+        let size = token
+            .parse::<i64>()
+            .with_context(|| format!("--exclude-sizes contains invalid size '{}'", raw.trim()))?;
+        if size < 0 {
+            anyhow::bail!("--exclude-sizes cannot contain negative values");
+        }
+        sizes.insert(size);
+    }
+    let mut sizes: Vec<i64> = sizes.into_iter().collect();
+    sizes.sort_unstable();
+    Ok(sizes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackupMode {
+    Auto,
+    Off,
+    DryRun,
+}
+
+fn resolve_backup_mode(
+    backup: &str,
+    legacy_off: bool,
+    legacy_dry_run: bool,
+) -> Result<BackupMode> {
+    if legacy_off && legacy_dry_run {
+        anyhow::bail!("--no-backup-fuzz conflicts with --backup-dry-run");
+    }
+    if backup != "auto" && (legacy_off || legacy_dry_run) {
+        anyhow::bail!("--backup cannot be combined with legacy backup mode flags");
+    }
+    if legacy_off {
+        return Ok(BackupMode::Off);
+    }
+    if legacy_dry_run {
+        return Ok(BackupMode::DryRun);
+    }
+    match backup {
+        "auto" => Ok(BackupMode::Auto),
+        "off" => Ok(BackupMode::Off),
+        "dry-run" => Ok(BackupMode::DryRun),
+        other => anyhow::bail!("invalid --backup '{}' (want auto|off|dry-run)", other),
+    }
+}
+
+fn resolve_scan_depths(args: &Args) -> (u8, bool, u8) {
+    let recursion_depth = args
+        .recursion_depth
+        .or(args.recurse)
+        .or(args.deep)
+        .or_else(|| args.recursive.then_some(3))
+        .unwrap_or(0);
+    let crawl_enabled = args.crawl.is_some() || args.crawl_depth.is_some() || args.deep.is_some();
+    let crawl_depth = args
+        .crawl_depth
+        .or(args.crawl)
+        .or(args.deep)
+        .unwrap_or(0);
+    (recursion_depth, crawl_enabled, crawl_depth)
+}
+
+fn backup_sidecar_path(output: Option<&str>) -> String {
+    output
+        .map(|path| format!("{}.backup.jsonl", path))
+        .unwrap_or_else(|| "httpxer-backup.jsonl".to_string())
+}
+
+fn validate_output_destination(path: &str, user_named: bool) -> Result<()> {
+    if !user_named {
+        return Ok(());
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open output {}", path))?;
+    Ok(())
+}
+
+fn write_realtime_line<W: Write>(output: &mut W, line: &str) -> std::io::Result<()> {
+    writeln!(output, "{}", line)?;
+    output.flush()
+}
+
+fn write_enrich_result(
+    joined: std::result::Result<EnrichRecord, tokio::task::JoinError>,
+    output: &mut std::fs::File,
+    httpx_compat: bool,
+    completed: &mut usize,
+    total: usize,
+    quiet: bool,
+) -> Result<()> {
+    match joined {
+        Ok(record) => {
+            let line = if httpx_compat {
+                serde_json::to_string(&HttpxCompatRecord::from_enrich(record))?
+            } else {
+                serde_json::to_string(&record)?
+            };
+            write_realtime_line(output, &line)?;
+            *completed += 1;
+            if !quiet && (*completed % 50 == 0 || *completed == total) {
+                eprintln!("  [{}/{}]", *completed, total);
+            }
+        }
+        Err(error) => {
+            eprintln!("[!] probe task did not complete: {}", error);
+        }
+    }
+    Ok(())
+}
+
+fn validate_mode_specific_args(args: &Args) -> Result<()> {
+    if args.paths.is_some() {
+        return Ok(());
+    }
+    let mut fuzz_only = Vec::new();
+    if args.status.is_some() { fuzz_only.push("--status"); }
+    if args.match_codes.is_some() { fuzz_only.push("--match-codes"); }
+    if args.include_status.is_some() { fuzz_only.push("--include"); }
+    if args.exclude_codes.is_some() { fuzz_only.push("--exclude"); }
+    if args.recurse.is_some() || args.recursive || args.recursion_depth.is_some() {
+        fuzz_only.push("--recurse");
+    }
+    if args.crawl.is_some() || args.crawl_depth.is_some() { fuzz_only.push("--crawl"); }
+    if args.deep.is_some() { fuzz_only.push("--deep"); }
+    if args.backup != "auto" || args.no_backup_fuzz || args.backup_dry_run {
+        fuzz_only.push("--backup");
+    }
+    if args.backup_tokens.is_some() { fuzz_only.push("--backup-tokens"); }
+    if args.safe { fuzz_only.push("--safe"); }
+    if args.rate_limit != 0.0 { fuzz_only.push("--rate-limit"); }
+    if args.retries != 1 { fuzz_only.push("--retries"); }
+    if args.include_errors { fuzz_only.push("--include-errors"); }
+    if args.recurse_on_200 || args.recurse_on_403 { fuzz_only.push("--recurse-on-*"); }
+    if args.exclude_subdirs.is_some() || args.add_excludes.is_some() || args.exclude_mode != "segment" {
+        fuzz_only.push("--exclude-subdirs/--exclude-mode");
+    }
+    if !args.exclude_sizes.is_empty() || args.exclude_root_size {
+        fuzz_only.push("--exclude-sizes/--exclude-root-size");
+    }
+    if args.format.is_some() || args.no_live { fuzz_only.push("--format/--no-live"); }
+    if args.scope.is_some() || args.max_links_per_page != 200 { fuzz_only.push("--scope/--max-links-per-page"); }
+    if args.fuzz_follow_redirects { fuzz_only.push("--fuzz-follow-redirects"); }
+    if args.no_wildcard || args.wildcard_policy != "strict" { fuzz_only.push("--wildcard"); }
+    fuzz_only.sort_unstable();
+    fuzz_only.dedup();
+    if !fuzz_only.is_empty() {
+        anyhow::bail!(
+            "fuzz-only option(s) {} require `-w WORDLIST`",
+            fuzz_only.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Decide whether to draw the ASCII banner BEFORE clap parses argv.
 /// We can't read parsed `args.quiet` / `args.no_art` here (parsing hasn't
 /// happened yet — that's the whole point — clap exiting on missing args
@@ -970,8 +1318,14 @@ fn banner_should_show_early(argv: &[String]) -> bool {
 /// API hit that refreshes the cache). Same constraint: we can't read
 /// parsed `args.no_update_check` yet because clap hasn't run.
 fn update_check_allowed_early(argv: &[String]) -> bool {
-    for a in argv {
+    for (index, a) in argv.iter().enumerate() {
         if a == "-q" || a == "--quiet" || a == "--no-update-check" {
+            return false;
+        }
+        if a == "--backup-dry-run"
+            || a == "--backup=dry-run"
+            || (a == "--backup" && argv.get(index + 1).is_some_and(|v| v == "dry-run"))
+        {
             return false;
         }
     }
@@ -1069,13 +1423,25 @@ async fn main() -> Result<()> {
     if args.uninstall {
         return update::run_uninstall(args.yes);
     }
+    validate_mode_specific_args(&args)?;
 
-    // Validate `--proxy` URL eagerly so a typo fails BEFORE the network
-    // probes. `wreq::Proxy::all` parses the scheme + host:port; we throw
-    // away the built Proxy and rebuild it inside `init_pool` (the value
-    // is cheap to construct and not Clone-cheap to plumb here).
-    if let Some(p) = args.proxy.as_deref() {
-        wreq::Proxy::all(p).map_err(|e| anyhow::anyhow!("invalid --proxy URL '{}': {}", p, e))?;
+    // Parse and validate one proxy URL or a mixed proxy file before target
+    // traffic starts. Diagnostics expose counts and schemes, never credentials.
+    let proxy_config = args
+        .proxy
+        .as_deref()
+        .map(probe::ProxyConfig::from_spec)
+        .transpose()?;
+    let proxy_enabled = proxy_config.is_some();
+    if let Some(config) = proxy_config.as_ref() {
+        if !args.quiet {
+            eprintln!(
+                "[+] proxy: {} endpoint(s) from {} ({}); rotating per request",
+                config.len(),
+                config.source_label(),
+                config.scheme_summary(),
+            );
+        }
     }
 
     // Yellow "[!] update available" stderr alert with What's-new notes —
@@ -1159,10 +1525,11 @@ async fn main() -> Result<()> {
         );
     }
 
-    // `--fingerprints` is only consulted when the tech-detect engine is built,
-    // which `--no-tech` skips entirely — so passing both means the custom
-    // fingerprint file is silently ignored. Warn instead of no-op'ing quietly.
-    // Placed BEFORE the mode split so it fires in fuzz mode too.
+    let tech_selection = resolve_tech_selection(
+        args.tech.as_deref(),
+        args.no_tech,
+        args.fingerprints.as_deref(),
+    )?;
     if args.no_tech && args.fingerprints.is_some() {
         eprintln!(
             "[!] --fingerprints is ignored because --no-tech was passed \
@@ -1177,22 +1544,104 @@ async fn main() -> Result<()> {
     //     finding (not chased). Output schema matches retroh4ck-prober
     //     v0.1.0 — see `src/fuzz.rs` for the FuzzRecord layout.
     if let Some(paths_path) = args.paths.as_deref() {
+        if args.tech.is_some() || args.no_tech || args.fingerprints.is_some() {
+            eprintln!("[!] technology detection options are enrich-only and do not affect fuzz records");
+        }
         let words = fuzz::read_words(paths_path)?;
         eprintln!("[+] wordlist: {} unique paths", words.len());
 
-        // Host-derived backup discovery is ON by default in fuzz mode: the
-        // per-host archive names a wordlist structurally cannot carry are
-        // exactly the ones worth trying while we are already probing this
-        // host. `--no-backup-fuzz` opts out.
-        let backup_enabled = !args.no_backup_fuzz;
-
-        // Build wildcard policy from flags. `--no-wildcard` overrides.
+        // Resolve and validate every fuzz-mode control before creating the
+        // HTTP pool or issuing backup/root-size requests.
+        let backup_mode = resolve_backup_mode(
+            &args.backup,
+            args.no_backup_fuzz,
+            args.backup_dry_run,
+        )?;
+        if matches!(backup_mode, BackupMode::Off) && args.backup_tokens.is_some() {
+            anyhow::bail!("--backup-tokens cannot be used with --backup off");
+        }
         let policy = fuzz::WildcardPolicy::from_cli(&args.wildcard_policy, args.no_wildcard)?;
+        let (match_codes, exclude_codes) = resolve_status_filters(
+            args.status.as_deref(),
+            args.match_codes.as_deref(),
+            args.include_status.as_deref(),
+            args.exclude_codes.as_deref(),
+        )?;
+        let exclude_subdirs = recurse::build_exclude_set(
+            args.exclude_subdirs.as_deref(),
+            args.add_excludes.as_deref(),
+        );
+        let exclude_mode = recurse::ExcludeMode::from_cli(&args.exclude_mode)?;
+        let exclude_sizes = parse_exclude_sizes(&args.exclude_sizes)?;
+        let scope_hosts: Vec<String> = args
+            .scope
+            .as_deref()
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (recursion_depth, crawl_enabled, crawl_depth) = resolve_scan_depths(&args);
+        let output_format = match args.format.as_deref() {
+            Some(value) => fuzz::OutputFormat::from_cli(value)?,
+            None => fuzz::OutputFormat::from_path(output_path),
+        };
+        if args.threads == 0 {
+            anyhow::bail!("--threads must be at least 1");
+        }
+        if args.rate_limit.is_sign_negative() || !args.rate_limit.is_finite() {
+            anyhow::bail!("--rate-limit must be a finite value greater than or equal to 0");
+        }
+
+        let request_limiter = Arc::new(fuzz::ratelimit::HostRateLimiter::new(args.rate_limit));
+        let backup_cfg = backup_fuzz::BackupCfg {
+            token_extra: args
+                .backup_tokens
+                .as_deref()
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|token| !token.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            current_year: chrono::Utc::now()
+                .format("%Y")
+                .to_string()
+                .parse()
+                .unwrap_or(2026),
+            ..Default::default()
+        };
+
+        // A backup preview is a terminal mode: print candidates, send no
+        // target or update-check requests, and never continue into fuzzing.
+        if matches!(backup_mode, BackupMode::DryRun) {
+            eprintln!(
+                "[+] backup discovery: maximum candidate preview \
+                 [dry-run; no requests; live auto may lower the URL budget]"
+            );
+            let opts = backup_fuzz::PhaseOpts {
+                cfg: backup_cfg,
+                dry_run: true,
+                concurrency: args.threads,
+                request: backup_fuzz::RequestCtx {
+                    limiter: request_limiter,
+                    extra_headers,
+                    cookie_header: initial_cookie_header,
+                },
+            };
+            backup_fuzz::run_phase(&hosts, &opts, |_| Ok(())).await?;
+            return Ok(());
+        }
+
+        validate_output_destination(output_path, user_named_output)?;
 
         // Build the impersonation pool once — fuzz uses the same pool
         // enrich does, so the init logic is identical.
-        probe::init_pool(args.timeout_ms, args.no_impersonate, args.proxy.as_deref())?;
-        let request_limiter = Arc::new(fuzz::ratelimit::HostRateLimiter::new(args.rate_limit));
+        probe::init_pool(args.timeout_ms, args.no_impersonate, proxy_config)?;
         if !args.no_impersonate {
             eprintln!(
                 "[+] TLS impersonation: stable real-browser JA3/JA4 + HTTP/2 profile per host"
@@ -1203,18 +1652,10 @@ async fn main() -> Result<()> {
 
         // Backup phase runs before the wordlist sweep so a jackpot archive
         // surfaces immediately rather than after a long path scan.
-        if backup_enabled {
+        if matches!(backup_mode, BackupMode::Auto) {
             let opts = backup_fuzz::PhaseOpts {
-                cfg: backup_fuzz::BackupCfg {
-                    token_extra: args
-                        .backup_tokens
-                        .as_deref()
-                        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
-                        .unwrap_or_default(),
-                    current_year: chrono::Utc::now().format("%Y").to_string().parse().unwrap_or(2026),
-                    ..Default::default()
-                },
-                dry_run: args.backup_dry_run,
+                cfg: backup_cfg,
+                dry_run: false,
                 concurrency: args.threads,
                 request: backup_fuzz::RequestCtx {
                     limiter: request_limiter.clone(),
@@ -1222,72 +1663,36 @@ async fn main() -> Result<()> {
                     cookie_header: initial_cookie_header.clone(),
                 },
             };
-            eprintln!(
-                "[+] backup discovery: host-derived candidates, auto-tuned per host{}",
-                if args.backup_dry_run { " [dry-run]" } else { "" }
-            );
-            let found = backup_fuzz::run_phase(&hosts, &opts).await;
-            if !found.is_empty() {
-                backup_fuzz::print_confirmed_table(&found);
-                let path = format!("{}.backup.jsonl", output_path);
-                let mut buf = String::new();
-                for f in &found {
-                    buf.push_str(&serde_json::to_string(f)?);
-                    buf.push('\n');
+            eprintln!("[+] backup discovery: host-derived candidates, auto-tuned per host");
+            let path = backup_sidecar_path(args.output.as_deref());
+            let mut backup_output: Option<std::fs::File> = None;
+            let mut backup_header_printed = false;
+            let show_backup_live = !args.no_live && !args.quiet;
+            let found = backup_fuzz::run_phase(&hosts, &opts, |finding| {
+                if show_backup_live {
+                    backup_fuzz::print_confirmed_finding(finding, &mut backup_header_printed);
                 }
-                std::fs::write(&path, buf)?;
-                eprintln!("[+] backup findings: {} → {}", found.len(), path);
+                if backup_output.is_none() {
+                    backup_output = Some(
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .truncate(true)
+                            .open(&path)
+                            .with_context(|| format!("open backup output {}", path))?,
+                    );
+                }
+                let output = backup_output.as_mut().expect("backup output just opened");
+                serde_json::to_writer(&mut *output, finding)?;
+                writeln!(output)?;
+                output.flush()?;
+                Ok(())
+            })
+            .await?;
+            if found > 0 {
+                eprintln!("[+] backup findings: {} → {}", found, path);
             }
         }
-
-        // -i / --include is a dirsearch-style alias for --match-codes.
-        // When passed, it OVERRIDES match-codes.
-        let codes_source = args
-            .include_status
-            .as_deref()
-            .unwrap_or(args.match_codes.as_str());
-        let match_codes: Vec<u16> = codes_source
-            .split(',')
-            .filter_map(|s| s.trim().parse::<u16>().ok())
-            .collect();
-        if match_codes.is_empty() {
-            anyhow::bail!(
-                "match codes parsed to zero (got '{}')",
-                codes_source
-            );
-        }
-        let exclude_codes: Vec<u16> = args
-            .exclude_codes
-            .split(',')
-            .filter_map(|s| s.trim().parse::<u16>().ok())
-            .collect();
-
-        // Auth was already built + validated before the mode split (v0.5.0),
-        // and installed for the enrich path via `probe::init_auth`. Fuzz reads
-        // the same values out of `extra_headers` / `initial_cookie_header`.
-
-        // Exclude-subdirs: built-in defaults unless --exclude-subdirs
-        // override is passed; --add-excludes always appends.
-        let exclude_subdirs = recurse::build_exclude_set(
-            args.exclude_subdirs.as_deref(),
-            args.add_excludes.as_deref(),
-        );
-        let exclude_mode = recurse::ExcludeMode::from_cli(&args.exclude_mode)?;
-
-        // Exclude-sizes: parse comma-separated bytes (accept trailing 'B').
-        // Empty string = no size filter.
-        let exclude_sizes: Vec<i64> = args
-            .exclude_sizes
-            .split(',')
-            .filter_map(|s| {
-                let s = s.trim().trim_end_matches(['B', 'b']);
-                if s.is_empty() {
-                    None
-                } else {
-                    s.parse::<i64>().ok()
-                }
-            })
-            .collect();
 
         // --exclude-root-size: probe `/` once and add its CL to exclude_sizes.
         // v0.4.5 — measure the root page through the SAME impersonation pool,
@@ -1311,7 +1716,6 @@ async fn main() -> Result<()> {
                 };
                 let response = probe::retry_wreq_pool_once(|| async {
                     let mut req = slot
-                        .client
                         .get(&url)
                         .redirect(wreq::redirect::Policy::none())
                         .header("Accept-Language", slot.accept_lang)
@@ -1369,53 +1773,24 @@ async fn main() -> Result<()> {
             }
         }
 
-        // v0.3.10 — apply exclude_subdirs to the wordlist BEFORE fuzz
-        // even starts. This is the dirsearch behaviour the user expected
-        // ("any queued path CONTAINING these strings is dropped"). When
-        // exclude_mode=substring, every wordlist entry containing any
-        // exclude pattern is dropped up-front; in segment mode only entries
-        // whose last component matches are dropped.
-        let initial_word_count = words.len();
-        let words: Vec<String> = words
-            .into_iter()
-            .filter(|w| !recurse::path_excluded(w, &exclude_subdirs, exclude_mode))
-            .collect();
-        let filtered = initial_word_count - words.len();
-        if filtered > 0 {
+        // Explicit dictionary entries are user intent and are always probed.
+        // These patterns only prevent discovered directories from expanding
+        // into another full wordlist pass.
+        if (recursion_depth > 0 || crawl_enabled) && !exclude_subdirs.is_empty() {
             eprintln!(
-                "[+] exclude-subdirs ({} mode): {} wordlist entries dropped ({} → {})",
+                "[+] recursion excludes: {} patterns ({} mode; explicit wordlist entries remain enabled)",
+                exclude_subdirs.len(),
                 exclude_mode.as_str(),
-                filtered,
-                initial_word_count,
-                words.len()
             );
         }
 
-        // Scope: empty = same-host-as-input default.
-        let scope_hosts: Vec<String> = args
-            .scope
-            .as_deref()
-            .map(|s| {
-                s.split(',')
-                    .map(|p| p.trim().to_string())
-                    .filter(|p| !p.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Recursion off when `-r` not passed; otherwise honour -R depth.
-        let recursion_depth = if args.recursive { args.recursion_depth } else { 0 };
-        // Crawl-depth defaults to recursion-depth (so a single -R bumps both).
-        let crawl_depth = args.crawl_depth.unwrap_or(args.recursion_depth);
-        // Crawl auto-follows redirects to capture terminal-page bodies —
-        // but an explicit `--no-follow-redirects` is a kill switch and wins
-        // over both that auto-enable and `--fuzz-follow-redirects`.
-        let fuzz_follow_redirects =
-            !args.no_follow_redirects && (args.fuzz_follow_redirects || args.crawl);
-        if args.no_follow_redirects && (args.fuzz_follow_redirects || args.crawl) {
+        // Redirect following is an explicit advanced override. Crawling keeps
+        // the original 3xx response for wildcard/output identity and queues
+        // its Location as a separate discovery instead.
+        let fuzz_follow_redirects = !args.no_follow_redirects && args.fuzz_follow_redirects;
+        if args.no_follow_redirects && args.fuzz_follow_redirects {
             eprintln!(
-                "[!] --no-follow-redirects overrides redirect-following in fuzz mode \
-                 (3xx stays a finding; crawl only sees pre-redirect bodies)"
+                "[!] --no-follow-redirects overrides --fuzz-follow-redirects"
             );
         }
 
@@ -1426,7 +1801,7 @@ async fn main() -> Result<()> {
             wildcard_samples: 3,
             include_errors: args.include_errors,
             retries: args.retries,
-            via_proxy: args.proxy.is_some(),
+            via_proxy: proxy_enabled,
             threads: args.threads,
             timeout_ms: args.timeout_ms,
             request_limiter: request_limiter.clone(),
@@ -1438,7 +1813,9 @@ async fn main() -> Result<()> {
             // v0.4.5 — native 401/403 bypass is auto-on unless `--safe`.
             bypass_enabled: !args.safe,
             max_dirs_per_host: args.max_dirs_per_host,
-            crawl_enabled: args.crawl,
+            recursion_excludes: exclude_subdirs,
+            recursion_exclude_mode: exclude_mode,
+            crawl_enabled,
             crawl_depth,
             crawl_robots: true,
             crawl_sitemap: true,
@@ -1452,11 +1829,9 @@ async fn main() -> Result<()> {
             max_redirects: args.max_redirects,
             initial_cookie_header: auth_ctx.initial_cookie_header(),
             extra_headers,
-            output_format: match args.format.as_deref() {
-                Some(s) => fuzz::OutputFormat::from_cli(s)?,
-                None => fuzz::OutputFormat::from_path(output_path),
-            },
-            live_findings: !args.no_live,
+            output_format,
+            live_findings: !args.no_live && !args.quiet,
+            show_progress: !args.quiet,
             response_headers: args.response_headers,
             // Pipeline provenance tags — enrich mode already embedded these in
             // every record; fuzz mode used to drop them because the FuzzCfg is
@@ -1500,10 +1875,10 @@ async fn main() -> Result<()> {
     }
 
     // 3. Load tech-detect engine (or not).
-    let tech_engine: Option<techdetect::TechEngine> = if args.no_tech {
+    let tech_engine: Option<techdetect::TechEngine> = if !tech_selection.enabled {
         None
     } else {
-        let json = match args.fingerprints.as_deref() {
+        let json = match tech_selection.fingerprints_path.as_deref() {
             Some(p) => std::fs::read_to_string(p).with_context(|| format!("read {}", p))?,
             None => EMBEDDED_FINGERPRINTS.to_string(),
         };
@@ -1535,7 +1910,7 @@ async fn main() -> Result<()> {
     //    Chrome/Firefox/Safari/Edge emulation profile). Each probe later
     //    picks a slot at random so the WAF sees a different real-browser
     //    JA4 fingerprint per request.
-    probe::init_pool(args.timeout_ms, args.no_impersonate, args.proxy.as_deref())?;
+    probe::init_pool(args.timeout_ms, args.no_impersonate, proxy_config)?;
     if !args.no_impersonate {
         eprintln!("[+] TLS impersonation: rotating real-browser JA3/JA4 + HTTP/2 fingerprints");
     } else {
@@ -1563,7 +1938,7 @@ async fn main() -> Result<()> {
     let with_body = args.with_body;
     // v0.4.10 — copied out of `args` so it can move into each probe task.
     let want_response_headers = args.response_headers;
-    let via_proxy = args.proxy.is_some();
+    let via_proxy = proxy_enabled;
 
     eprintln!(
         "[+] probing {} hosts ({} concurrent)…",
@@ -1573,6 +1948,9 @@ async fn main() -> Result<()> {
 
     let mut set: FuturesUnordered<tokio::task::JoinHandle<EnrichRecord>> = FuturesUnordered::new();
     let total = hosts.len();
+    let max_inflight = args.threads.max(1);
+    let mut completed = 0usize;
+    let httpx_compat = args.httpx_compat;
 
     for input in hosts {
         let host = extract_host(&input);
@@ -1735,34 +2113,36 @@ async fn main() -> Result<()> {
             }
             rec
         }));
+
+        // Keep completed response bodies and records bounded by concurrency.
+        // Previously every input host was spawned before the first result was
+        // drained, so a very large host list could retain one task per host.
+        if set.len() >= max_inflight {
+            if let Some(joined) = set.next().await {
+                write_enrich_result(
+                    joined,
+                    &mut out_file,
+                    httpx_compat,
+                    &mut completed,
+                    total,
+                    args.quiet,
+                )?;
+            }
+        }
     }
 
     // 9. Drain — write NDJSON as each completes (crash-safe, no buffered tail).
     //    When `--httpx-compat` is set, every record is reshaped from the
     //    default EnrichRecord into HttpxCompatRecord just before serialise.
-    let mut completed = 0usize;
-    let httpx_compat = args.httpx_compat;
     while let Some(joined) = set.next().await {
-        match joined {
-            Ok(rec) => {
-                let line = if httpx_compat {
-                    serde_json::to_string(&HttpxCompatRecord::from_enrich(rec))?
-                } else {
-                    serde_json::to_string(&rec)?
-                };
-                writeln!(out_file, "{}", line)?;
-                completed += 1;
-                if completed % 50 == 0 || completed == total {
-                    eprintln!("  [{}/{}]", completed, total);
-                }
-            }
-            // Surface panics + cancellations so probe tasks lost to
-            // tech-detect regex blowups / runtime aborts don't silently
-            // disappear from the output.
-            Err(e) => {
-                eprintln!("[!] probe task did not complete: {}", e);
-            }
-        }
+        write_enrich_result(
+            joined,
+            &mut out_file,
+            httpx_compat,
+            &mut completed,
+            total,
+            args.quiet,
+        )?;
     }
     out_file.flush()?;
     eprintln!("[+] done: wrote {} records to {}", completed, output_path);
@@ -2024,5 +2404,218 @@ mod tests {
         assert_eq!(v["tech"], serde_json::json!([]));
         // Empty cname → empty array.
         assert_eq!(v["cname"], serde_json::json!([]));
+    }
+
+    fn cli(parts: &[&str]) -> Vec<String> {
+        std::iter::once("httpxer".to_string())
+            .chain(parts.iter().map(|part| part.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn normalize_preserves_attached_values_and_short_clusters() {
+        assert_eq!(normalize_args(cli(&["-t150", "-u", "x.test"])), cli(&["-t150", "-u", "x.test"]));
+        assert_eq!(normalize_args(cli(&["-R3", "-u", "x.test"])), cli(&["-R3", "-u", "x.test"]));
+        assert_eq!(normalize_args(cli(&["-rq", "-u", "x.test"])), cli(&["-rq", "-u", "x.test"]));
+    }
+
+    #[test]
+    fn normalize_only_rewrites_registered_compatibility_names() {
+        assert_eq!(normalize_args(cli(&["-fr", "-u", "x.test"])), cli(&["--fr", "-u", "x.test"]));
+        assert_eq!(normalize_args(cli(&["-path", "words.txt", "-u", "x.test"])), cli(&["--path", "words.txt", "-u", "x.test"]));
+        assert_eq!(normalize_args(cli(&["--", "-fr"])), cli(&["--", "-fr"]));
+    }
+
+    #[test]
+    fn clap_accepts_attached_and_clustered_short_syntax() {
+        let args = Args::try_parse_from(normalize_args(cli(&[
+            "-t150", "-rq", "-R3", "-u", "x.test",
+        ])))
+        .unwrap();
+        assert_eq!(args.threads, 150);
+        assert!(args.recursive);
+        assert!(args.quiet);
+        assert_eq!(args.recursion_depth, Some(3));
+    }
+
+    #[test]
+    fn status_selector_supports_classes_and_inline_exclusions() {
+        let (included, excluded) = parse_status_selector("2xx,301,302,!204,!429").unwrap();
+        assert!(included.contains(&200));
+        assert!(included.contains(&299));
+        assert!(included.contains(&301));
+        assert_eq!(excluded, vec![204, 429]);
+        assert_eq!(parse_status_selector("6xx").unwrap().0.len(), 100);
+        assert!(parse_status_selector("!4xx").is_err());
+        assert!(parse_status_selector("200,bad").is_err());
+    }
+
+    #[test]
+    fn canonical_status_rejects_legacy_filter_mix() {
+        assert!(resolve_status_filters(Some("2xx"), Some("200"), None, None).is_err());
+        let (included, excluded) = resolve_status_filters(None, None, None, None).unwrap();
+        assert_eq!(included, vec![200, 301, 302, 307, 308, 401, 403]);
+        assert!(excluded.is_empty());
+    }
+
+    #[test]
+    fn backup_mode_resolves_legacy_aliases_without_ambiguity() {
+        assert_eq!(resolve_backup_mode("auto", false, false).unwrap(), BackupMode::Auto);
+        assert_eq!(resolve_backup_mode("off", false, false).unwrap(), BackupMode::Off);
+        assert_eq!(resolve_backup_mode("auto", false, true).unwrap(), BackupMode::DryRun);
+        assert!(resolve_backup_mode("off", false, true).is_err());
+        assert!(resolve_backup_mode("auto", true, true).is_err());
+    }
+
+    #[test]
+    fn depth_shortcuts_preserve_legacy_and_new_forms() {
+        let legacy = Args::try_parse_from(normalize_args(cli(&[
+            "-r", "-R", "2", "-u", "x.test",
+        ])))
+        .unwrap();
+        assert_eq!(resolve_scan_depths(&legacy), (2, false, 0));
+
+        let deep = Args::try_parse_from(normalize_args(cli(&[
+            "--deep", "4", "-u", "x.test",
+        ])))
+        .unwrap();
+        assert_eq!(resolve_scan_depths(&deep), (4, true, 4));
+
+        let crawl = Args::try_parse_from(normalize_args(cli(&[
+            "--crawl", "-u", "x.test",
+        ])))
+        .unwrap();
+        assert_eq!(resolve_scan_depths(&crawl), (0, true, 3));
+    }
+
+    #[test]
+    fn tech_selection_and_backup_sidecar_are_explicit() {
+        assert_eq!(
+            resolve_tech_selection(Some("off"), false, None).unwrap(),
+            TechSelection { enabled: false, fingerprints_path: None }
+        );
+        assert_eq!(
+            resolve_tech_selection(Some("custom.json"), false, None).unwrap(),
+            TechSelection { enabled: true, fingerprints_path: Some("custom.json".into()) }
+        );
+        assert!(resolve_tech_selection(Some("off"), true, None).is_err());
+        assert_eq!(backup_sidecar_path(None), "httpxer-backup.jsonl");
+        assert_eq!(backup_sidecar_path(Some("hits.jsonl")), "hits.jsonl.backup.jsonl");
+    }
+
+    #[test]
+    fn backup_dry_run_suppresses_startup_update_check() {
+        assert!(!update_check_allowed_early(&cli(&["--backup", "dry-run"])));
+        assert!(!update_check_allowed_early(&cli(&["--backup=dry-run"])));
+        assert!(!update_check_allowed_early(&cli(&["--backup-dry-run"])));
+    }
+
+    #[test]
+    fn fuzz_only_options_fail_in_enrich_mode() {
+        let args = Args::try_parse_from(normalize_args(cli(&[
+            "-u", "x.test", "--deep", "2",
+        ])))
+        .unwrap();
+        assert!(validate_mode_specific_args(&args).is_err());
+
+        let args = Args::try_parse_from(normalize_args(cli(&[
+            "-u", "x.test", "-w", "words.txt", "--deep", "2",
+        ])))
+        .unwrap();
+        assert!(validate_mode_specific_args(&args).is_ok());
+    }
+
+    #[test]
+    fn legacy_dirsearch_style_command_still_parses() {
+        let args = Args::try_parse_from(normalize_args(cli(&[
+            "-u", "https://x.test", "-w", "a.txt,b.txt", "-t150", "-r", "-R3",
+            "--recurse-on-200", "--max-dirs-per-host", "1000", "--add-excludes",
+            "assets,images", "--exclude-mode", "substring", "--exclude-root-size",
+            "--wildcard-policy", "strict", "--crawl", "-i", "200,301,302,307,308",
+            "--exclude", "429,503", "--retries", "2", "-q", "-o", "out.txt",
+        ])))
+        .unwrap();
+        assert_eq!(args.threads, 150);
+        assert_eq!(resolve_scan_depths(&args), (3, true, 3));
+        assert_eq!(resolve_backup_mode(&args.backup, args.no_backup_fuzz, args.backup_dry_run).unwrap(), BackupMode::Auto);
+        let (included, excluded) = resolve_status_filters(
+            args.status.as_deref(),
+            args.match_codes.as_deref(),
+            args.include_status.as_deref(),
+            args.exclude_codes.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(included, vec![200, 301, 302, 307, 308]);
+        assert_eq!(excluded, vec![429, 503]);
+    }
+
+    #[test]
+    fn short_help_is_task_oriented_and_hides_advanced_flags() {
+        let mut command = Args::command();
+        let mut output = Vec::new();
+        command.write_help(&mut output).unwrap();
+        let help = String::from_utf8(output).unwrap();
+
+        for tag in [
+            "[PROBE]",
+            "[TECH]",
+            "[HEADERS]",
+            "[FUZZ]",
+            "[PROXY]",
+            "[BACKUP]",
+        ] {
+            assert!(help.contains(tag), "short help is missing {tag}");
+        }
+        assert!(help.contains("Use `httpxer --help` for advanced options"));
+        assert!(!help.contains("--dns-concurrency"));
+        assert!(!help.contains("--exclude-root-size"));
+    }
+
+    #[test]
+    fn long_help_keeps_advanced_options_and_practical_examples() {
+        let mut command = Args::command();
+        let mut output = Vec::new();
+        command.write_long_help(&mut output).unwrap();
+        let help = String::from_utf8(output).unwrap();
+
+        for section in [
+            "PRACTICAL EXAMPLES",
+            "PROBE AND TECHNOLOGY",
+            "HEADERS AND BODY",
+            "PATH FUZZING",
+            "RECURSION AND CRAWL",
+            "PROXY AND ROTATION",
+        ] {
+            assert!(help.contains(section), "long help is missing {section}");
+        }
+        assert!(help.contains("--dns-concurrency"));
+        assert!(help.contains("--exclude-root-size"));
+        assert!(help.contains("--with-body"));
+    }
+
+    #[derive(Default)]
+    struct FlushTrackingWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl std::io::Write for FlushTrackingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn realtime_writer_flushes_every_record() {
+        let mut writer = FlushTrackingWriter::default();
+        write_realtime_line(&mut writer, "{\"status_code\":200}").unwrap();
+        assert_eq!(writer.bytes, b"{\"status_code\":200}\n");
+        assert_eq!(writer.flushes, 1);
     }
 }

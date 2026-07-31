@@ -2,6 +2,33 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.6.7] — 2026-07-31
+
+### Fixed
+- **Recursion exclusions:** built-in and user exclusions now block discovered-directory expansion only; every explicit wordlist entry is still probed.
+- **Crawl identity:** crawl no longer follows redirects inside the original fuzz probe; it preserves the `3xx` response and queues `Location` as a separate discovery before output filters.
+- **Dry-run isolation:** `--backup dry-run` exits after candidate generation without initializing the HTTP pool, checking for updates, scanning the target, or creating output files.
+- **Backup discovery:** mandatory generic and hostname-derived names survive every adaptive budget, path-echo catchalls cannot prove backup directories, all bases share one URL cap, and declared archive sizes are preserved.
+- **CLI parsing and validation:** attached short values and short clusters are preserved, invalid status/size selectors fail before traffic, fuzz-only options fail outside fuzz mode, and stdout backup findings use a safe sidecar name.
+
+### Changed
+- Added consolidated `--status`, `--tech`, `--backup`, and `--deep` controls while retaining legacy spellings; short help now uses task-tagged examples and concise descriptions while long help retains advanced options and practical recipes.
+- `--proxy` now accepts one authenticated endpoint or a mixed HTTP/HTTPS/SOCKS proxy file and rotates endpoints per request without changing the host-pinned browser fingerprint.
+- Enrich scheduling is bounded by concurrency, normal records flush as they complete, and backup findings stream directly to their sidecar instead of accumulating in memory.
+- Backup dry-run is explicitly a request-free maximum-budget preview; live auto mode may lower the URL budget after profiling the host.
+- Quiet mode now suppresses live findings and progress while retaining phase summaries; technology startup output reports definitions, detectable apps, compiled patterns, and skipped regexes.
+- Documentation now reflects released architectures, Linux glibc linkage, enrich-only technology detection, recursion-exclusion behavior, and current commands.
+
+### Verified
+- Cap-specific backup tests cover 50, 60, 100, 180, and 300 candidate URLs, mandatory-name retention, global multi-base budgeting, and path-echo directory rejection.
+- `cargo test --locked`: 197 passing, including parser, status-selector, mode-validation, depth, dry-run, sidecar, recursion-exclusion, backup-size, backup-budget, proxy-rotation, proxy-authentication, and real-time-output coverage.
+- An optimized local fixture confirmed both hostname-derived and generic ZIPs with correct sizes, suppressed path-echo fake-200s, and held the candidate phase to 300 URLs.
+- A low-rate authorized production smoke completed without a transport panic or backup false positive, emitted the expected API redirect, and left the target healthy.
+- A controlled local flow emitted the explicit health endpoint, recursively found the API child, crawled a filtered redirect and its HTML child, and skipped expansion below the excluded assets directory.
+- A request-counting fixture confirmed backup dry-run sent zero target requests.
+- Wire-level fixtures confirmed round-robin proxy selection plus HTTP request and HTTPS CONNECT authentication without exposing credentials in diagnostics.
+- A 2,000-record enrich fixture exposed complete JSONL records before completion and finished with bounded in-flight work.
+
 ## [0.6.6] — 2026-07-31
 
 ### Fixed

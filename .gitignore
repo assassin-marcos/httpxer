@@ -14,3 +14,6 @@ release_notes.md
 # Stray copies of the binary from running the relocate-flow test with
 # HOME='' (the relocate logic lands a relative `./httpxer` in that case).
 /httpxer
+
+# Local scan input accidentally created under the source tree.
+/src/dirscan-live.txt

@@ -6,16 +6,16 @@
 #   curl -sL https://raw.githubusercontent.com/assassin-marcos/httpxer/main/install.sh | INSTALL_DIR=~/bin bash
 #
 # What it does:
-#   1. Detects host OS + arch (linux/macos × x86_64/arm64).
+#   1. Detects a released target (Linux x86_64; macOS x86_64/arm64).
 #   2. Downloads the matching release asset from the latest GitHub release.
 #   3. Picks the best install dir: prefers a user-writable path that's
 #      already on $PATH (~/.local/bin, ~/bin, /opt/homebrew/bin) so future
-#      `httpxer -u` invocations need no sudo. Falls back to /usr/local/bin
+#      `httpxer -U` invocations need no sudo. Falls back to /usr/local/bin
 #      (with sudo) only when nothing user-writable exists.
 #
 # After install, manage with the binary itself:
 #   httpxer -c   # check-update (prints status, doesn't install)
-#   httpxer -u   # install latest release (auto-relocates from root-owned paths)
+#   httpxer -U   # install latest release (auto-relocates from root-owned paths)
 #   httpxer -X   # uninstall
 set -euo pipefail
 
@@ -45,7 +45,7 @@ fi
 # Priority order (first hit wins):
 #   1. $INSTALL_DIR (explicit user override — honoured as-is)
 #   2. User-writable dirs already on $PATH — picked WITHOUT sudo so future
-#      `httpxer -u` runs as the calling user. macOS gets /opt/homebrew/bin
+#      `httpxer -U` runs as the calling user. macOS gets /opt/homebrew/bin
 #      bumped above ~/.local/bin because that's the default Apple-Silicon
 #      shell PATH; Linux prefers ~/.local/bin (XDG convention).
 #   3. /usr/local/bin with sudo as last resort.
@@ -127,6 +127,6 @@ echo
 echo "Installed. Try it out:"
 echo "    httpxer --version"
 echo "    httpxer -c                                          # check for updates"
-echo "    httpxer -u                                          # install latest (auto-relocates if needed)"
+echo "    httpxer -U                                          # install latest (auto-relocates if needed)"
 echo "    httpxer -l urls.txt -o out.jsonl                    # enrich (1 probe per host)"
 echo "    httpxer -l urls.txt -path words.txt -o out.jsonl    # fuzz (host x path)"

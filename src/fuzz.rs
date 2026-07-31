@@ -275,15 +275,12 @@ enum Discovery {
 /// that reaches this struct and stops there is a silently-ignored flag, so
 /// let the dead-code lint be the tripwire.
 ///
-/// Knobs that intentionally do NOT live here:
-///   - the working `WildcardPolicy` — passed as its own `run()` parameter;
-///   - `--exclude-subdirs` / `--exclude-mode` — applied in `main.rs` to the
-///     wordlist itself before `run()` is called, so fuzz never re-checks them.
+/// The working `WildcardPolicy` intentionally does not live here because it is
+/// passed as its own `run()` parameter.
 pub struct FuzzCfg {
     pub match_codes: Vec<u16>,
     /// Status codes to EXCLUDE from output even when they're in match_codes.
-    /// Default `[429, 503]` — transient overload codes that rarely indicate
-    /// real findings. Empty = exclude nothing.
+    /// Empty by default; canonical `--status` can express exclusions inline.
     pub exclude_codes: Vec<u16>,
     pub body_preview_bytes: usize,
     /// Wildcard pre-flight sample count. v0.3.7 default 3; all must agree
@@ -316,6 +313,10 @@ pub struct FuzzCfg {
     /// what actually bounds a recursive scan. v0.4.10 removed the companion
     /// `max_probes_per_host`, which was never enforced.
     pub max_dirs_per_host: usize,
+    /// Patterns that block expansion of discovered directories. Explicit
+    /// round-0 wordlist entries are never filtered by this set.
+    pub recursion_excludes: HashSet<String>,
+    pub recursion_exclude_mode: crate::recurse::ExcludeMode,
     // ── Crawl (v0.3.7) ─────────────────────────────────────────────────
     pub crawl_enabled: bool,
     pub crawl_depth: u8,
@@ -330,8 +331,7 @@ pub struct FuzzCfg {
     pub exclude_sizes_by_origin: std::collections::HashMap<String, Vec<i64>>,
     // ── Misc behavior (v0.3.7) ─────────────────────────────────────────
     /// Follow redirects within fuzz probes (default off — 3xx is a finding).
-    /// Auto-on when crawl_enabled (crawl needs terminal URL + body), unless
-    /// `--no-follow-redirects` was passed explicitly (that wins).
+    /// This is an explicit advanced override; crawl queues Location separately.
     pub fuzz_follow_redirects: bool,
     /// Max redirect HOPS to chase when `fuzz_follow_redirects` is on — the
     /// user's `--max-redirects` (default 10). Same unit as the enrich path
@@ -351,6 +351,9 @@ pub struct FuzzCfg {
     /// Print findings live to stderr during the scan in dirsearch-style
     /// format (v0.3.13). True by default; disable for clean log scraping.
     pub live_findings: bool,
+    /// Draw live/batched progress. `--quiet` disables this independently from
+    /// summary diagnostics.
+    pub show_progress: bool,
     /// v0.4.9 — `--response-headers`: attach the full response header set to
     /// each emitted record (JSON `response_headers` object) and print it under
     /// each live finding on the terminal. Off by default (keeps output small).
@@ -482,6 +485,17 @@ fn output_url_key(raw: &str) -> String {
 
 fn mark_directory_expanded(expanded: &mut HashSet<String>, canonical_url: &str) -> bool {
     expanded.insert(canonical_url.to_string())
+}
+
+fn recursion_candidate_excluded(
+    canonical_url: &str,
+    excludes: &HashSet<String>,
+    mode: crate::recurse::ExcludeMode,
+) -> bool {
+    let path = url::Url::parse(canonical_url)
+        .map(|url| url.path().to_string())
+        .unwrap_or_else(|_| canonical_url.to_string());
+    crate::recurse::path_excluded(&path, excludes, mode)
 }
 
 /// `"foo"` → `"/foo"`, `"//foo"` → `"/foo"`, `""` → `""`. Trims whitespace.
@@ -869,7 +883,6 @@ async fn dispatch_once(
     let slot = probe::pick_pool_slot_for(&request_host)
         .ok_or_else(|| "probe pool not initialised".to_string())?;
     let mut req = slot
-        .client
         .get(url)
         .redirect(Policy::none())
         .header("Accept-Language", slot.accept_lang)
@@ -1792,7 +1805,8 @@ pub async fn run(
     // ~backlog_cap tasks, so the earlier code's drain-counting strategy
     // never saw the bulk of completions.
     let progress_done = Arc::new(AtomicBool::new(false));
-    let is_tty = std::io::stderr().is_terminal();
+    let show_progress = cfg.show_progress;
+    let is_tty = show_progress && std::io::stderr().is_terminal();
     // Debug print removed v0.3.12 — kept the comment as a marker.
     let progress_task = {
         let progress = progress.clone();
@@ -1823,7 +1837,7 @@ pub async fn run(
                         format_eta(snap.eta_secs(rps))
                     );
                     let _ = stderr.flush();
-                } else {
+                } else if show_progress {
                     // Piped runs — batched line per 500 completions.
                     // (Was per-200 in v0.3.7 drain-loop counter; the
                     // ticker-task variant uses 500 so the cadence
@@ -1973,10 +1987,19 @@ pub async fn run(
             // Dedupe via visited set + apply per-host budgets.
             let mut frontier_dirs: Vec<(String, String, u8, String)> = Vec::new();
             let mut frontier_urls: Vec<(String, String, u8, String)> = Vec::new();
+            let mut excluded_dirs = 0usize;
             {
                 let mut v = visited.lock().await;
                 let mut budgets = host_budgets.lock().await;
                 for (canon, host, depth, parent) in new_dirs {
+                    if recursion_candidate_excluded(
+                        &canon,
+                        &cfg.recursion_excludes,
+                        cfg.recursion_exclude_mode,
+                    ) {
+                        excluded_dirs += 1;
+                        continue;
+                    }
                     if !mark_directory_expanded(&mut expanded_dirs, &canon) { continue; }
                     let budget = budgets.entry(host.clone()).or_insert_with(|| {
                         Arc::new(crate::recurse::HostBudget::new(cfg.max_dirs_per_host))
@@ -1990,6 +2013,12 @@ pub async fn run(
                     // single-shot probes, not new fuzz-prefixes.
                     frontier_urls.push((canon, source, depth, parent));
                 }
+            }
+            if excluded_dirs > 0 {
+                eprintln!(
+                    "[+] round {}: skipped {} excluded directory expansion(s)",
+                    round, excluded_dirs
+                );
             }
             if frontier_dirs.is_empty() && frontier_urls.is_empty() {
                 eprintln!("[+] round {}: no new discoveries — done", round);
@@ -2984,10 +3013,12 @@ async fn run_probe(
                 if let Some((technique, bp, bp_url)) =
                     attempt_auth_bypass(&item, &parsed, cfg, wildcards).await
                 {
-                    eprintln!(
-                        "  [bypass] {} {}→{} via {}",
-                        bp_url, parsed.status, bp.status, technique
-                    );
+                    if cfg.live_findings {
+                        eprintln!(
+                            "  [bypass] {} {}→{} via {}",
+                            bp_url, parsed.status, bp.status, technique
+                        );
+                    }
                     let cf = cf_challenge(bp.status, &bp.server, &bp.body_preview_for_output);
                     let rec = FuzzRecord {
                         url: bp_url,
@@ -3033,12 +3064,62 @@ async fn run_probe(
                 }
             }
 
+            // Crawl discovery is independent of output filtering. Keep the
+            // original 3xx response for wildcard/status identity and enqueue
+            // Location as a separate URL instead of silently classifying the
+            // terminal page under the requested path.
+            if cfg.crawl_enabled && next_depth <= cfg.crawl_depth {
+                let crawl_cfg = crate::crawl::CrawlCfg {
+                    crawl_robots: cfg.crawl_robots,
+                    crawl_sitemap: cfg.crawl_sitemap,
+                    max_links_per_page: cfg.max_links_per_page,
+                    scope_hosts: cfg.scope_hosts.clone(),
+                };
+                let crawl_base = &parsed.effective_url;
+                if matches!(parsed.status, 301 | 302 | 303 | 307 | 308)
+                    && !parsed.location.is_empty()
+                {
+                    let target = crate::probe::resolve_redirect_url(&url, &parsed.location);
+                    if target != url
+                        && crate::crawl::in_scope(&target, &url, &cfg.scope_hosts)
+                    {
+                        let _ = disc_tx.send(Discovery::Link {
+                            canonical_url: crate::recurse::canonical_url_key(&target),
+                            source: "crawl-redirect".to_string(),
+                            depth: next_depth,
+                            parent: url.clone(),
+                        });
+                    }
+                }
+                let links = crate::crawl::extract_urls(
+                    &parsed.raw_body,
+                    &parsed.content_type,
+                    crawl_base,
+                    &crawl_cfg,
+                );
+                let source_tag = if crawl_base.ends_with("/robots.txt") {
+                    "crawl-robots"
+                } else if crawl_base.ends_with("/sitemap.xml") {
+                    "crawl-sitemap"
+                } else {
+                    "crawl-html"
+                };
+                for link in links {
+                    let _ = disc_tx.send(Discovery::Link {
+                        canonical_url: crate::recurse::canonical_url_key(&link),
+                        source: source_tag.to_string(),
+                        depth: next_depth,
+                        parent: crawl_base.clone(),
+                    });
+                }
+            }
+
             // ── Emit filters (gate OUTPUT only; discovery already done) ───────
             // Status-code filter (include then exclude).
             if !cfg.match_codes.contains(&parsed.status) {
                 return;
             }
-            // v0.3.7 — `--exclude` filter (default `429,503`).
+            // Legacy `--exclude` and canonical `--status !CODE` share this gate.
             if cfg.exclude_codes.contains(&parsed.status) {
                 return;
             }
@@ -3102,41 +3183,6 @@ async fn run_probe(
                 source_tools: cfg.source_tools.clone(),
             };
             write_record(out_file, &rec, cfg.output_format, cfg.live_findings).await;
-
-            // ── v0.4.5: crawl-link discovery. (Directory/recursion discovery
-            // was hoisted ABOVE the emit filter so 401/403 dirs recurse
-            // without being emitted; it reused `next_depth` computed there.)
-            // Crawl runs only on emitted, status-matched pages.
-            if cfg.crawl_enabled && next_depth <= cfg.crawl_depth {
-                let crawl_cfg = crate::crawl::CrawlCfg {
-                    crawl_robots: cfg.crawl_robots,
-                    crawl_sitemap: cfg.crawl_sitemap,
-                    max_links_per_page: cfg.max_links_per_page,
-                    scope_hosts: cfg.scope_hosts.clone(),
-                };
-                let crawl_base = &parsed.effective_url;
-                let links = crate::crawl::extract_urls(
-                    &parsed.raw_body,
-                    &parsed.content_type,
-                    crawl_base,
-                    &crawl_cfg,
-                );
-                let source_tag = if crawl_base.ends_with("/robots.txt") {
-                    "crawl-robots"
-                } else if crawl_base.ends_with("/sitemap.xml") {
-                    "crawl-sitemap"
-                } else {
-                    "crawl-html"
-                };
-                for link in links {
-                    let _ = disc_tx.send(Discovery::Link {
-                        canonical_url: crate::recurse::canonical_url_key(&link),
-                        source: source_tag.to_string(),
-                        depth: next_depth,
-                        parent: crawl_base.clone(),
-                    });
-                }
-            }
         }
         None => {
             if !cfg.include_errors {
@@ -3253,7 +3299,7 @@ async fn write_record(
         }
     };
     let mut f = out_file.file.lock().await;
-    if let Err(e) = writeln!(*f, "{}", line) {
+    if let Err(e) = writeln!(*f, "{}", line).and_then(|_| f.flush()) {
         out_file.fail(e.to_string());
     }
 }
@@ -3274,6 +3320,26 @@ mod tests {
             "probe identity must not block directory expansion"
         );
         assert!(!mark_directory_expanded(&mut expanded_dirs, &dir));
+    }
+
+    #[test]
+    fn recursion_excludes_match_discovered_path_not_hostname() {
+        let excludes = HashSet::from(["healthz".to_string(), "media".to_string()]);
+        assert!(recursion_candidate_excluded(
+            "https://x.test/healthz/",
+            &excludes,
+            crate::recurse::ExcludeMode::Segment,
+        ));
+        assert!(recursion_candidate_excluded(
+            "https://x.test/api/media/private/",
+            &excludes,
+            crate::recurse::ExcludeMode::Substring,
+        ));
+        assert!(!recursion_candidate_excluded(
+            "https://media.example/api/",
+            &excludes,
+            crate::recurse::ExcludeMode::Substring,
+        ));
     }
 
     #[test]
@@ -4054,6 +4120,34 @@ mod tests {
         .await;
         assert!(sink.failed.load(Ordering::Acquire));
         assert!(sink.failure().is_some());
+    }
+
+    #[tokio::test]
+    async fn output_record_is_visible_before_the_scan_finishes() {
+        let path = std::env::temp_dir().join(format!(
+            "httpxer-output-realtime-{}-{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let sink = Arc::new(OutputSink::new(file, HashSet::new()));
+
+        write_record(
+            &sink,
+            &provenance_test_record(),
+            OutputFormat::Json,
+            false,
+        )
+        .await;
+
+        let visible = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(visible.lines().count(), 1);
+        assert!(visible.contains("https://x.com/a"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 REQUESTS: dict[str, list[dict[str, object]]] = defaultdict(list)
 LOCK = threading.Lock()
 SERVERS: dict[str, ThreadingHTTPServer] = {}
+ZIP_BODY = b"PK\x03\x04" + (b"httpxer-backup-fixture" * 16)
 
 
 class FixtureServer(ThreadingHTTPServer):
@@ -133,6 +134,30 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 self._send(404, b"not found", "text/plain")
             return
 
+        if mode == "flow":
+            if path == "/healthz":
+                self._send(200, b"REAL explicit health endpoint", "text/plain")
+            elif path in {"/assets", "/api"}:
+                self._send(301, b"directory", headers={"Location": path + "/"})
+            elif path == "/api/child":
+                self._send(200, b"REAL recursively discovered child", "text/plain")
+            elif path == "/redir":
+                self._send(302, b"redirect", headers={"Location": "/landing"})
+            elif path == "/landing":
+                self._send(200, b'<html><a href="/hidden">next</a></html>')
+            elif path == "/hidden":
+                self._send(200, b"REAL crawl-discovered endpoint", "text/plain")
+            else:
+                self._send(404, b"not found", "text/plain")
+            return
+
+        if mode == "backup":
+            if path in {"/127.0.0.1.zip", "/backup.zip", "/app/backup.zip"}:
+                self._send(200, ZIP_BODY, "application/zip")
+            else:
+                self._send(200, b"not found path=" + path.encode() + b"; end")
+            return
+
         if mode == "cross_a":
             self._send(200, b"<html>shared shell-looking content</html>")
             return
@@ -167,7 +192,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--modes",
-        default="mixed,echo,status,auth,cross_a,cross_b,redirect,capture",
+        default="mixed,echo,status,auth,flow,backup,cross_a,cross_b,redirect,capture",
     )
     args = parser.parse_args()
 

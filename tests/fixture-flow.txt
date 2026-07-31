@@ -1,0 +1,5 @@
+/healthz
+/assets
+/api
+/child
+/redir

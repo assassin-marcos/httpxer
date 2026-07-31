@@ -23,7 +23,12 @@
 //!    rotate egress IPs at a higher layer if they hit those.
 
 use once_cell::sync::OnceCell;
+use base64::Engine as _;
+use percent_encoding::percent_decode_str;
+use std::collections::HashSet;
 use std::future::Future;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Once;
 use std::time::{Duration, Instant};
@@ -171,12 +176,13 @@ fn append_capped(body: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
 /// field (e.g. `"chrome-137"`, `"firefox-139"`, `"vanilla"`). It is set when
 /// the pool is built so the fuzz worker doesn't need a runtime lookup.
 pub struct PoolSlot {
-    pub client: Client,
+    client: Client,
     pub accept_lang: &'static str,
     pub tag: &'static str,
 }
 
 static POOL: OnceCell<Vec<PoolSlot>> = OnceCell::new();
+static PROXY_POOL: OnceCell<ProxyPool> = OnceCell::new();
 static WREQ_POOL_HOOK: Once = Once::new();
 static WREQ_POOL_RETRIES: AtomicUsize = AtomicUsize::new(0);
 static WREQ_POOL_FAILURES: AtomicUsize = AtomicUsize::new(0);
@@ -195,6 +201,238 @@ const WREQ_POOL_ASSERTION: &str =
 /// adds no new parameters to three public signatures and their call sites.
 /// Set once at startup via `init_auth`; empty when no auth flags were given.
 static AUTH: OnceCell<(Vec<(String, String)>, Option<String>)> = OnceCell::new();
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ProxySchemeCounts {
+    http: usize,
+    https: usize,
+    socks4: usize,
+    socks5: usize,
+}
+
+/// Validated proxy input. `--proxy` accepts one endpoint directly or a file
+/// containing one endpoint per line. Endpoint credentials stay inside wreq's
+/// parsed `Proxy` value and are never rendered in diagnostics.
+pub struct ProxyConfig {
+    endpoints: Vec<ProxyEndpoint>,
+    from_file: bool,
+    counts: ProxySchemeCounts,
+}
+
+impl ProxyConfig {
+    pub fn from_spec(spec: &str) -> anyhow::Result<Self> {
+        let forced_file = spec.strip_prefix('@');
+        let path = forced_file.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(spec));
+        let has_explicit_scheme = spec.contains("://");
+        let file_like = forced_file.is_some()
+            || path.is_file()
+            || (!has_explicit_scheme
+                && (spec.contains(std::path::MAIN_SEPARATOR)
+                    || spec.contains('/')
+                    || spec.contains('\\')
+                    || ["txt", "list", "lst", "csv"].iter().any(|ext| {
+                        path.extension()
+                            .and_then(|v| v.to_str())
+                            .is_some_and(|v| v.eq_ignore_ascii_case(ext))
+                    })));
+
+        let entries = if file_like {
+            if !path.is_file() {
+                anyhow::bail!("--proxy file does not exist or is not a regular file");
+            }
+            read_proxy_file(&path)?
+        } else {
+            vec![(1usize, spec.trim().to_string())]
+        };
+
+        let mut endpoints = Vec::new();
+        let mut counts = ProxySchemeCounts::default();
+        let mut seen = HashSet::new();
+        for (line, raw) in entries {
+            let (normalized, proxy, family) = parse_proxy_entry(&raw)
+                .map_err(|reason| anyhow::anyhow!("invalid proxy entry at line {}: {}", line, reason))?;
+            if !seen.insert(normalized) {
+                continue;
+            }
+            match family {
+                "http" => counts.http += 1,
+                "https" => counts.https += 1,
+                "socks4" | "socks4a" => counts.socks4 += 1,
+                "socks5" | "socks5h" => counts.socks5 += 1,
+                _ => unreachable!("proxy scheme was validated"),
+            }
+            endpoints.push(proxy);
+        }
+        if endpoints.is_empty() {
+            anyhow::bail!("--proxy file contains no usable endpoints");
+        }
+
+        Ok(Self {
+            endpoints,
+            from_file: file_like,
+            counts,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.endpoints.len()
+    }
+
+    pub fn source_label(&self) -> &'static str {
+        if self.from_file { "file" } else { "URL" }
+    }
+
+    pub fn scheme_summary(&self) -> String {
+        format!(
+            "http={}, https={}, socks4={}, socks5={}",
+            self.counts.http, self.counts.https, self.counts.socks4, self.counts.socks5
+        )
+    }
+}
+
+fn read_proxy_file(path: &Path) -> anyhow::Result<Vec<(usize, String)>> {
+    let file = std::fs::File::open(path).map_err(|e| anyhow::anyhow!("open --proxy file: {}", e))?;
+    let mut entries = Vec::new();
+    for (idx, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| anyhow::anyhow!("read --proxy file line {}: {}", idx + 1, e))?;
+        let value = line.trim();
+        if value.is_empty() || value.starts_with('#') {
+            continue;
+        }
+        entries.push((idx + 1, value.to_string()));
+    }
+    Ok(entries)
+}
+
+fn parse_proxy_entry(raw: &str) -> Result<(String, ProxyEndpoint, &'static str), &'static str> {
+    if raw.is_empty() {
+        return Err("empty endpoint");
+    }
+    let normalized = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{}", raw)
+    };
+    let parsed = url::Url::parse(&normalized).map_err(|_| "malformed URL")?;
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    let family = match scheme.as_str() {
+        "http" => "http",
+        "https" => "https",
+        "socks4" => "socks4",
+        "socks4a" => "socks4a",
+        "socks5" => "socks5",
+        "socks5h" => "socks5h",
+        _ => return Err("unsupported scheme (use http, https, socks4, socks4a, socks5, or socks5h)"),
+    };
+    if parsed.host_str().is_none() {
+        return Err("missing host");
+    }
+    if !parsed.username().is_empty() && parsed.password().is_none() {
+        return Err("proxy username requires a password");
+    }
+    if matches!(family, "socks4" | "socks4a")
+        && (!parsed.username().is_empty() || parsed.password().is_some())
+    {
+        return Err("SOCKS4 authentication is not supported; use SOCKS5 for credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("query strings and fragments are not supported");
+    }
+    if !matches!(parsed.path(), "" | "/") {
+        return Err("URL paths are not supported");
+    }
+    let canonical = parsed.to_string();
+    let proxy = wreq::Proxy::all(canonical.as_str())
+        .map_err(|_| "endpoint could not be parsed or resolved")?;
+    let http_auth = if matches!(family, "http" | "https") {
+        match parsed.password() {
+            Some(password) => {
+                let username = percent_decode_str(parsed.username())
+                    .decode_utf8()
+                    .map_err(|_| "username is not valid UTF-8")?;
+                let password = percent_decode_str(password)
+                    .decode_utf8()
+                    .map_err(|_| "password is not valid UTF-8")?;
+                let encoded = base64::engine::general_purpose::STANDARD
+                    .encode(format!("{}:{}", username, password));
+                Some(
+                    wreq::header::HeaderValue::from_str(&format!("Basic {}", encoded))
+                        .map_err(|_| "credentials are not valid HTTP header data")?,
+                )
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    Ok((canonical, ProxyEndpoint { proxy, http_auth }, family))
+}
+
+#[derive(Clone)]
+struct ProxyEndpoint {
+    proxy: wreq::Proxy,
+    http_auth: Option<wreq::header::HeaderValue>,
+}
+
+struct ProxyPool {
+    endpoints: Vec<ProxyEndpoint>,
+    next: AtomicUsize,
+}
+
+impl ProxyPool {
+    fn new(endpoints: Vec<ProxyEndpoint>) -> Self {
+        Self {
+            endpoints,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    fn next(&self) -> Option<ProxyEndpoint> {
+        if self.endpoints.is_empty() {
+            return None;
+        }
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.endpoints.len();
+        Some(self.endpoints[idx].clone())
+    }
+}
+
+impl PoolSlot {
+    /// Build a request with this slot's stable browser profile and the next
+    /// configured egress proxy. The proxy is selected here, not on the client,
+    /// so redirects, retries, pre-flight, backup, and fuzz probes all rotate.
+    pub fn get(&self, url: &str) -> wreq::RequestBuilder {
+        self.with_proxy(self.client.get(url), url)
+    }
+
+    pub fn head(&self, url: &str) -> wreq::RequestBuilder {
+        self.with_proxy(self.client.head(url), url)
+    }
+
+    fn with_proxy(&self, request: wreq::RequestBuilder, url: &str) -> wreq::RequestBuilder {
+        self.with_proxy_endpoint(request, url, PROXY_POOL.get().and_then(ProxyPool::next))
+    }
+
+    fn with_proxy_endpoint(
+        &self,
+        request: wreq::RequestBuilder,
+        url: &str,
+        endpoint: Option<ProxyEndpoint>,
+    ) -> wreq::RequestBuilder {
+        match endpoint {
+            Some(endpoint) => {
+                let request = request.proxy(endpoint.proxy);
+                let plain_http = url::Url::parse(url)
+                    .ok()
+                    .is_some_and(|target| target.scheme() == "http");
+                match (plain_http, endpoint.http_auth) {
+                    (true, Some(auth)) => request.header(wreq::header::PROXY_AUTHORIZATION, auth),
+                    _ => request,
+                }
+            }
+            None => request,
+        }
+    }
+}
 
 fn is_wreq_pool_panic(payload: &(dyn std::any::Any + Send)) -> bool {
     payload
@@ -275,30 +513,18 @@ pub fn init_auth(headers: Vec<(String, String)>, cookie: Option<String>) {
 /// Profile pool kept ~10 entries: enough variety to defeat single-profile
 /// rule-blocks, small enough that all client builds finish in ms.
 ///
-/// When `proxy_url` is `Some`, EVERY client in the pool is built with
-/// `.proxy(wreq::Proxy::all(url)?)` so all egress traffic — enrich-mode
-/// chase-the-chain GETs AND fuzz-mode single-shot GETs — goes through the
-/// configured proxy. Supports `http://`, `https://`, and `socks5://` /
-/// `socks5h://` URLs (BoringSSL handles all three under the hood). An
-/// invalid URL returns the wreq error wrapped in `anyhow` so the caller
-/// can fail loudly at startup before the banner renders.
+/// Proxy selection is attached by `PoolSlot::get` per request. Keeping it off
+/// the client lets one stable TLS/browser profile rotate across a mixed proxy
+/// file without constructing `profiles × proxies` clients.
 pub fn init_pool(
     timeout_ms: u64,
     no_impersonate: bool,
-    proxy_url: Option<&str>,
+    proxy_config: Option<ProxyConfig>,
 ) -> anyhow::Result<()> {
     install_wreq_pool_panic_hook();
-    // Pre-validate the proxy URL once, outside the OnceCell init closure,
-    // so we can surface the error to the caller as a normal Result rather
-    // than panicking inside `get_or_init`. The closure then clones the
-    // already-validated `Proxy` per slot.
-    let proxy_proto: Option<wreq::Proxy> = match proxy_url {
-        Some(u) => Some(
-            wreq::Proxy::all(u)
-                .map_err(|e| anyhow::anyhow!("invalid --proxy URL '{}': {}", u, e))?,
-        ),
-        None => None,
-    };
+    if let Some(config) = proxy_config {
+        let _ = PROXY_POOL.set(ProxyPool::new(config.endpoints));
+    }
 
     POOL.get_or_init(|| {
         let timeout = Duration::from_millis(timeout_ms);
@@ -365,9 +591,6 @@ pub fn init_pool(
             if !no_impersonate {
                 b = b.emulation(*emul);
             }
-            if let Some(p) = proxy_proto.as_ref() {
-                b = b.proxy(p.clone());
-            }
             if let Ok(c) = b.build() {
                 pool.push(PoolSlot {
                     client: c,
@@ -378,12 +601,8 @@ pub fn init_pool(
         }
         if pool.is_empty() {
             // Final safety net — at minimum one plain client so probes don't
-            // all silently no-op if every profile build fails. The proxy is
-            // still applied here so the fallback honours `--proxy`.
-            let mut b = Client::builder().timeout(timeout);
-            if let Some(p) = proxy_proto.as_ref() {
-                b = b.proxy(p.clone());
-            }
+            // all silently no-op if every profile build fails.
+            let b = Client::builder().timeout(timeout);
             if let Ok(c) = b.build() {
                 pool.push(PoolSlot {
                     client: c,
@@ -439,7 +658,6 @@ pub async fn http_probe_once(
     max_redirects: usize,
 ) -> Option<HttpProbeResult> {
     let slot = pick_slot()?;
-    let client = &slot.client;
     let started_https = url.starts_with("https://");
     let mut current = url.to_string();
     let mut chain: Vec<String> = Vec::new();
@@ -457,7 +675,7 @@ pub async fn http_probe_once(
         // The emulation profile already sets a matching UA, Accept-Encoding,
         // sec-ch-ua etc. — we just add Accept-Language for variety and a
         // browser-like Accept header for HTML targets (httpx-style).
-        let mut req = client
+        let mut req = slot
             .get(&current)
             .header("Accept-Language", slot.accept_lang)
             .header(
@@ -676,6 +894,232 @@ pub async fn http_probe_with_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_config_accepts_direct_authenticated_url() {
+        let config = ProxyConfig::from_spec("http://alice:secret@127.0.0.1:8080").unwrap();
+        assert_eq!(config.len(), 1);
+        assert_eq!(config.source_label(), "URL");
+        assert_eq!(config.counts.http, 1);
+    }
+
+    #[test]
+    fn proxy_file_accepts_mixed_schemes_and_deduplicates() {
+        let path = std::env::temp_dir().join(format!(
+            "httpxer-proxies-{}-{}.txt",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "# mixed proxy list\n",
+                "http://127.0.0.1:8001\n",
+                "https://user:pass@127.0.0.1:8002\n",
+                "socks4://127.0.0.1:8003\n",
+                "socks5://127.0.0.1:8004\n",
+                "socks5h://user:pass@127.0.0.1:8005\n",
+                "127.0.0.1:8006\n",
+                "http://127.0.0.1:8001\n",
+            ),
+        )
+        .unwrap();
+
+        let config = ProxyConfig::from_spec(path.to_str().unwrap()).unwrap();
+        assert_eq!(config.len(), 6);
+        assert_eq!(config.source_label(), "file");
+        assert_eq!(
+            config.counts,
+            ProxySchemeCounts {
+                http: 2,
+                https: 1,
+                socks4: 1,
+                socks5: 2,
+            }
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn proxy_errors_do_not_echo_credentials() {
+        let error = ProxyConfig::from_spec("ftp://alice:topsecret@127.0.0.1:21")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("unsupported scheme"));
+        assert!(!error.contains("alice"));
+        assert!(!error.contains("topsecret"));
+    }
+
+    #[test]
+    fn socks4_credentials_are_rejected_without_panicking() {
+        let result = std::panic::catch_unwind(|| {
+            ProxyConfig::from_spec("socks4://alice:secret@127.0.0.1:1080")
+        });
+        assert!(result.is_ok(), "SOCKS4 validation must not panic");
+        let error = result.unwrap().err().unwrap().to_string();
+        assert!(error.contains("SOCKS4 authentication is not supported"));
+        assert!(!error.contains("alice"));
+        assert!(!error.contains("secret"));
+    }
+
+    async fn one_shot_http_proxy(marker: &'static [u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                marker.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(marker).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        format!("http://{}", address)
+    }
+
+    #[tokio::test]
+    async fn authenticated_proxy_entry_sends_basic_authorization() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            request_tx
+                .send(String::from_utf8_lossy(&request[..read]).into_owned())
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let raw = format!("http://alice:secret@{}", address);
+        let (_, endpoint, _) = parse_proxy_entry(&raw).unwrap();
+        let slot = PoolSlot {
+            client: Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+            accept_lang: "en-US,en;q=0.9",
+            tag: "test",
+        };
+        let response = slot
+            .with_proxy_endpoint(
+                slot.client.get("http://target.invalid/auth-check"),
+                "http://target.invalid/auth-check",
+                Some(endpoint),
+            )
+            .send()
+            .await
+            .unwrap();
+        let _ = read_body_capped(response, 8).await.unwrap();
+
+        let request = request_rx.await.unwrap().to_ascii_lowercase();
+        assert!(
+            request.contains("proxy-authorization: basic ywxpy2u6c2vjcmv0"),
+            "captured request:\n{}",
+            request
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_proxy_entry_authorizes_https_connect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            request_tx
+                .send(String::from_utf8_lossy(&request[..read]).into_owned())
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let raw = format!("http://alice:secret@{}", address);
+        let (_, endpoint, _) = parse_proxy_entry(&raw).unwrap();
+        let slot = PoolSlot {
+            client: Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+            accept_lang: "en-US,en;q=0.9",
+            tag: "test",
+        };
+        let _ = slot
+            .with_proxy_endpoint(
+                slot.client.get("https://target.invalid/connect-check"),
+                "https://target.invalid/connect-check",
+                Some(endpoint),
+            )
+            .send()
+            .await;
+
+        let request = request_rx.await.unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("connect target.invalid:443 http/1.1"));
+        assert!(
+            request.contains("proxy-authorization: basic ywxpy2u6c2vjcmv0"),
+            "captured CONNECT request:\n{}",
+            request
+        );
+    }
+
+    #[tokio::test]
+    async fn request_level_proxy_pool_rotates_endpoints() {
+        let first = one_shot_http_proxy(b"first").await;
+        let second = one_shot_http_proxy(b"second").await;
+        let (_, first_proxy, _) = parse_proxy_entry(&first).unwrap();
+        let (_, second_proxy, _) = parse_proxy_entry(&second).unwrap();
+        let proxy_pool = ProxyPool::new(vec![first_proxy, second_proxy]);
+        let slot = PoolSlot {
+            client: Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+            accept_lang: "en-US,en;q=0.9",
+            tag: "test",
+        };
+
+        let first_response = slot
+            .with_proxy_endpoint(
+                slot.client.get("http://target.invalid/one"),
+                "http://target.invalid/one",
+                proxy_pool.next(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let first_body = read_body_capped(first_response, 32).await.unwrap();
+        let second_response = slot
+            .with_proxy_endpoint(
+                slot.client.get("http://target.invalid/two"),
+                "http://target.invalid/two",
+                proxy_pool.next(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let second_body = read_body_capped(second_response, 32).await.unwrap();
+
+        assert_eq!(first_body, b"first");
+        assert_eq!(second_body, b"second");
+    }
 
     #[test]
     fn resolve_redirect_url_absolute() {

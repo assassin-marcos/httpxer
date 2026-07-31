@@ -11,7 +11,7 @@
 #
 # After install, manage with the binary itself:
 #   httpxer -c   # check-update
-#   httpxer -u   # install latest in place
+#   httpxer -U   # install latest in place
 #   httpxer -X   # uninstall
 
 $ErrorActionPreference = 'Stop'
@@ -54,5 +54,5 @@ Write-Host ""
 Write-Host "Installed. Try it out:"
 Write-Host "    httpxer --version"
 Write-Host "    httpxer -c                       # check for updates"
-Write-Host "    httpxer -u                       # install latest"
+Write-Host "    httpxer -U                       # install latest"
 Write-Host "    httpxer -l urls.txt -o out.jsonl   # run a probe"

@@ -10,8 +10,8 @@
 //
 // AUTO-ACTIVATION
 // The mode turns itself ON whenever the binary is in fuzz mode (a wordlist
-// was supplied). `--no-backup-fuzz` opts out; `--backup-fuzz` forces it on
-// outside fuzz mode. Rationale: a fuzz run is already paying the per-host
+// was supplied). `--backup off` opts out; `--backup dry-run` previews candidates
+// without probing and then exits. Rationale: a fuzz run is already paying the per-host
 // setup cost, and host-derived archives are the highest-yield candidates a
 // wordlist cannot express.
 //
@@ -26,6 +26,7 @@
 // through them so a join bug can only ever exist in one place.
 
 use crate::probe;
+use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -67,7 +68,7 @@ pub const DATE_FORMS: &[&str] = &[
     "{}-{Y}.zip", "{}_{Y}.zip", "{}.{Y}.zip", "{}-{Y}.sql.gz",
 ];
 
-/// Directory prefixes probed when `--backup-dirs` is set.
+/// Directory prefixes conditionally verified after `backup/` or `bak/` exists.
 pub const BACKUP_DIRS: &[&str] = &[
     "backup", "backups", "bak", "old", "tmp", "temp", "dump", "dumps",
     "db", "database", "archive", "archives", "files", "storage",
@@ -85,6 +86,10 @@ pub const STATIC_GENERIC: &[&str] = &[
 
 /// P1 extension set - applied to the strongest tokens first.
 const P1_EXTS: &[&str] = &[".zip", ".rar", ".7z", ".tar.gz", ".sql", ".bak", ".backup"];
+
+/// Enough hostname forms to cover the full host, registrable domain, SLD and
+/// one common separator variant before spending budget on the long tail.
+const CORE_TOKEN_LIMIT: usize = 4;
 
 // ───────────────────────────── base normalization ────────────────────────────
 
@@ -328,8 +333,8 @@ pub fn derive_tokens(host: &str, path_segment: Option<&str>) -> Vec<String> {
 
 /// Server stack, inferred from one response. Drives which extension classes
 /// are worth spending requests on: a Java shop leaves `.war` files, a PHP
-/// shop leaves `.sql` and `.zip`. Guessing wrong only costs ordering, never
-/// coverage, because `Unknown` falls back to the full matrix.
+/// shop leaves `.sql` and `.zip`. Detection changes only lower-tail ordering;
+/// mandatory candidates remain stack-independent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stack {
     Java,
@@ -343,10 +348,8 @@ pub enum Stack {
 impl Stack {
     /// Extension classes ordered by what this stack most often leaves behind.
     ///
-    /// Every stack returns EVERY class - detection only changes the ORDER,
-    /// never the coverage. Stack detection is a heuristic on one response,
-    /// so excluding a class would mean a misdetected host silently loses a
-    /// whole category of findings. Reordering is free; exclusion is not.
+    /// Every stack returns every class. Automatic URL budgets may truncate the
+    /// lower tail, but stack detection never removes a class from the matrix.
     fn ext_classes(&self) -> Vec<&'static [&'static str]> {
         // The lead classes for this stack, then everything else appended in a
         // stable default order.
@@ -415,7 +418,7 @@ pub fn stack_from_signals(server: Option<&str>, powered_by: Option<&str>, body: 
 /// infer: an internal project name unrelated to the hostname.
 #[derive(Debug, Clone)]
 pub struct BackupCfg {
-    /// Hard ceiling on candidates per host. Auto-scaled by responsiveness,
+    /// Shared candidate-URL ceiling per host. Auto-scaled by responsiveness and
     /// never above `MAX_PERMS_CEILING`.
     pub max_perms: usize,
     /// Date-stamp depth. Fixed at 3 (this year and the previous two) - a
@@ -444,9 +447,10 @@ impl Default for BackupCfg {
     }
 }
 
-/// Build the candidate filename list for a host, in priority order P1..P5 and
-/// capped at `cfg.max_perms`. Returns filenames only - joining to a base is
-/// the caller's job so the same list can be reused for ROOT and DIR bases.
+/// Build the candidate filename list for a host, in priority order and capped
+/// at `cfg.max_perms`. High-yield generic, separator and current-year names are
+/// reserved before the bulk token/extension matrix, so a low live budget never
+/// drops `backup.zip` or the strongest hostname-derived forms.
 pub fn generate_candidates(host: &str, path_segment: Option<&str>, cfg: &BackupCfg) -> Vec<String> {
     let mut tokens = derive_tokens(host, path_segment);
     for extra in &cfg.token_extra {
@@ -463,14 +467,30 @@ pub fn generate_candidates(host: &str, path_segment: Option<&str>, cfg: &BackupC
         }
     };
 
-    // P1 - the full host with the highest-yield extensions.
-    if let Some(full) = tokens.first() {
-        for e in P1_EXTS {
-            push(format!("{}{}", full, e), &mut out, &mut seen);
+    let core_tokens: Vec<&String> = tokens.iter().take(CORE_TOKEN_LIMIT).collect();
+
+    // P0 - mandatory coverage. These names must survive every automatic live
+    // budget (the smallest is 50 candidate URLs).
+    for t in &core_tokens {
+        push(format!("{}.zip", t), &mut out, &mut seen);
+    }
+    for g in STATIC_GENERIC {
+        push(g.to_string(), &mut out, &mut seen);
+    }
+    for t in &core_tokens {
+        for f in SEPARATOR_FORMS.iter().take(2) {
+            push(f.replace("{}", t), &mut out, &mut seen);
+        }
+        for f in DATE_FORMS.iter().take(2) {
+            let c = f
+                .replace("{}", t)
+                .replace("{Y}", &cfg.current_year.to_string());
+            push(c, &mut out, &mut seen);
         }
     }
-    // P2 - every remaining token with the same set.
-    for t in tokens.iter().skip(1) {
+
+    // P1 - every token with the highest-yield extensions.
+    for t in &tokens {
         for e in P1_EXTS {
             push(format!("{}{}", t, e), &mut out, &mut seen);
         }
@@ -491,14 +511,11 @@ pub fn generate_candidates(host: &str, path_segment: Option<&str>, cfg: &BackupC
             }
         }
     }
-    // P4 - separator forms, then the host-independent generics.
+    // P4 - remaining separator forms.
     for t in &tokens {
         for f in SEPARATOR_FORMS {
             push(f.replace("{}", t), &mut out, &mut seen);
         }
-    }
-    for g in STATIC_GENERIC {
-        push(g.to_string(), &mut out, &mut seen);
     }
     // P5 - date-stamped, newest year first.
     for back in 0..cfg.years {
@@ -514,27 +531,34 @@ pub fn generate_candidates(host: &str, path_segment: Option<&str>, cfg: &BackupC
     out
 }
 
-/// Expand a candidate list across the backup directory prefixes.
-pub fn with_backup_dirs(candidates: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    for d in BACKUP_DIRS {
-        for c in candidates.iter().take(8) {
-            out.push(format!("{}/{}", d, c));
+/// Join candidates to bases in priority-round-robin order under one global URL
+/// budget. A target with both root and current-directory bases therefore still
+/// probes at most `max_urls` candidate URLs, not `max_urls` per base.
+fn build_probe_queue(
+    candidates: &[String],
+    targets: &[(String, String)],
+    max_urls: usize,
+) -> Vec<(String, String, String)> {
+    let mut queue = Vec::with_capacity(max_urls);
+    let mut seen = HashSet::new();
+    if max_urls == 0 {
+        return queue;
+    }
+
+    'candidates: for candidate in candidates {
+        for (base_type, base) in targets {
+            let Ok(url) = join_url(base, candidate) else {
+                continue;
+            };
+            if seen.insert(url.clone()) {
+                queue.push((url, base_type.clone(), candidate.clone()));
+                if queue.len() == max_urls {
+                    break 'candidates;
+                }
+            }
         }
     }
-    out
-}
-
-fn merge_backup_dir_candidates(mut candidates: Vec<String>, max_perms: usize) -> Vec<String> {
-    if max_perms == 0 || candidates.is_empty() {
-        return Vec::new();
-    }
-    let expanded = with_backup_dirs(&candidates);
-    let reserve = expanded.len().min((max_perms / 4).max(1));
-    candidates.truncate(max_perms.saturating_sub(reserve));
-    candidates.extend(expanded.into_iter().take(reserve));
-    candidates.truncate(max_perms);
-    candidates
+    queue
 }
 
 // ──────────────────────────────── detection ────────────────────────────────
@@ -665,6 +689,27 @@ pub struct Evidence<'a> {
     pub candidate: &'a str,
 }
 
+#[derive(Debug, Clone)]
+struct ResponseSample {
+    status: u16,
+    path: String,
+    body: Vec<u8>,
+}
+
+fn canonical_sample_body(sample: &ResponseSample) -> Vec<u8> {
+    if sample.path.is_empty() {
+        return sample.body.clone();
+    }
+    let Ok(text) = std::str::from_utf8(&sample.body) else {
+        return sample.body.clone();
+    };
+    text.replace(&sample.path, "{PATH}").into_bytes()
+}
+
+fn sample_similarity(a: &ResponseSample, b: &ResponseSample) -> f64 {
+    similarity(&canonical_sample_body(a), &canonical_sample_body(b))
+}
+
 /// The zero-false-positive gate.
 ///
 /// CONFIRMED requires all of: a 200/206 status, a body above the size floor,
@@ -726,18 +771,29 @@ pub fn first_bytes_sha256(body: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+fn declared_object_length(
+    content_length: Option<&str>,
+    content_range: Option<&str>,
+) -> Option<u64> {
+    content_range
+        .and_then(|value| value.rsplit_once('/').map(|(_, total)| total.trim()))
+        .filter(|total| *total != "*")
+        .and_then(|total| total.parse().ok())
+        .or_else(|| content_length.and_then(|value| value.trim().parse().ok()))
+}
+
 /// Probe one candidate URL with the shared client pool.
 ///
 /// Strategy: HEAD first (cheap, gives status + Content-Length). Only when
 /// that looks positive do we spend a ranged GET for the first 1024 bytes.
 /// The full archive is never downloaded.
-pub async fn probe_candidate(
+async fn probe_candidate(
     url: &str,
     host_key: &str,
     base_type: &str,
     host: &str,
     candidate: &str,
-    baseline: Option<&[u8]>,
+    baselines: &[ResponseSample],
     magic_verify: bool,
     request: &RequestCtx,
 ) -> Option<BackupFinding> {
@@ -747,8 +803,7 @@ pub async fn probe_candidate(
     // not a finding.
     gate_request(request, url).await;
     let head_resp = apply_request_ctx(
-        slot.client
-            .head(url)
+        slot.head(url)
             .redirect(wreq::redirect::Policy::none()),
         request,
     )
@@ -758,7 +813,11 @@ pub async fn probe_candidate(
     let (mut status, mut content_length, mut content_type, mut method) = match head_resp {
         Ok(r) => {
             let s = r.status().as_u16();
-            let cl = r.content_length();
+            let cl = declared_object_length(
+                r.headers().get("content-length").and_then(|v| v.to_str().ok()),
+                r.headers().get("content-range").and_then(|v| v.to_str().ok()),
+            )
+            .or_else(|| r.content_length());
             let ct = r
                 .headers()
                 .get("content-type")
@@ -782,8 +841,7 @@ pub async fn probe_candidate(
     if magic_verify || head_unusable {
         gate_request(request, url).await;
         let get_resp = apply_request_ctx(
-            slot.client
-                .get(url)
+            slot.get(url)
                 .redirect(wreq::redirect::Policy::none())
                 .header("Range", "bytes=0-1023"),
             request,
@@ -793,7 +851,11 @@ pub async fn probe_candidate(
         if let Ok(r) = get_resp {
             status = r.status().as_u16();
             if content_length.is_none() {
-                content_length = r.content_length();
+                content_length = declared_object_length(
+                    r.headers().get("content-length").and_then(|v| v.to_str().ok()),
+                    r.headers().get("content-range").and_then(|v| v.to_str().ok()),
+                )
+                .or_else(|| r.content_length());
             }
             if content_type.is_none() {
                 content_type = r
@@ -809,10 +871,17 @@ pub async fn probe_candidate(
         }
     }
 
-    let baseline_similarity = match baseline {
-        Some(b) => similarity(&body_head, b),
-        None => 0.0,
+    let candidate_sample = ResponseSample {
+        status,
+        path: url::Url::parse(url)
+            .map(|parsed| parsed.path().to_string())
+            .unwrap_or_default(),
+        body: body_head.clone(),
     };
+    let baseline_similarity = baselines
+        .iter()
+        .map(|baseline| sample_similarity(&candidate_sample, baseline))
+        .fold(0.0, f64::max);
 
     let ev = Evidence {
         status,
@@ -918,8 +987,7 @@ async fn profile_host(base: &str, host_key: &str, request: &RequestCtx) -> (Stac
     };
     gate_request(request, base).await;
     let resp = apply_request_ctx(
-        slot.client
-            .get(base)
+        slot.get(base)
             .redirect(wreq::redirect::Policy::none())
             .header("Range", "bytes=0-2047"),
         request,
@@ -959,42 +1027,15 @@ async fn profile_host(base: &str, host_key: &str, request: &RequestCtx) -> (Stac
     (stack, cap)
 }
 
-/// Probe two sentinel directories. The other prefixes are only worth
-/// expanding into when a host demonstrably exposes a backup directory, so
-/// this costs 2 requests instead of a flag the user has to guess at.
-async fn backup_dir_exists(root: &str, host_key: &str, request: &RequestCtx) -> bool {
-    for probe_dir in ["backup/", "bak/"] {
-        if let Ok(u) = join_url(root, probe_dir) {
-            if let Some(slot) = probe::pick_pool_slot_for(host_key) {
-                gate_request(request, &u).await;
-                if let Ok(r) = apply_request_ctx(
-                    slot.client
-                        .head(&u)
-                        .redirect(wreq::redirect::Policy::none()),
-                    request,
-                )
-                .send()
-                .await
-                {
-                    let s = r.status().as_u16();
-                    // 200 = listing, 403 = exists but denied. Both prove the
-                    // directory is real, which is what we are testing for.
-                    if s == 200 || s == 403 {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
-async fn baseline_sample(url: &str, host_key: &str, request: &RequestCtx) -> Option<Vec<u8>> {
+async fn response_sample(
+    url: &str,
+    host_key: &str,
+    request: &RequestCtx,
+) -> Option<ResponseSample> {
     let slot = probe::pick_pool_slot_for(host_key)?;
     gate_request(request, url).await;
     let response = apply_request_ctx(
-        slot.client
-            .get(url)
+        slot.get(url)
             .redirect(wreq::redirect::Policy::none())
             .header("Range", "bytes=0-1023"),
         request,
@@ -1002,19 +1043,87 @@ async fn baseline_sample(url: &str, host_key: &str, request: &RequestCtx) -> Opt
     .send()
     .await
     .ok()?;
+    let status = response.status().as_u16();
     let body = probe::read_body_capped(response, 1024).await.ok()?;
-    (!body.is_empty()).then_some(body)
+    (!body.is_empty()).then_some(ResponseSample {
+        status,
+        path: url::Url::parse(url)
+            .map(|parsed| parsed.path().to_string())
+            .unwrap_or_default(),
+        body,
+    })
+}
+
+fn sample_is_distinct(sample: &ResponseSample, controls: &[ResponseSample]) -> bool {
+    (sample.status == 200 || sample.status == 403)
+        && !controls
+            .iter()
+            .any(|control| sample_similarity(sample, control) >= 0.95)
+}
+
+/// Verify backup-directory responses against impossible-path controls and
+/// return the exact directories that differ. The remaining prefixes are only
+/// checked after `backup/` or `bak/` is verified, preserving the bounded setup
+/// cost on hosts with no backup-directory signal.
+async fn verified_backup_dirs(
+    root: &str,
+    host_key: &str,
+    request: &RequestCtx,
+    file_controls: &[ResponseSample],
+) -> Vec<String> {
+    let mut controls = file_controls.to_vec();
+    if let Ok(url) = join_url(root, "zzz-nonexistent-backup-dir-a1b2c3/") {
+        if let Some(control) = response_sample(&url, host_key, request).await {
+            controls.push(control);
+        }
+    }
+    if controls.is_empty() {
+        return Vec::new();
+    }
+
+    let mut found = Vec::new();
+    for dir in ["backup", "bak"] {
+        let Ok(url) = join_url(root, &format!("{}/", dir)) else {
+            continue;
+        };
+        if let Some(sample) = response_sample(&url, host_key, request).await {
+            if sample_is_distinct(&sample, &controls) {
+                found.push(dir.to_string());
+            }
+        }
+    }
+    if found.is_empty() {
+        return found;
+    }
+
+    for dir in BACKUP_DIRS {
+        if *dir == "backup" || *dir == "bak" {
+            continue;
+        }
+        let Ok(url) = join_url(root, &format!("{}/", dir)) else {
+            continue;
+        };
+        if let Some(sample) = response_sample(&url, host_key, request).await {
+            if sample_is_distinct(&sample, &controls) {
+                found.push((*dir).to_string());
+            }
+        }
+    }
+    found
 }
 
 /// Run host-derived backup discovery across `hosts`.
 ///
-/// Returns the findings that survived the verdict gate. Nothing here touches
-/// the wordlist probe path, so a change in this function cannot regress
-/// normal fuzzing.
-pub async fn run_phase(hosts: &[String], opts: &PhaseOpts) -> Vec<BackupFinding> {
+/// Streams each finding through `on_finding` as soon as it clears the verdict
+/// gate. Nothing here touches the wordlist probe path, so a change in this
+/// function cannot regress normal fuzzing.
+pub async fn run_phase<F>(hosts: &[String], opts: &PhaseOpts, mut on_finding: F) -> Result<usize>
+where
+    F: FnMut(&BackupFinding) -> Result<()>,
+{
     use futures::stream::{FuturesUnordered, StreamExt};
 
-    let mut findings: Vec<BackupFinding> = Vec::new();
+    let mut finding_count = 0usize;
     let mut emitted_urls: HashSet<String> = HashSet::new();
 
     for raw_host in hosts {
@@ -1051,52 +1160,18 @@ pub async fn run_phase(hosts: &[String], opts: &PhaseOpts) -> Vec<BackupFinding>
             cfg.stack = stack;
             cfg.max_perms = cap.min(MAX_PERMS_CEILING);
             eprintln!(
-                "  [backup] {} stack={:?} budget={}",
+                "  [backup] {} stack={:?} url_budget={}",
                 host_only, stack, cfg.max_perms
             );
         }
 
-        let mut candidates = generate_candidates(&host_only, seg.as_deref(), &cfg);
-        // Expand into backup directories only when the host actually has one.
-        let backup_dir_detected = if opts.dry_run {
-            false
-        } else {
-            probe::retry_wreq_pool_once(|| {
-                backup_dir_exists(&bases.root, &host_only, &opts.request)
-            })
-            .await
-            .unwrap_or(false)
-        };
-        if backup_dir_detected {
-            eprintln!("  [backup] {} exposes a backup directory - expanding", host_only);
-            candidates = merge_backup_dir_candidates(candidates, cfg.max_perms);
-        }
+        let candidates = generate_candidates(&host_only, seg.as_deref(), &cfg);
 
-        // Both bases always, deduped when identical. There is no reason to
-        // make the user choose - the join layer already collapses the case
-        // where the directory IS the root.
-        let mut targets: Vec<(&str, &String)> = vec![("root", &bases.root)];
-        if bases.dir != bases.root {
-            targets.push(("dir", &bases.dir));
-        }
-
-        if opts.dry_run {
-            for (bt, base) in &targets {
-                for c in &candidates {
-                    match join_url(base, c) {
-                        Ok(u) => eprintln!("  [backup dry-run] {} {}", bt, u),
-                        Err(e) => eprintln!("  [backup malformed] {} ({})", c, e),
-                    }
-                }
-            }
-            continue;
-        }
-
-        // Soft-404 calibration: three names that cannot exist, so any body
-        // they return IS the catch-all template for this host. Always on -
-        // disabling it could only ever make results worse.
-        let baseline: Option<Vec<u8>> = {
-            let mut sample: Option<Vec<u8>> = None;
+        // Soft-404 calibration keeps all successful controls. Similarity uses
+        // the closest of the three after replacing each echoed request path,
+        // so per-path catchalls cannot masquerade as archive content.
+        let mut baselines: Vec<ResponseSample> = Vec::new();
+        if !opts.dry_run {
             for probe_name in [
                 "zzz-nonexistent-a1b2c3.zip",
                 "zzz-nonexistent-d4e5f6.sql",
@@ -1104,30 +1179,67 @@ pub async fn run_phase(hosts: &[String], opts: &PhaseOpts) -> Vec<BackupFinding>
             ] {
                 if let Ok(u) = join_url(&bases.root, probe_name) {
                     if let Some(value) = probe::retry_wreq_pool_once(|| {
-                        baseline_sample(&u, &host_only, &opts.request)
+                        response_sample(&u, &host_only, &opts.request)
                     })
                     .await
                     .unwrap_or(None)
                     {
-                        sample = Some(value);
-                        break;
+                        baselines.push(value);
                     }
                 }
             }
-            sample
-        };
+        }
 
-        // Bounded fan-out so the phase honours the caller's concurrency.
-        let mut inflight = FuturesUnordered::new();
-        let mut queue: Vec<(String, String, String)> = Vec::new();
-        for (bt, base) in &targets {
-            for c in &candidates {
-                match join_url(base, c) {
-                    Ok(u) => queue.push((u, bt.to_string(), c.clone())),
-                    Err(e) => eprintln!("  [backup malformed, dropped] {} ({})", c, e),
+        // Root and current directory share one URL budget. Verified backup
+        // directories become exact bases rather than prefixes sprayed across
+        // every possible directory name.
+        let mut targets: Vec<(String, String)> = vec![("root".to_string(), bases.root.clone())];
+        if bases.dir != bases.root {
+            targets.push(("dir".to_string(), bases.dir.clone()));
+        }
+        if !opts.dry_run {
+            let verified_dirs = probe::retry_wreq_pool_once(|| {
+                verified_backup_dirs(&bases.root, &host_only, &opts.request, &baselines)
+            })
+            .await
+            .unwrap_or_default();
+            if !verified_dirs.is_empty() {
+                eprintln!(
+                    "  [backup] {} verified directories: {}",
+                    host_only,
+                    verified_dirs.join(",")
+                );
+            }
+            for dir in verified_dirs {
+                if let Ok(base) = join_url(&bases.root, &format!("{}/", dir)) {
+                    targets.push((format!("backup-dir:{}", dir), base));
                 }
             }
         }
+
+        let queue = build_probe_queue(&candidates, &targets, cfg.max_perms);
+        if opts.dry_run {
+            eprintln!(
+                "  [backup dry-run] {} maximum-url-budget={} bases={}",
+                host_only,
+                queue.len(),
+                targets.len()
+            );
+            for (url, base_type, _) in &queue {
+                eprintln!("  [backup dry-run] {} {}", base_type, url);
+            }
+            continue;
+        }
+        eprintln!(
+            "  [backup] {} candidate_urls={} bases={}",
+            host_only,
+            queue.len(),
+            targets.len()
+        );
+
+        // Bounded fan-out so the phase honours the caller's concurrency.
+        let mut inflight = FuturesUnordered::new();
+        let baselines = Arc::new(baselines);
 
         // Boxed so both spawn sites share one future type.
         type Task = std::pin::Pin<Box<dyn std::future::Future<Output = Option<BackupFinding>> + Send>>;
@@ -1135,7 +1247,7 @@ pub async fn run_phase(hosts: &[String], opts: &PhaseOpts) -> Vec<BackupFinding>
             let (u, bt, c) = queue[idx].clone();
             let hk = host_only.clone();
             let ho = host_only.clone();
-            let bl = baseline.clone();
+            let bl = baselines.clone();
             let request = opts.request.clone();
             Box::pin(async move {
                 // Magic-byte verification is unconditional: it is the single
@@ -1148,7 +1260,7 @@ pub async fn run_phase(hosts: &[String], opts: &PhaseOpts) -> Vec<BackupFinding>
                         &bt,
                         &ho,
                         &c,
-                        bl.as_deref(),
+                        bl.as_slice(),
                         true,
                         &request,
                     )
@@ -1169,7 +1281,8 @@ pub async fn run_phase(hosts: &[String], opts: &PhaseOpts) -> Vec<BackupFinding>
                 // Distinct URLs are distinct findings even when their first
                 // archive block is identical. Only collapse duplicate joins.
                 if emitted_urls.insert(f.url.clone()) {
-                    findings.push(f);
+                    on_finding(&f)?;
+                    finding_count += 1;
                 }
             }
             if next < queue.len() {
@@ -1179,30 +1292,27 @@ pub async fn run_phase(hosts: &[String], opts: &PhaseOpts) -> Vec<BackupFinding>
         }
     }
 
-    findings
+    Ok(finding_count)
 }
 
-/// Human-readable table for CONFIRMED findings only.
-pub fn print_confirmed_table(findings: &[BackupFinding]) {
-    let confirmed: Vec<&BackupFinding> = findings
-        .iter()
-        .filter(|f| f.verdict == Verdict::Confirmed)
-        .collect();
-    if confirmed.is_empty() {
+/// Human-readable stream for CONFIRMED findings only.
+pub fn print_confirmed_finding(finding: &BackupFinding, header_printed: &mut bool) {
+    if finding.verdict != Verdict::Confirmed {
         return;
     }
-    eprintln!();
-    eprintln!("  CONFIRMED host-derived backups");
-    eprintln!("  {:<58} {:>6} {:>12}  {}", "URL", "STATUS", "SIZE", "TYPE");
-    for f in confirmed {
-        eprintln!(
-            "  {:<58} {:>6} {:>12}  {}",
-            if f.url.len() > 58 { &f.url[..58] } else { &f.url },
-            f.status,
-            f.content_length.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
-            f.magic_matched.as_deref().unwrap_or("sql-text"),
-        );
+    if !*header_printed {
+        eprintln!();
+        eprintln!("  CONFIRMED host-derived backups");
+        eprintln!("  {:<58} {:>6} {:>12}  {}", "URL", "STATUS", "SIZE", "TYPE");
+        *header_printed = true;
     }
+    eprintln!(
+        "  {:<58} {:>6} {:>12}  {}",
+        if finding.url.len() > 58 { &finding.url[..58] } else { &finding.url },
+        finding.status,
+        finding.content_length.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+        finding.magic_matched.as_deref().unwrap_or("sql-text"),
+    );
 }
 
 // ───────────────────────────────── tests ─────────────────────────────────
@@ -1435,20 +1545,81 @@ mod tests {
     }
 
     #[test]
-    fn backup_directory_expansion_survives_the_candidate_cap() {
-        let cfg = BackupCfg { max_perms: 25, ..Default::default() };
-        let base = generate_candidates("www.abc.com", None, &cfg);
-        assert_eq!(base.len(), 25);
-        let merged = merge_backup_dir_candidates(base, 25);
-        assert_eq!(merged.len(), 25);
-        assert!(
-            merged.iter().any(|candidate| {
-                BACKUP_DIRS
-                    .iter()
-                    .any(|dir| candidate.starts_with(&format!("{}/", dir)))
-            }),
-            "at least one verified backup-directory candidate must remain"
-        );
+    fn automatic_cap_tiers_keep_mandatory_backup_coverage() {
+        for cap in [50, 60, 100, 180, 300] {
+            let cfg = BackupCfg { max_perms: cap, ..Default::default() };
+            let candidates = generate_candidates("www.abc.com", None, &cfg);
+            assert_eq!(candidates.len(), cap, "cap={}", cap);
+            for required in [
+                "www.abc.com.zip",
+                "abc.com.zip",
+                "abc.zip",
+                "backup.zip",
+                "backup.sql",
+                "backup.tar.gz",
+                "site.zip",
+                "www.abc.com_backup.zip",
+                "www.abc.com-2026.zip",
+            ] {
+                assert!(
+                    candidates.iter().any(|candidate| candidate == required),
+                    "cap={} missing {}",
+                    cap,
+                    required
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_cap_tiers_are_global_across_all_bases() {
+        let cfg = BackupCfg::default();
+        let candidates = generate_candidates("www.abc.com", Some("portal"), &cfg);
+        let targets = vec![
+            ("root".to_string(), "https://www.abc.com".to_string()),
+            ("dir".to_string(), "https://www.abc.com/portal".to_string()),
+            (
+                "backup-dir:backup".to_string(),
+                "https://www.abc.com/backup".to_string(),
+            ),
+        ];
+        for cap in [50, 60, 100, 180, 300] {
+            let queue = build_probe_queue(&candidates, &targets, cap);
+            assert_eq!(queue.len(), cap, "cap={}", cap);
+            let unique: HashSet<&String> = queue.iter().map(|(url, _, _)| url).collect();
+            assert_eq!(unique.len(), cap, "cap={}", cap);
+            for base_type in ["root", "dir", "backup-dir:backup"] {
+                assert!(
+                    queue.iter().any(|(_, kind, _)| kind == base_type),
+                    "cap={} missing base {}",
+                    cap,
+                    base_type
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn path_echo_controls_do_not_verify_a_wildcard_directory() {
+        let control = ResponseSample {
+            status: 200,
+            path: "/zzz-nonexistent-backup-dir-a1b2c3/".to_string(),
+            body: b"not found path=/zzz-nonexistent-backup-dir-a1b2c3/; end".to_vec(),
+        };
+        let wildcard = ResponseSample {
+            status: 200,
+            path: "/backup/".to_string(),
+            body: b"not found path=/backup/; end".to_vec(),
+        };
+        let real = ResponseSample {
+            status: 200,
+            path: "/backup/".to_string(),
+            body: b"<html><title>Index of /backup/</title></html>".to_vec(),
+        };
+
+        assert!(sample_similarity(&control, &wildcard) >= 0.95);
+        assert!(!sample_is_distinct(&wildcard, std::slice::from_ref(&control)));
+        assert!(sample_is_distinct(&real, &[control]));
     }
 
     #[test]
@@ -1458,6 +1629,16 @@ mod tests {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
         assert_eq!(first_bytes_sha256(b"archive").len(), 64);
+    }
+
+    #[test]
+    fn declared_length_uses_header_and_range_total() {
+        assert_eq!(declared_object_length(Some("356"), None), Some(356));
+        assert_eq!(
+            declared_object_length(Some("1024"), Some("bytes 0-1023/90000")),
+            Some(90_000)
+        );
+        assert_eq!(declared_object_length(None, Some("bytes */*")), None);
     }
 
     #[test]

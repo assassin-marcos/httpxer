@@ -7,8 +7,8 @@
 //!     └─── regex ─────────────────────────┴── suffix: \;version:\N means
 //!                                              "version = capture group N"
 //!
-//! Each app has up to 6 detection vectors — we cover headers, cookies, meta,
-//! html, scriptSrc. We deliberately skip `js` (needs a JS engine) and `dom`
+//! We cover five server-observable vectors: headers, cookies, meta, HTML and
+//! script source URLs. We deliberately skip `js` (needs a JS engine) and `dom`
 //! (needs a real HTML parser); those vectors are minority hits and httpx
 //! itself only runs them with a headless-browser config.
 
@@ -100,6 +100,8 @@ impl TechEngine {
 
         let mut apps: Vec<AppFingerprint> = Vec::with_capacity(apps_obj.len());
         let mut skipped_patterns = 0usize;
+        let mut detectable_apps = 0usize;
+        let mut compiled_patterns = 0usize;
 
         for (name, def) in apps_obj {
             let mut fp = AppFingerprint {
@@ -186,12 +188,23 @@ impl TechEngine {
                 }
             }
 
+            let app_patterns = fp.headers.len()
+                + fp.cookies.len()
+                + fp.meta.len()
+                + fp.html.len()
+                + fp.script_src.len();
+            if app_patterns > 0 {
+                detectable_apps += 1;
+                compiled_patterns += app_patterns;
+            }
             apps.push(fp);
         }
 
         eprintln!(
-            "[+] tech-detect: loaded {} apps{}",
+            "[+] tech-detect: {} definitions; {} detectable apps; {} compiled patterns{}",
             apps.len(),
+            detectable_apps,
+            compiled_patterns,
             if skipped_patterns > 0 {
                 format!(" ({} unsupported regex patterns skipped)", skipped_patterns)
             } else {

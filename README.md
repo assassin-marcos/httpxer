@@ -1,10 +1,12 @@
 # httpxer
 
-**Native httpx + dirsearch replacement: enrichment + recursive fuzz + crawl, with browser-grade TLS impersonation, content-aware wildcard detection, auth-dir recursion, and a native 401/403 bypass engine. One static binary.**
+**Native HTTP enrichment + recursive path fuzzing with browser-grade TLS impersonation, content-aware wildcard detection, auth-dir recursion, crawling, and a content-confirmed 401/403 bypass engine.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey.svg)]()
+
+**Current release:** [v0.6.7](https://github.com/assassin-marcos/httpxer/releases/tag/v0.6.7)
 
 ```
  _     _   _
@@ -19,7 +21,7 @@
 
 One tool, two jobs:
 
-- **Enrich mode** — reads a hostname list, probes each over HTTP(S), emits one NDJSON record per host with DNS / CDN / Wappalyzer tech-detect / HTTP fingerprint. Drop-in for ProjectDiscovery `httpx -json` (use `--httpx-compat` for byte-identical field shape).
+- **Enrich mode** — reads a hostname list, probes each over HTTP(S), and emits one JSONL record per host with DNS, CDN, Wappalyzer-style technology detection, and HTTP metadata. `--httpx-compat` provides the common httpx JSON field shape; exact byte-for-byte parity is not promised.
 - **Fuzz mode** — host × wordlist Cartesian probe with **recursive** dir bruteforce (incl. **auto-recursion into protected `401`/`403` dirs**), **crawl** (HTML/robots/sitemap link extraction), **content-aware wildcard detection** (static catchall + per-request-nonce catchall + path-echo), a **native, content-confirmed `401`/`403` bypass engine**, and dirsearch-style **live progress bar + findings stream**.
 
 Both modes share a 16-slot **BoringSSL** browser-emulation pool. Enrich mode samples the pool per probe; fuzz mode pins one profile per host so wildcard pre-flight and wordlist probes see the same UA-dependent response. Distinct hosts are still distributed across the pool.
@@ -27,7 +29,7 @@ Both modes share a 16-slot **BoringSSL** browser-emulation pool. Enrich mode sam
 ## Install
 
 ```bash
-# Linux / macOS — auto-detects x86_64 / arm64
+# Linux x86_64; macOS x86_64 or Apple Silicon
 curl -sL https://raw.githubusercontent.com/assassin-marcos/httpxer/main/install.sh | bash
 
 # Windows (PowerShell)
@@ -39,77 +41,74 @@ httpxer -c   # check for updates
 httpxer -X   # uninstall
 ```
 
+Released binaries: Linux `x86_64` (glibc 2.35+), macOS `x86_64` and `arm64`, and Windows `x86_64`. Linux ARM is not currently published; build it from source if your toolchain supports the dependency stack.
+
 ## Quickstart
 
 ### Enrich mode
 
 ```bash
-# Drop-in for httpx -json
+# One target, a file, or stdin
+httpxer -u https://example.com
 httpxer -l hosts.txt -o enriched.jsonl
-
-# httpx-compatible field shape (input/host/url/scheme/port/path/method/...)
-httpxer -l hosts.txt -o enriched.jsonl --httpx-compat
-
-# From stdin
 subfinder -d example.com -silent | httpxer -l - -o enriched.jsonl
 
-# Through a proxy (HTTP / HTTPS / SOCKS5)
-httpxer -l hosts.txt -o enriched.jsonl --proxy http://127.0.0.1:8080
+# Common httpx-compatible JSON fields
+httpxer -l hosts.txt --httpx-compat -o enriched.jsonl
 
-# Show every response header (terminal + a `response_headers` JSON object)
+# Headers, body, authentication, and proxying
 httpxer -u example.com --rh
+httpxer -u https://internal.example.com --bearer "$TOKEN" --cookie 'sid=abc'
+httpxer -l hosts.txt --proxy http://127.0.0.1:8080 -o enriched.jsonl
+httpxer -l hosts.txt --proxy proxies.txt -o rotated.jsonl
 
-# Authenticated probe — -H / --bearer / --cookie work in BOTH modes (v0.5.0)
-httpxer -u https://internal.example.com --bearer "$TOKEN" --rh
+# Technology detection: embedded snapshot, disabled, or custom snapshot
+httpxer -u example.com --tech default
+httpxer -l hosts.txt --tech off -o fast.jsonl
+httpxer -u example.com --tech ./fingerprints.json
 ```
 
-### Fuzz mode (single target)
+Technology detection is enrich-only. Fuzz records keep `tech:[]`; path scans do not run the detector for every response.
+
+### Fuzz mode
 
 ```bash
-# Basic — wordlist fuzz, smart defaults
+# Basic scan. Backup discovery, wildcard suppression and 401/403 bypass are on.
 httpxer -u https://example.com/ -w wordlist.txt -o out.txt
 
-# Full recon: recursion 3 levels + crawl 3 levels
-httpxer -u https://example.com/ -w wordlist.txt -r -R 3 --crawl --crawl-depth 3 -o out.txt
-
-# Plain "STATUS SIZE URL" output (auto-detected from .txt extension)
-httpxer -u https://example.com/ -w wordlist.txt -o out.txt
-# → 200    1.2KB  https://example.com/admin
-# → 301    320B   https://example.com/login
-# → 403     --    https://example.com/.git/HEAD
-
-# Full JSONL output (.jsonl extension)
-httpxer -u https://example.com/ -w wordlist.txt -o out.jsonl
-```
-
-### Multi-dictionary
-
-`-w` accepts **comma-separated wordlists** — they're loaded, merged, and de-duplicated (a per-file load count is printed):
-
-```bash
+# Multiple dictionaries are merged and de-duplicated
 httpxer -u https://example.com/ -w admin.txt,api.txt,sensitive.txt -o out.txt
-#   [wordlist] admin.txt : 1204 paths (+1204 new)
-#   [wordlist] api.txt : 980 paths (+812 new)
-#   ...
+
+# Exact codes, status classes, and inline exclusions
+httpxer -u https://example.com/ -w wordlist.txt --status '2xx,3xx,!429,!503'
+
+# Recursion, crawl, or both at depth 3
+httpxer -u https://example.com/ -w wordlist.txt --recurse 3 -o recurse.txt
+httpxer -u https://example.com/ -w wordlist.txt --crawl 3 -o crawl.txt
+httpxer -u https://example.com/ -w wordlist.txt --deep 3 -o deep.txt
+
+# Polite multi-host scan
+httpxer -l hosts.txt -w wordlist.txt -t 50 --rate-limit 10 -o findings.jsonl
+
+# Authenticated scan; auth controls work in both modes
+httpxer -u https://example.com/ -w wordlist.txt --bearer "$TOKEN" -H 'X-Tenant: 42'
+
+# Disable bypass requests where they are out of scope
+httpxer -u https://example.com/ -w wordlist.txt --safe -o findings.txt
+
+# Inspect wildcard candidates instead of suppressing them
+httpxer -u https://example.com/ -w wordlist.txt --wildcard mark -o review.jsonl
+
+# Preview host-derived backup names without sending any request, then exit
+httpxer -u https://example.com/ -w wordlist.txt --backup dry-run
+
+# Disable host-derived backup probes for a pure wordlist scan
+httpxer -u https://example.com/ -w wordlist.txt --backup off -o findings.txt
 ```
 
-### dirsearch-equivalent invocation
+`.txt` selects plain `STATUS SIZE URL`; other output extensions select JSONL. With no `-o`, records stream to stdout. With `-o`, each record is written and flushed as soon as it is found; enrich tasks are bounded by `-t`, and backup findings stream to their sidecar instead of accumulating until phase completion. `-q` hides the banner, update check, live findings and progress while retaining phase summaries.
 
-```bash
-httpxer -u https://example.com/ \
-  -w common.txt,sensitive.txt \
-  -t 150 \
-  -r -R 3 \
-  --crawl --crawl-depth 3 \
-  -i 200,301,302,307,308 \
-  --exclude 429,503 \
-  --timeout-ms 10000 \
-  --retries 2 \
-  --fuzz-follow-redirects \
-  -o everything.txt
-```
-
-> No `X-Original-URL` / `X-Forwarded-For` headers needed — the **native bypass engine** applies those (and more) *only* on `401`/`403` responses, with the real path and content-confirmation, instead of poisoning every request. Pass `--safe` to disable it.
+`--status`, `--tech`, `--backup`, and `--deep` are the preferred consolidated controls. Legacy spellings such as `-i`, `-r -R`, `--wildcard-policy`, `--no-backup-fuzz`, and `--backup-dry-run` remain accepted. Run `httpxer -h` for task-tagged examples or `httpxer --help` for the advanced option reference and practical recipes.
 
 ## Wildcard detection (the FP killer)
 
@@ -124,59 +123,74 @@ This closes the case where a constant-size catchall with a per-request token use
 
 | Policy | Behavior |
 |---|---|
-| `--wildcard-policy strict` *(default)* | Drop probes matching the wildcard |
-| `--wildcard-policy mark` | Emit them tagged `is_wildcard:true` (zero-suppression — you filter later) |
-| `--wildcard-policy off` / `--no-wildcard` | Skip pre-flight entirely |
+| `--wildcard strict` *(default)* | Drop probes matching the wildcard |
+| `--wildcard mark` | Emit them tagged `is_wildcard:true` for later review |
+| `--wildcard off` | Skip wildcard pre-flight and suppression |
 
 ## Recursion + crawl
 
-Pass `-r` (recursion) and/or `--crawl` to turn the host × wordlist single pass into a multi-round orchestrator:
+Use `--recurse N`, `--crawl N`, or `--deep N` to turn the host × wordlist single pass into a multi-round orchestrator:
 
-- **Recursion** — discovered directories (301/302/307/308 with `Location == URL + "/"` parity check; opt-in 200+autoindex via `--recurse-on-200`) get re-fuzzed with the wordlist up to `-R N` levels deep.
-- **Auth-dir recursion** *(auto-on)* — a `401`/`403` on a **directory-shaped** path (e.g. `/api`, `/internal` — not `/x.php`) is descended into so accessible children behind a protected parent are found (the classic `/api` = 401 → `/api/actuator` = 200). Excluding `401`/`403` from `-i` hides the parent without disabling discovery. A scoped random-child fingerprint prevents identical nested auth walls from becoming new recursion roots. Bounded by `--max-dirs-per-host`; the legacy `--recurse-on-403` flag (recurse *any* 403) still exists.
-- **Crawl** — every response body is parsed for HTML `<a/link/script/img/form/iframe>`, robots.txt `Disallow/Allow/Sitemap`, sitemap.xml `<loc>`. Same-host scope + third-party CDN deny list + static-media filter applied. Extracted URLs probed in the next round.
+- **Recursion** — discovered directories (301/302/307/308 with `Location == URL + "/"` parity check; opt-in 200+autoindex via `--recurse-on-200`) get re-fuzzed with the wordlist up to the requested depth.
+- **Auth-dir recursion** *(auto-on)* — a `401`/`403` on a **directory-shaped** path (e.g. `/api`, `/internal` — not `/x.php`) is descended into so accessible children behind a protected parent are found (the classic `/api` = 401 → `/api/actuator` = 200). Omitting `401`/`403` from `--status` hides the parent without disabling discovery. A scoped random-child fingerprint prevents identical nested auth walls from becoming new recursion roots. Bounded by `--max-dirs-per-host`; the legacy `--recurse-on-403` flag (recurse *any* 403) still exists.
+- **Crawl** — response bodies are parsed for HTML `<a/link/script/img/form/iframe>`, robots.txt `Disallow/Allow/Sitemap`, and sitemap.xml `<loc>`. Discovery happens before output status/size filters. A `3xx` stays attached to its requested path while its `Location` is queued as a separate crawl URL, so crawling cannot change wildcard identity.
 
-Both share a visited-set + a per-host **directory** budget (`--max-dirs-per-host`, default 200) so recursion never blows up on adversarial targets. Each discovered directory costs a full wordlist pass, so that cap — together with `-R` depth — is what actually bounds a recursive scan.
+Both share a visited set and a per-host **directory** budget (`--max-dirs-per-host`, default 200). Each discovered directory costs a full wordlist pass, so that cap plus depth bounds a recursive scan.
+
+Built-in `--exclude-subdirs` patterns guard **discovered directory expansion only**. Explicit wordlist entries are always probed, including names such as `healthz`, `readyz`, `ping`, and `actuator/health`. Override the built-ins with a comma-separated list, append with `--add-excludes`, or disable them with:
+
+```bash
+httpxer -u https://example.com -w wordlist.txt --deep 3 --exclude-subdirs ''
+```
+
+`--exclude-mode substring` is intentionally aggressive and can suppress a discovered directory when a short token appears anywhere in its path. The default `segment` mode is safer.
 
 ## Host-derived backup discovery (auto-on in fuzz mode)
 
 Site owners leave archives on the web root named after the site itself — `www.example.com.zip`, `example.com.sql`, `example.zip`. **No wordlist can carry these**, because the filename is a function of the target's own hostname. httpxer derives them per-host at runtime.
 
-Runs automatically whenever a wordlist is set. Pass `--no-backup-fuzz` to turn it off.
+Runs automatically whenever a wordlist is set. Use the single `--backup` control to select `auto`, `off`, or `dry-run`.
 
 ```sh
-# Auto — nothing to enable
+# Auto (default)
 httpxer -u https://example.com -w paths.txt
 
-# Preview candidates, send zero requests
-httpxer -u https://example.com -w paths.txt --backup-dry-run
+# Preview the maximum-budget candidate set, send zero requests, then exit
+httpxer -u https://example.com -w paths.txt --backup dry-run
+
+# Pure wordlist scan
+httpxer -u https://example.com -w paths.txt --backup off
 
 # Add a name the hostname can't reveal (internal project name)
 httpxer -u https://shop.example.io -w paths.txt --backup-tokens acmecorp,internal-portal
 ```
 
-**13 token rules** per host — full host, `www.`-stripped, registrable domain (real Public Suffix List, so `abc.co.uk` doesn't collapse to `co.uk`), SLD alone, dot→underscore/hyphen/removed variants, leftmost label, sub+SLD concatenations, and the current path segment. Ports are stripped: a backup is named after the site, never the socket. Crossed with ~80 extensions across 8 classes (archive, backup marker, database, Java package, disk image, compound, separator, date-stamped).
+**13 token rules** per host — full host, `www.`-stripped, registrable domain (real Public Suffix List, so `abc.co.uk` doesn't collapse to `co.uk`), SLD alone, dot→underscore/hyphen/removed variants, leftmost label, sub+SLD concatenations, and the current path segment. Ports are stripped: a backup is named after the site, never the socket. The resulting tokens feed a broad matrix across archive, backup-marker, database, Java-package, disk-image, compound, separator, and date-stamped classes.
+
+Every automatic budget reserves the highest-yield names first: full-host/registrable-domain/SLD `.zip` forms, all static generics (`backup.zip`, `backup.sql`, `backup.tar.gz`, `site.zip`, and related names), common separator forms, and current-year forms. Lower-priority permutations fill only the remaining budget.
 
 Everything is decided at runtime:
 
-- **Extension ordering follows the detected stack.** One request reads `Server`, `X-Powered-By` and a body snippet → Java / PHP / .NET / Node / Python / Unknown. Detection **reorders but never excludes** — a misread costs ordering, never a whole finding category.
-- **Budget scales with responsiveness.** <400 ms → 300 candidates, <1.2 s → 180, <3 s → 100, slower → 50. Hard ceiling 300/host, so it can't run away on a large scope.
-- **Backup directories are proven before expansion.** Two HEADs for `backup/` and `bak/`; the other 17 prefixes are only tried if one exists (200 or 403 both count).
-- **Root and current directory both probed**, deduped when identical.
+- **Extension ordering follows the detected stack.** One request reads `Server`, `X-Powered-By` and a body snippet → Java / PHP / .NET / Node / Python / Unknown. Detection reorders the lower-priority matrix; the reserved names above are stack-independent.
+- **Budget scales with responsiveness.** <400 ms → 300 candidate URLs, <1.2 s → 180, <3 s → 100, slower → 50, and failed profiling → 60. This is one total URL budget shared round-robin across root, current-directory, and verified backup-directory bases — not a separate allowance for every base.
+- **Backup directories are catchall-verified.** `backup/` and `bak/` are compared with impossible-path controls after request-path echoes are normalized. Only exact directories whose bodies differ are added as bases; the remaining prefixes are checked only after a sentinel is verified.
+- **Root and current directory both receive the highest-priority names**, deduped when identical and sharing the same URL budget.
+
+`--backup dry-run` cannot know the target's latency or stack without making a request. It therefore prints the maximum 300-URL priority preview and clearly exits without initializing the HTTP pool; a live `auto` run may select a lower budget and reorder only the lower-priority tail.
 
 **Zero-false-positive gate.** Naive backup scanning drowns in soft-404s — sites that answer `200 OK` with an HTML "not found" page for any filename. Every candidate must clear all of:
 
 - Status `200`/`206` only. Other statuses are not emitted by backup discovery, and redirects are not followed.
-- Soft-404 baseline calibrated from 3 impossible filenames per host; ≥0.95 body similarity is discarded
+- Soft-404 baseline calibrated from 3 impossible filenames per host; request-path echoes are normalized and ≥0.95 similarity to any control is discarded
 - Content-Type sanity — `text/html` on a `.zip`/`.sql`/`.db` is discarded unless the bytes say otherwise
 - **Magic bytes** — ZIP `50 4B 03 04`, GZIP `1F 8B`, BZIP2, XZ, 7Z, RAR, TAR `ustar`@257, `SQLite format 3`, MS Access — or a plaintext SQL-dump marker
 - Edge-security interstitials (challenge/blocked pages) filtered out
 
 Only `status OK + size OK + (magic OR SQL text) + baseline-dissimilar` reaches **CONFIRMED**. A remaining plausible `200`/`206` can be marked **REVIEW**; hard gate failures are discarded.
 
-**Bandwidth-safe.** `HEAD` first; only a promising result earns a ranged `GET` for the first 1024 bytes. The archive itself is never downloaded — a 4 GB `backup.tar.gz` costs ~1 KB to confirm.
+**Bandwidth-safe.** Each candidate URL gets `HEAD` first; only a `200`/`206` response (or a server that rejects `HEAD`) earns a ranged `GET` for the first 1024 bytes. The archive itself is never downloaded. The adaptive number is a candidate-URL budget; profiling, catchall controls, directory verification, retries, and the ranged confirmation request are additional bounded HTTP requests.
 
-Findings go to `<output>.backup.jsonl` (15 fields incl. `base_type`, `magic_matched`, `baseline_similarity`, `confidence`, `verdict`), plus a terminal table for CONFIRMED only.
+Findings go to `<output>.backup.jsonl` (15 fields including `base_type`, `magic_matched`, `baseline_similarity`, `confidence`, `verdict`), plus a terminal table for CONFIRMED only. When `-o` is omitted, the sidecar is `httpxer-backup.jsonl`; it is never derived from `/dev/stdout`.
 
 ## 401/403 bypass (native, auto, content-confirmed)
 
@@ -186,6 +200,14 @@ When a probe hits `401`/`403`, httpxer automatically retries it with a small, co
 - **Path mutations** — e.g. `…/..;/`
 
 A bypass is reported **only when confirmed**: the retry returns a `2xx` with a non-empty body, its normalized content **differs** from the original block page, and it doesn't match the host catchall. Redirects and empty bodies are not accepted as proof of access. Confirmed hits are emitted with a `bypass:"<technique>"` tag and a visible `[bypass] /admin 403→200 via X-Original-URL` line. Traffic is bounded by a per-host budget; it only ever *adds* findings, never suppresses. Pass **`--safe`** to disable it entirely (for programs/targets where bypass attempts are out of scope).
+
+## Technology fingerprints
+
+The embedded snapshot contains **7,524 technology definitions**. In the source data, **5,205 apps** have at least one vector the shallow HTTP engine supports, comprising **6,590 pattern entries**. With the current Rust regex engine, startup compiles **6,582 patterns across 5,186 directly detectable apps** and reports the 8 unsupported regex patterns it skips. Implication rules can add related technology names after a direct match.
+
+Supported vectors are response headers, cookies, meta tags, HTML, and script source URLs. JavaScript runtime variables and DOM-only rules require a browser and are not evaluated. Technology detection runs in enrich mode only; fuzz output intentionally leaves `tech` empty.
+
+Use `--tech default`, `--tech off`, or `--tech /path/to/fingerprints.json`. The legacy `--no-tech` and `--fingerprints` spellings remain available.
 
 ## TLS impersonation
 
@@ -205,7 +227,7 @@ Each `wreq` profile configures browser-specific TLS and HTTP/2 behavior plus mat
 Verify against a TLS-echo service:
 ```bash
 printf 'https://tls.peet.ws/api/all?n=%s\n' {1..64} > urls.txt
-httpxer -l urls.txt -o out.jsonl --with-body --no-tech -t 8
+httpxer -l urls.txt -o out.jsonl --with-body --tech off -t 8
 # Enrich mode samples profiles randomly; inspect the observed JA4 distribution.
 ```
 
@@ -224,9 +246,36 @@ Color-coded by status class when stderr is a TTY: green 2xx, yellow 3xx, cyan 40
 
 ### JSONL (default / `.jsonl` extension / `--format json`)
 
-Full structured record per finding. Fuzz mode includes `depth`, `source`, `parent_url` for multi-round provenance, and `bypass` (the winning technique) on confirmed 401/403 bypasses. Enrich mode (`--httpx-compat`) matches ProjectDiscovery httpx's JSON shape field-for-field. New fields are `skip_serializing_if`-gated, so existing downstream parsers stay byte-compatible on the common case.
+Full structured record per finding. Fuzz mode includes `depth`, `source`, `parent_url` for multi-round provenance, and `bypass` (the winning technique) on confirmed 401/403 bypasses. Enrich mode (`--httpx-compat`) uses common ProjectDiscovery httpx field names and array shapes, but consumers should not assume byte-for-byte output identity.
 
-Live findings stream to stderr above a `[N/total] X% | rps | eta` progress bar. Disable with `--no-live`.
+Live findings stream to stderr above a `[N/total] X% | rps | eta` progress bar. `--no-live` hides findings only; `-q` hides findings and progress while retaining phase summaries.
+
+## Proxy rotation
+
+`--proxy` accepts either one endpoint or a proxy file. A file may mix protocols; httpxer validates and de-duplicates it at startup, then selects the next endpoint for every HTTP request. The browser/TLS profile remains stable per target host so wildcard fingerprints stay comparable. URL credentials work with HTTP, HTTPS, SOCKS5, and SOCKS5H; the underlying client does not support SOCKS4 authentication, so authenticated SOCKS4 entries fail validation instead of starting a scan.
+
+```text
+# proxies.txt: one endpoint per line; blank lines and comments are ignored
+http://127.0.0.1:8080
+https://user:password@proxy.example:8443
+socks5://127.0.0.1:1080
+socks5h://user:password@proxy.example:1080
+127.0.0.1:8888
+```
+
+```bash
+# One authenticated proxy
+httpxer -u https://example.com --proxy http://user:password@127.0.0.1:8080
+
+# Mixed per-request rotation in enrich or fuzz mode
+httpxer -l hosts.txt --proxy proxies.txt -o enriched.jsonl
+httpxer -u https://example.com -w paths.txt --proxy proxies.txt -o findings.jsonl
+
+# Force a path without a conventional file extension to be read as a file
+httpxer -u https://example.com --proxy @proxy-pool
+```
+
+Supported schemes are HTTP, HTTPS, SOCKS4/SOCKS4A, and SOCKS5/SOCKS5H. Bare `host:port` entries default to HTTP. Credentials must use URL form (`scheme://user:password@host:port`) and are not printed in startup diagnostics. A failed endpoint is reported as a normal request error; retries rotate to the next endpoint.
 
 ## Auth
 
@@ -252,37 +301,30 @@ httpxer ... --cookie "sid=abc123" --cookie "csrf=token"
 | `-o <FILE>` | — | Output (`.jsonl` → JSON, `.txt` → plain) |
 | `-t <N>` | 250 | Concurrent probes |
 | `--timeout-ms` | 5000 | Per-probe timeout (ms) |
-| `--proxy <URL>` | — | HTTP / HTTPS / SOCKS5 proxy |
-| `-r / -R <N>` | off / 3 | Enable recursion, max depth (incl. auto auth-dir recursion) |
-| `--crawl / --crawl-depth <N>` | off / 3 | Enable crawl, max depth |
-| `-w a.txt,b.txt` | — | Multiple wordlists (merged + de-duplicated) |
-| `--wildcard-policy strict\|mark\|off` | `strict` | Drop / tag / skip wildcard matches |
+| `--proxy <URL\|FILE>` | — | One proxy or mixed per-request proxy rotation file |
+| `--status '2xx,3xx,!429'` | common finding codes | Include exact codes/classes and exclude with `!` |
+| `--recurse [N]` | off / 3 | Recursive wordlist expansion |
+| `--crawl [N]` | off / 3 | HTML, robots, sitemap and redirect discovery |
+| `--deep [N]` | off / 3 | Recursion and crawl together |
+| `--wildcard strict\|mark\|off` | `strict` | Drop, tag, or disable wildcard handling |
+| `--backup auto\|off\|dry-run` | `auto` | Host-derived backups, disable, or request-free preview |
 | `--safe` | off | Disable the native 401/403 bypass engine |
-| `-i <codes>` | `200,301,302,307,308,401,403` | Status codes to emit (alias: `--match-codes`) |
-| `--exclude <codes>` | `429,503` | Status codes to drop |
-| `--exclude-root-size` | off | Auto-probe `/` and add CL to exclude list |
-| `--exclude-mode segment\|substring` | `segment` | Exclude-list match style |
-| `--recurse-on-200` / `--recurse-on-403` | off | Treat these statuses as directories too |
+| `--tech default\|off\|FILE` | `default` | Embedded, disabled, or custom enrich fingerprints |
 | `-H "K: V"` | — | Custom header (repeatable) |
 | `--bearer <TOK>` | — | `Authorization: Bearer TOK` |
 | `--cookie "K=V"` | — | Static Cookie header value (repeatable) |
-| `--fuzz-follow-redirects` | off (auto-on with `--crawl`) | Follow redirects in fuzz mode |
-| `--no-backup-fuzz` | backup discovery on | Disable host-derived backup discovery |
-| `--backup-dry-run` | off | Print backup candidates, send no requests |
-| `--backup-tokens <LIST>` | — | Extra base-name tokens the hostname can't reveal |
 | `--httpx-compat` | off | Enrich output in httpx JSON shape |
 | `--with-body` | off | Include response body (≤2 MiB) |
-| `--no-live` | live on | Suppress live findings stream on stderr |
-| `-q` | off | Suppress banner / progress / update-check |
+| `-q` | off | Hide banner, update check, live findings and progress |
 | `-U` / `-c` / `-X` | — | Update / check / uninstall |
 
-Full reference: `httpxer --help`.
+Full reference: `httpxer --help`. Advanced exact-size filters are intentionally lossy: `--exclude-root-size` can hide a real page that happens to equal the root body size. `--fuzz-follow-redirects` classifies a terminal response under the requested path and should be used only when that behavior is explicitly required.
 
 ## Limitations
 
 - **JS challenges** (Cloudflare Turnstile, Akamai sensor data) — needs a headless browser
 - **Behavioral detection** (timing, mouse events, per-IP rate scoring) — static-signature defeat ≠ behavioral defeat
-- **IP reputation** — rotate egress IPs at a higher layer (proxies / residential pool)
+- **IP reputation** — proxy rotation distributes requests but cannot guarantee that an endpoint has good reputation
 - **JS endpoint extraction** — crawl parses HTML/robots/sitemap; endpoints embedded inside JavaScript bodies aren't parsed (planned)
 
 Browser emulation can reduce simple static-signature blocks, but it is not a bypass guarantee. Behavioral defenses still apply.
@@ -296,7 +338,7 @@ Browser emulation can reduce simple static-signature blocks, but it is not a byp
 git clone https://github.com/assassin-marcos/httpxer && cd httpxer && cargo build --release
 ```
 
-`libclang` is needed once at build time (for `boring-sys2` bindgen). The resulting binary is statically linked — runtime has no dependencies.
+`libclang` is needed at build time for `boring-sys2` bindgen. The released Linux GNU binary dynamically uses the standard glibc runtime and targets glibc 2.35+; libclang, LLVM, and NASM are not runtime dependencies.
 
 ## License / Contact
 
