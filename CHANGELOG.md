@@ -2,6 +2,16 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.6.6] — 2026-07-31
+
+### Fixed
+- **Path-echo precedence:** a validated linear Layer 2 model now wins before normalized Layer 1b, so short wordlist paths match catchalls learned from longer random paths.
+- **Protected-directory recursion:** trailing-slash auth directories expand once even when already probed, while a scoped auth fingerprint prevents identical nested `401`/`403` walls from multiplying recursion.
+
+### Verified
+- Controlled mixed-family, path-echo, status-separated, and protected-child fixtures emitted only the expected real endpoints across strict wildcard and depth-3 recursion runs.
+- `cargo test`: 171 passing; the optimized `v0.6.6` binary passed the same four controlled fixture runs.
+
 ## [0.6.5] — 2026-07-31
 
 ### Fixed

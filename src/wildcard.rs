@@ -289,16 +289,64 @@ pub fn agreed_from_samples(samples: &[WildcardSig]) -> Option<WildcardSig> {
     }
 }
 
-/// Two-layer wildcard detector — the v0.3.9 upgrade.
+/// Fit a path-echo response family where body length changes linearly with the
+/// requested path length. Three samples are required because any two points
+/// define a line and therefore cannot validate the model.
+fn detect_layer2(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
+    if samples.len() < 3 {
+        return None;
+    }
+    let first = &samples[0];
+    if !samples
+        .iter()
+        .all(|sample| sample.status == first.status && sample.content_type == first.content_type)
+    {
+        return None;
+    }
+
+    let min_s = samples.iter().min_by_key(|sample| sample.path_len)?;
+    let max_s = samples.iter().max_by_key(|sample| sample.path_len)?;
+    let dx = max_s.path_len as i64 - min_s.path_len as i64;
+    if dx == 0 {
+        return None;
+    }
+    let dy = max_s.content_length - min_s.content_length;
+    let k = (dy as f64 / dx as f64).round() as i64;
+    if !(1..=20).contains(&k) {
+        return None;
+    }
+    let base = min_s.content_length - k * min_s.path_len as i64;
+    if samples.iter().any(|sample| {
+        let expected = k * sample.path_len as i64 + base;
+        (expected - sample.content_length).abs() > tolerance
+    }) {
+        return None;
+    }
+
+    Some(WildcardSig {
+        status: first.status,
+        content_length: -1,
+        content_type: first.content_type.clone(),
+        snippet_md5: String::new(),
+        k: Some(k),
+        base: Some(base),
+        tolerance,
+        normalized_snippet_md5: String::new(),
+    })
+}
+
+/// Three-layer wildcard detector.
 ///
-/// Returns `Some(sig)` when EITHER:
+/// Returns `Some(sig)` when one of these ordered checks succeeds:
 ///   - **Layer 1**: all samples agree on `(CL, CT, snippet_md5)` (modulo
 ///     `tolerance`) → static catchall fingerprint stored.
 ///   - **Layer 2**: Layer 1 failed but samples fit a linear relationship
 ///     `CL = k × path_len + base` with same `content_type` and small
 ///     residuals → path-echo fingerprint stored.
+///   - **Layer 1b**: no linear model fits, but normalized body structure
+///     agrees across dynamic responses → content-aware fingerprint stored.
 ///
-/// Returns `None` when neither layer fires — the server is truly
+/// Returns `None` when none of the layers fire — the server is truly
 /// path-sensitive and we cannot reliably distinguish wildcard from real
 /// findings. Caller marks the dir path-sensitive and skips suppression.
 ///
@@ -352,6 +400,13 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
             });
         }
 
+        // A wide same-prefix response can still be path-echoing content whose
+        // variable path appears after the exact snippet window. Prefer the
+        // validated linear model before falling back to a shape-only shell.
+        if let Some(signature) = detect_layer2(samples, tolerance) {
+            return Some(signature);
+        }
+
         // Wide-drift app-shell fallback. Sharing only body[:200] is not enough:
         // unrelated pages often have the same HTML head. Require the normalized
         // first 2 KiB and raw token shape to agree, then use that same shape at
@@ -376,6 +431,11 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
                 });
             }
         }
+    } else if let Some(signature) = detect_layer2(samples, tolerance) {
+        // Path-echo bodies normally differ in the first snippet. Detect their
+        // length relationship before normalization can collapse random hex
+        // paths into a Layer 1b signature that will not match short words.
+        return Some(signature);
     }
 
     // ── Layer 1b (content-aware): same CT + bounded CL spread, body varies
@@ -434,52 +494,7 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
         }
     }
 
-    // ── Layer 2: linear CL = k × path_len + base. ─────────────────────
-    // Two points always define a line, so they cannot validate a path-echo
-    // model. Require a third independent path to reject coincidental slopes.
-    if samples.len() < 3 {
-        return None;
-    }
-    let same_ct = samples.iter().all(|s| s.content_type == first.content_type);
-    if !same_ct {
-        return None;
-    }
-    // Pick the path-length extremes for slope calculation (most stable
-    // estimate against per-sample jitter).
-    let min_s = samples.iter().min_by_key(|s| s.path_len).unwrap();
-    let max_s = samples.iter().max_by_key(|s| s.path_len).unwrap();
-    let dx = max_s.path_len as i64 - min_s.path_len as i64;
-    if dx == 0 {
-        // All samples used the same path length → can't compute slope.
-        return None;
-    }
-    let dy = max_s.content_length - min_s.content_length;
-    // Round to nearest integer K (we expect 1, 2, 3, occasionally more).
-    let k_float = dy as f64 / dx as f64;
-    let k = k_float.round() as i64;
-    // K must be a sane "path appears N times" count. Outside [1, 20]
-    // suggests this isn't actually a path-echo pattern.
-    if !(1..=20).contains(&k) {
-        return None;
-    }
-    let base = min_s.content_length - k * min_s.path_len as i64;
-    // Verify ALL samples fit the formula within tolerance.
-    for s in samples {
-        let expected = k * s.path_len as i64 + base;
-        if (expected - s.content_length).abs() > tolerance {
-            return None;
-        }
-    }
-    Some(WildcardSig {
-        status: first.status,
-        content_length: -1,
-        content_type: first.content_type.clone(),
-        snippet_md5: String::new(),
-        k: Some(k),
-        base: Some(base),
-        tolerance,
-        normalized_snippet_md5: String::new(),
-    })
+    None
 }
 
 /// Host-level **auth-catchall** fingerprint (v0.6.3).
@@ -833,6 +848,36 @@ mod tests {
         assert!(detect(&samples, 10).is_none());
     }
 
+    #[test]
+    fn path_echo_beats_normalized_layer1b() {
+        let samples: Vec<ProbeSample> = [17usize, 33, 65]
+            .into_iter()
+            .map(|path_len| {
+                let path = format!("/{}", "a".repeat(path_len - 1));
+                let body = format!("not found path={}; end", path);
+                ProbeSample {
+                    status: 200,
+                    content_length: body.len() as i64,
+                    content_type: "text/html".into(),
+                    snippet_md5: md5_hex(&body),
+                    path_len,
+                    raw_body: body,
+                }
+            })
+            .collect();
+
+        let sig = detect(&samples, 10).expect("path echo should be detected");
+        assert_eq!(sig.k, Some(1), "Layer 2 must win over normalized L1b");
+        let short_body = "not found path=/a; end";
+        assert!(sig.matches_probe(
+            short_body.len() as i64,
+            "text/html",
+            &md5_hex(short_body),
+            2,
+            short_body,
+        ));
+    }
+
     /// Same as above but with ±2 bytes per-sample jitter (e.g. timestamp
     /// fluctuation in error body). Should still detect K=3.
     #[test]
@@ -937,7 +982,7 @@ mod tests {
         assert!(detect(&samples, 10).is_none());
     }
 
-    /// Truly path-sensitive server — neither layer fits → None.
+    /// Truly path-sensitive server — none of the layers fit → None.
     #[test]
     fn detect_returns_none_when_neither_layer_fits() {
         let samples = vec![

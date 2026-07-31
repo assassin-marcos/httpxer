@@ -480,6 +480,10 @@ fn output_url_key(raw: &str) -> String {
     url.to_string()
 }
 
+fn mark_directory_expanded(expanded: &mut HashSet<String>, canonical_url: &str) -> bool {
+    expanded.insert(canonical_url.to_string())
+}
+
 /// `"foo"` → `"/foo"`, `"//foo"` → `"/foo"`, `""` → `""`. Trims whitespace.
 /// Donor logic — ported verbatim from retroh4ck-prober/src/util.rs so paths
 /// produced by both binaries are byte-identical given the same wordlist.
@@ -1767,6 +1771,7 @@ pub async fn run(
     // v0.4.6 — per-directory catchall cache, learned live during the run (both
     // detectors write here). Budget scales with host count.
     let catchall = Arc::new(Mutex::new(CatchallCache::new(hosts.len())));
+    let scoped_auth = Arc::new(Mutex::new(ScopedAuthCache::default()));
 
     // ── Concurrency ────────────────────────────────────────────────────
     let sem = Arc::new(Semaphore::new(cfg.threads.max(1)));
@@ -1843,6 +1848,10 @@ pub async fn run(
     // Insert-and-check is atomic via Mutex; HashSet for O(1) lookup.
     let visited: Arc<tokio::sync::Mutex<HashSet<String>>> =
         Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+    // A directory URL can already be in `visited` because the response that
+    // proved it was a directory was itself a round-0 probe. Expansion needs a
+    // separate identity set, especially for wordlist entries ending in `/`.
+    let mut expanded_dirs: HashSet<String> = HashSet::new();
     // Seed visited with the round-0 host × wordlist set so crawl-extracted
     // links matching existing wordlist probes don't double-fire.
     {
@@ -1887,6 +1896,7 @@ pub async fn run(
             let cfg = cfg.clone();
             let wildcards = wildcards.clone();
             let catchall = catchall.clone();
+            let scoped_auth = scoped_auth.clone();
             let out_file = out_file.clone();
             let policy = wildcard_policy_arc.clone();
             let disc = disc_tx.clone();
@@ -1903,7 +1913,14 @@ pub async fn run(
             tasks.push(progress.spawn_probe(async move {
                 let _p = permit;
                 run_probe_resilient(
-                    item, &cfg, &wildcards, &catchall, &out_file, *policy, &disc,
+                    item,
+                    &cfg,
+                    &wildcards,
+                    &catchall,
+                    &scoped_auth,
+                    &out_file,
+                    *policy,
+                    &disc,
                 )
                 .await;
             }));
@@ -1960,7 +1977,7 @@ pub async fn run(
                 let mut v = visited.lock().await;
                 let mut budgets = host_budgets.lock().await;
                 for (canon, host, depth, parent) in new_dirs {
-                    if !v.insert(canon.clone()) { continue; }
+                    if !mark_directory_expanded(&mut expanded_dirs, &canon) { continue; }
                     let budget = budgets.entry(host.clone()).or_insert_with(|| {
                         Arc::new(crate::recurse::HostBudget::new(cfg.max_dirs_per_host))
                     });
@@ -2037,6 +2054,7 @@ pub async fn run(
                     let cfg_c = cfg.clone();
                     let wildcards_c = wildcards.clone();
                     let catchall_c = catchall.clone();
+                    let scoped_auth_c = scoped_auth.clone();
                     let out_file_c = out_file.clone();
                     let policy_c = wildcard_policy_arc.clone();
                     let disc_c = disc_tx.clone();
@@ -2047,7 +2065,13 @@ pub async fn run(
                     tasks.push(progress.spawn_probe(async move {
                         let _p = permit;
                         run_probe_resilient(
-                            item, &cfg_c, &wildcards_c, &catchall_c, &out_file_c, *policy_c,
+                            item,
+                            &cfg_c,
+                            &wildcards_c,
+                            &catchall_c,
+                            &scoped_auth_c,
+                            &out_file_c,
+                            *policy_c,
                             &disc_c,
                         )
                         .await;
@@ -2086,6 +2110,7 @@ pub async fn run(
                 let cfg_c = cfg.clone();
                 let wildcards_c = wildcards.clone();
                 let catchall_c = catchall.clone();
+                let scoped_auth_c = scoped_auth.clone();
                 let out_file_c = out_file.clone();
                 let policy_c = wildcard_policy_arc.clone();
                 let disc_c = disc_tx.clone();
@@ -2094,7 +2119,13 @@ pub async fn run(
                 tasks.push(progress.spawn_probe(async move {
                     let _p = permit;
                     run_probe_resilient(
-                        item, &cfg_c, &wildcards_c, &catchall_c, &out_file_c, *policy_c,
+                        item,
+                        &cfg_c,
+                        &wildcards_c,
+                        &catchall_c,
+                        &scoped_auth_c,
+                        &out_file_c,
+                        *policy_c,
                         &disc_c,
                     )
                     .await;
@@ -2302,6 +2333,42 @@ struct CatchallCache {
     /// Sibling-probe count per origin. One noisy host cannot consume the
     /// entire multi-host run's detection budget.
     parents_used: std::collections::HashMap<String, usize>,
+}
+
+/// Auth response learned from a random child of a confirmed protected
+/// directory. It prevents identical 401/403 children from each becoming a new
+/// recursion root while still allowing the protected directory itself to be
+/// expanded once for accessible children.
+#[derive(Default)]
+struct ScopedAuthCache {
+    learned: std::collections::HashMap<String, Vec<crate::wildcard::AuthCatchall>>,
+}
+
+impl ScopedAuthCache {
+    fn insert(&mut self, scope: &str, sig: crate::wildcard::AuthCatchall) {
+        let scope = scope.trim_end_matches('/').to_string();
+        let sigs = self.learned.entry(scope).or_default();
+        if !sigs.contains(&sig) {
+            sigs.push(sig);
+        }
+    }
+
+    fn matches(&self, url: &str, status: u16, cl: i64, ct: &str, md5: &str) -> bool {
+        self.learned
+            .iter()
+            .filter(|(scope, _)| {
+                url.strip_prefix(scope.as_str()).is_some_and(|rest| {
+                    rest.is_empty()
+                        || rest.starts_with('/')
+                        || rest.starts_with('?')
+                        || rest.starts_with('#')
+                })
+            })
+            .max_by_key(|(scope, _)| scope.len())
+            .is_some_and(|(_, sigs)| {
+                sigs.iter().any(|sig| sig.matches(status, cl, ct, md5))
+            })
+    }
 }
 
 /// True if any learned catchall sig content-matches this response. Shared by
@@ -2683,6 +2750,7 @@ async fn run_probe_resilient(
     cfg: &FuzzCfg,
     wildcards: &Arc<WildcardMap>,
     catchall: &Arc<Mutex<CatchallCache>>,
+    scoped_auth: &Arc<Mutex<ScopedAuthCache>>,
     out_file: &Arc<OutputSink>,
     wildcard_policy: WildcardPolicy,
     disc_tx: &tokio::sync::mpsc::UnboundedSender<Discovery>,
@@ -2693,6 +2761,7 @@ async fn run_probe_resilient(
             cfg,
             wildcards,
             catchall,
+            scoped_auth,
             out_file,
             wildcard_policy,
             disc_tx,
@@ -2706,6 +2775,7 @@ async fn run_probe(
     cfg: &FuzzCfg,
     wildcards: &Arc<WildcardMap>,
     catchall: &Arc<Mutex<CatchallCache>>,
+    scoped_auth: &Arc<Mutex<ScopedAuthCache>>,
     out_file: &Arc<OutputSink>,
     wildcard_policy: WildcardPolicy,
     disc_tx: &tokio::sync::mpsc::UnboundedSender<Discovery>,
@@ -2815,13 +2885,21 @@ async fn run_probe(
                 // from the blanket response is real signal and still recurses,
                 // which is the `/api`=401 → `/api/actuator`=200 case this rule
                 // exists to serve.
-                let auth_noise = wildcards.is_auth_catchall(
-                    &item.host_input,
+                let scoped_auth_noise = scoped_auth.lock().await.matches(
+                    &url,
                     parsed.status,
                     parsed.content_length,
                     &parsed.content_type,
                     &parsed.snippet_md5,
                 );
+                let auth_noise = scoped_auth_noise
+                    || wildcards.is_auth_catchall(
+                        &item.host_input,
+                        parsed.status,
+                        parsed.content_length,
+                        &parsed.content_type,
+                        &parsed.snippet_md5,
+                    );
                 if let Some(dir_url) = crate::recurse::detect_directory(
                     &url,
                     parsed.status,
@@ -2856,15 +2934,28 @@ async fn run_probe(
                         )
                         .await
                         {
-                            Ok((child, _, _)) => wildcards.matches_url_body(
-                                &item.host_input,
-                                &canary,
-                                child.status,
-                                child.content_length,
-                                &child.content_type,
-                                &child.snippet_md5,
-                                &child.raw_body,
-                            ),
+                            Ok((child, _, _)) => {
+                                if matches!(child.status, 401 | 403) {
+                                    scoped_auth.lock().await.insert(
+                                        &dir_url,
+                                        crate::wildcard::AuthCatchall {
+                                            status: child.status,
+                                            content_length: child.content_length,
+                                            content_type: child.content_type.clone(),
+                                            snippet_md5: child.snippet_md5.clone(),
+                                        },
+                                    );
+                                }
+                                wildcards.matches_url_body(
+                                    &item.host_input,
+                                    &canary,
+                                    child.status,
+                                    child.content_length,
+                                    &child.content_type,
+                                    &child.snippet_md5,
+                                    &child.raw_body,
+                                )
+                            }
                             Err(_) => false,
                         }
                     } else {
@@ -2884,8 +2975,8 @@ async fn run_probe(
             // ── Native 401/403 bypass (v0.4.5, auto-on unless --safe) ─────────
             // On a forbidden response, try the conservative bypass battery.
             // Confirmed wins are emitted as their own record tagged `bypass`;
-            // the raw 401/403 is NOT emitted (it's filtered below). Per-host
-            // budget bounds traffic.
+            // normal 401/403 output still follows the user's status filters.
+            // Per-host budget bounds traffic.
             if cfg.bypass_enabled
                 && matches!(parsed.status, 401 | 403)
                 && crate::bypass::charge_host(&item.host)
@@ -3170,6 +3261,56 @@ async fn write_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probed_trailing_slash_directory_can_still_expand_once() {
+        let dir = crate::recurse::canonical_url_key("https://x.test/protected/");
+        let mut probed_urls = HashSet::from([dir.clone()]);
+        let mut expanded_dirs = HashSet::new();
+
+        assert!(!probed_urls.insert(dir.clone()), "the directory URL was probed");
+        assert!(
+            mark_directory_expanded(&mut expanded_dirs, &dir),
+            "probe identity must not block directory expansion"
+        );
+        assert!(!mark_directory_expanded(&mut expanded_dirs, &dir));
+    }
+
+    #[test]
+    fn scoped_auth_catchall_blocks_identical_children_only() {
+        let mut cache = ScopedAuthCache::default();
+        cache.insert(
+            "https://x.test/protected/",
+            crate::wildcard::AuthCatchall {
+                status: 401,
+                content_length: 14,
+                content_type: "text/plain".into(),
+                snippet_md5: "auth-wall".into(),
+            },
+        );
+
+        assert!(cache.matches(
+            "https://x.test/protected/admin",
+            401,
+            14,
+            "text/plain",
+            "auth-wall",
+        ));
+        assert!(!cache.matches(
+            "https://x.test/protected-real/admin",
+            401,
+            14,
+            "text/plain",
+            "auth-wall",
+        ));
+        assert!(!cache.matches(
+            "https://x.test/protected/admin",
+            401,
+            14,
+            "text/plain",
+            "different-wall",
+        ));
+    }
 
     // ── Progress accounting: the "never above 100%" invariant ────────────
     //
