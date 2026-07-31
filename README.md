@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey.svg)]()
 
-**Current release:** [v0.6.7](https://github.com/assassin-marcos/httpxer/releases/tag/v0.6.7)
+**Current release:** [v0.6.8](https://github.com/assassin-marcos/httpxer/releases/tag/v0.6.8)
 
 ```
  _     _   _
@@ -22,7 +22,7 @@
 One tool, two jobs:
 
 - **Enrich mode** — reads a hostname list, probes each over HTTP(S), and emits one JSONL record per host with DNS, CDN, Wappalyzer-style technology detection, and HTTP metadata. `--httpx-compat` provides the common httpx JSON field shape; exact byte-for-byte parity is not promised.
-- **Fuzz mode** — host × wordlist Cartesian probe with **recursive** dir bruteforce (incl. **auto-recursion into protected `401`/`403` dirs**), **crawl** (HTML/robots/sitemap link extraction), **content-aware wildcard detection** (static catchall + per-request-nonce catchall + path-echo), a **native, content-confirmed `401`/`403` bypass engine**, and dirsearch-style **live progress bar + findings stream**.
+- **Fuzz mode** — host × wordlist Cartesian probe with **recursive** dir bruteforce (incl. smart auto-recursion into protected `401` dirs and opt-in `403` recursion), **crawl** (HTML/robots/sitemap link extraction), **content-aware wildcard detection** (static catchall + per-request-nonce catchall + path-echo), a **native, content-confirmed `401`/`403` bypass engine**, and dirsearch-style **live progress bar + findings stream**.
 
 Both modes share a 16-slot **BoringSSL** browser-emulation pool. Enrich mode samples the pool per probe; fuzz mode pins one profile per host so wildcard pre-flight and wordlist probes see the same UA-dependent response. Distinct hosts are still distributed across the pool.
 
@@ -132,7 +132,7 @@ This closes the case where a constant-size catchall with a per-request token use
 Use `--recurse N`, `--crawl N`, or `--deep N` to turn the host × wordlist single pass into a multi-round orchestrator:
 
 - **Recursion** — discovered directories (301/302/307/308 with `Location == URL + "/"` parity check; opt-in 200+autoindex via `--recurse-on-200`) get re-fuzzed with the wordlist up to the requested depth.
-- **Auth-dir recursion** *(auto-on)* — a `401`/`403` on a **directory-shaped** path (e.g. `/api`, `/internal` — not `/x.php`) is descended into so accessible children behind a protected parent are found (the classic `/api` = 401 → `/api/actuator` = 200). Omitting `401`/`403` from `--status` hides the parent without disabling discovery. A scoped random-child fingerprint prevents identical nested auth walls from becoming new recursion roots. Bounded by `--max-dirs-per-host`; the legacy `--recurse-on-403` flag (recurse *any* 403) still exists.
+- **Auth-dir recursion** — a `401` on a **directory-shaped** path (e.g. `/api`, not `/x.php`) is descended into so accessible children behind a protected parent are found (the classic `/api` = 401 → `/api/actuator` = 200). Random-sibling and random-child checks reject nested prefix auth walls before they multiply the wordlist. `403` recursion is off by default because WAF path rules produce noisy false directories; use `--recurse-on-403` when exhaustive 403 expansion is intentional. Omitting `401`/`403` from `--status` hides parents without disabling discovery. Bounded by `--max-dirs-per-host`.
 - **Crawl** — response bodies are parsed for HTML `<a/link/script/img/form/iframe>`, robots.txt `Disallow/Allow/Sitemap`, and sitemap.xml `<loc>`. Discovery happens before output status/size filters. A `3xx` stays attached to its requested path while its `Location` is queued as a separate crawl URL, so crawling cannot change wildcard identity.
 
 Both share a visited set and a per-host **directory** budget (`--max-dirs-per-host`, default 200). Each discovered directory costs a full wordlist pass, so that cap plus depth bounds a recursive scan.

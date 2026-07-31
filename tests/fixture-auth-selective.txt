@@ -1,0 +1,6 @@
+/protected/
+/child
+/v1/graphql
+/v1/catalog/nodes
+/admin
+/team/private

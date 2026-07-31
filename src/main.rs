@@ -1808,7 +1808,8 @@ async fn main() -> Result<()> {
             recursion_depth,
             recurse_on_200: args.recurse_on_200,
             recurse_on_403: args.recurse_on_403,
-            // v0.4.5 — auth-dir recursion is auto-on (smart default, no flag).
+            // Auth-dir recursion is auto-on for 401. A 403 remains opt-in via
+            // --recurse-on-403 because path-sensitive WAF denials are noisy.
             recurse_on_auth: true,
             // v0.4.5 — native 401/403 bypass is auto-on unless `--safe`.
             bypass_enabled: !args.safe,

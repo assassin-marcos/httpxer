@@ -300,10 +300,12 @@ pub struct FuzzCfg {
     pub recursion_depth: u8,
     pub recurse_on_200: bool,
     pub recurse_on_403: bool,
-    /// v0.4.5 — auto-recurse into directory-shaped 401/403 dirs (no flag;
-    /// smart default) so accessible children behind a protected parent
-    /// (e.g. /api=401 → /api/actuator=200) aren't missed. The 401/403 itself
-    /// is never emitted; bounded by `max_dirs_per_host`.
+    /// Auto-recurse into directory-shaped 401 dirs so accessible children
+    /// behind a protected parent (e.g. /api=401 → /api/actuator=200) aren't
+    /// missed. Automatic 403 recursion is intentionally excluded because WAF
+    /// path rules commonly return false directory signals; `recurse_on_403`
+    /// is the explicit opt-in. Auth responses need not be emitted for this
+    /// discovery path; expansion is bounded by `max_dirs_per_host`.
     pub recurse_on_auth: bool,
     /// v0.4.5 — native, content-confirmed 401/403 bypass engine (auto-on;
     /// `--safe` sets this false). Bounded per host by `bypass::PER_HOST_PATH_BUDGET`.
@@ -2547,6 +2549,21 @@ fn parent_prefix(url: &str) -> String {
     }
 }
 
+/// Return the immediate parent scope to use for a random-sibling auth probe.
+/// The root of the current fuzz expansion is intentionally not sampled: a
+/// protected root (`/api = 401`) must still expand once so an accessible child
+/// can be found. Nested candidates are different: if `/v1/<random>` and
+/// `/v1/graphql` return the same auth response, `graphql` carries no evidence
+/// that it is a real directory and must not multiply the wordlist.
+fn auth_sibling_scope(scan_scope: &str, candidate_url: &str) -> Option<String> {
+    let parent = parent_prefix(candidate_url);
+    if parent.trim_end_matches('/') == scan_scope.trim_end_matches('/') {
+        None
+    } else {
+        Some(parent)
+    }
+}
+
 pub(crate) fn origin_key(url: &str) -> String {
     let Ok(parsed) = url::Url::parse(url) else {
         return bare_host(url);
@@ -2899,11 +2916,11 @@ async fn run_probe(
             }
 
             // ── Recursion discovery — HOISTED above the emit filter (v0.4.5) ──
-            // Runs regardless of `match_codes`, so directory-shaped 401/403
-            // dirs are descended into WITHOUT being emitted (your "no 401
-            // noise"), and accessible children (e.g. /api/actuator) still
-            // surface. 200/3xx directory detection is unchanged. Bounded by
-            // --max-dirs-per-host in the orchestrator.
+            // Runs regardless of `match_codes`, so directory-shaped 401 dirs
+            // are descended into without needing to be emitted, and accessible
+            // children (e.g. /api/actuator) still surface. Explicit 403 and
+            // normal 200/3xx directory detection follow the same path. Bounded
+            // by --max-dirs-per-host in the orchestrator.
             let next_depth = item.depth.saturating_add(1);
             if cfg.recursion_depth > 0 && next_depth <= cfg.recursion_depth {
                 // v0.6.3 — a 401/403 indistinguishable from what this host
@@ -2940,52 +2957,95 @@ async fn run_probe(
                 )
                 .filter(|_| !auth_noise)
                 {
-                    // v0.6.4 — for 401/403 auth-dir candidates, verify the
-                    // directory is real by probing a random child. If the
-                    // child matches the HOST WILDCARD, this "directory" is a
-                    // one-off 403 for that exact path (e.g. `/aws/credentials`
-                    // returns 403 but `/aws/credentials/{random}` returns the
-                    // normal 200 wildcard). Recursing would multiply the
-                    // wordlist against responses that wildcard detection
-                    // already suppresses. A real protected directory's
-                    // children return something different from the host
-                    // wildcard (404, a distinct 401, etc.).
+                    // Verify nested auth candidates against a random SIBLING
+                    // first. If `/v1/<random>` and `/v1/graphql` have the same
+                    // 401 response, `graphql` is just part of a prefix auth
+                    // wall and expanding it adds a full wordlist with no new
+                    // evidence. The current scan root is never sibling-gated,
+                    // preserving `/api=401 -> /api/actuator=200` discovery.
+                    //
+                    // If the sibling differs, retain the v0.6.4 random-CHILD
+                    // check. A child matching the host wildcard proves a
+                    // one-off protected path rather than a directory.
                     let skip = if matches!(parsed.status, 401 | 403) {
-                        let canary = format!("{}{:08x}", dir_url, fastrand::u32(..));
-                        match dispatch_one(
-                            &canary,
-                            &cfg.request_limiter,
-                            cfg.body_preview_bytes,
-                            &cfg.extra_headers,
-                            cfg.initial_cookie_header.as_deref(),
-                            false,
-                            0,
-                        )
-                        .await
-                        {
-                            Ok((child, _, _)) => {
-                                if matches!(child.status, 401 | 403) {
+                        let candidate_sig = crate::wildcard::AuthCatchall {
+                            status: parsed.status,
+                            content_length: parsed.content_length,
+                            content_type: parsed.content_type.clone(),
+                            snippet_md5: parsed.snippet_md5.clone(),
+                        };
+                        let mut sibling_catchall = false;
+                        if let Some(scope) = auth_sibling_scope(&item.host_input, &url) {
+                            let sibling = format!(
+                                "{}{}",
+                                scope.trim_end_matches('/'),
+                                random_hex_path(8)
+                            );
+                            if let Ok((probe, _, _)) = dispatch_one(
+                                &sibling,
+                                &cfg.request_limiter,
+                                cfg.body_preview_bytes,
+                                &cfg.extra_headers,
+                                cfg.initial_cookie_header.as_deref(),
+                                false,
+                                0,
+                            )
+                            .await
+                            {
+                                sibling_catchall = candidate_sig.matches(
+                                    probe.status,
+                                    probe.content_length,
+                                    &probe.content_type,
+                                    &probe.snippet_md5,
+                                );
+                                if sibling_catchall {
                                     scoped_auth.lock().await.insert(
-                                        &dir_url,
-                                        crate::wildcard::AuthCatchall {
-                                            status: child.status,
-                                            content_length: child.content_length,
-                                            content_type: child.content_type.clone(),
-                                            snippet_md5: child.snippet_md5.clone(),
-                                        },
+                                        &scope,
+                                        candidate_sig.clone(),
                                     );
                                 }
-                                wildcards.matches_url_body(
-                                    &item.host_input,
-                                    &canary,
-                                    child.status,
-                                    child.content_length,
-                                    &child.content_type,
-                                    &child.snippet_md5,
-                                    &child.raw_body,
-                                )
                             }
-                            Err(_) => false,
+                        }
+
+                        if sibling_catchall {
+                            true
+                        } else {
+                            let canary = format!("{}{:08x}", dir_url, fastrand::u32(..));
+                            match dispatch_one(
+                                &canary,
+                                &cfg.request_limiter,
+                                cfg.body_preview_bytes,
+                                &cfg.extra_headers,
+                                cfg.initial_cookie_header.as_deref(),
+                                false,
+                                0,
+                            )
+                            .await
+                            {
+                                Ok((child, _, _)) => {
+                                    if matches!(child.status, 401 | 403) {
+                                        scoped_auth.lock().await.insert(
+                                            &dir_url,
+                                            crate::wildcard::AuthCatchall {
+                                                status: child.status,
+                                                content_length: child.content_length,
+                                                content_type: child.content_type.clone(),
+                                                snippet_md5: child.snippet_md5.clone(),
+                                            },
+                                        );
+                                    }
+                                    wildcards.matches_url_body(
+                                        &item.host_input,
+                                        &canary,
+                                        child.status,
+                                        child.content_length,
+                                        &child.content_type,
+                                        &child.snippet_md5,
+                                        &child.raw_body,
+                                    )
+                                }
+                                Err(_) => false,
+                            }
                         }
                     } else {
                         false
@@ -3624,6 +3684,31 @@ mod tests {
         assert_eq!(
             parent_prefix("https://h.com/a/b?x=1#y"),
             "https://h.com/a"
+        );
+    }
+
+    #[test]
+    fn auth_sibling_scope_only_gates_nested_candidates() {
+        assert_eq!(
+            auth_sibling_scope("https://x.test", "https://x.test/v1/graphql"),
+            Some("https://x.test/v1".into())
+        );
+        assert_eq!(
+            auth_sibling_scope(
+                "https://x.test/base",
+                "https://x.test/base/v1/catalog/nodes"
+            ),
+            Some("https://x.test/base/v1/catalog".into())
+        );
+        assert_eq!(
+            auth_sibling_scope("https://x.test", "https://x.test/api"),
+            None,
+            "a protected root must remain eligible for one expansion"
+        );
+        assert_eq!(
+            auth_sibling_scope("https://x.test/api", "https://x.test/api/child"),
+            None,
+            "the root of a recursive expansion is protected by its scoped auth cache"
         );
     }
 

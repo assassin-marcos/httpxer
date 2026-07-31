@@ -307,15 +307,15 @@ pub fn detect_directory(
     if status == 403 && recurse_on_403 {
         return Some(format!("{}/", req_url.trim_end_matches('/')));
     }
-    // Pattern 4 (v0.4.5): auth-dir auto-recursion. A 401/403 on a
+    // Pattern 4 (v0.4.5): auth-dir auto-recursion. A 401 on a
     // DIRECTORY-SHAPED path (no file extension, e.g. /api, /internal) is a
     // protected directory worth descending into — its children may be
-    // accessible (e.g. /api=401 but /api/actuator=200). Gated to dir-shaped
-    // paths so we don't waste the wordlist recursing a protected *file*
-    // (/admin.php), and bounded by the per-host --max-dirs-per-host budget.
-    // The 401/403 itself is NOT emitted (caller filters by status), so this
-    // adds coverage with no output noise.
-    if recurse_on_auth && matches!(status, 401 | 403) && is_dir_shaped(req_url) {
+    // accessible (e.g. /api=401 but /api/actuator=200). A 403 is deliberately
+    // excluded from the automatic path: gateways and WAFs commonly return
+    // path-sensitive 403s for dictionary-looking names that do not identify a
+    // real directory. Users who need exhaustive 403 recursion can opt in with
+    // --recurse-on-403 (Pattern 3 above).
+    if recurse_on_auth && status == 401 && is_dir_shaped(req_url) {
         return Some(format!("{}/", req_url.trim_end_matches('/')));
     }
     None
@@ -646,8 +646,9 @@ mod tests {
         assert!(detect_directory("https://x.com/secret", 403, "", "", false, true, false).is_some());
     }
 
-    /// v0.4.5 — auth-dir auto-recursion: a 401/403 on a directory-shaped path
-    /// recurses (so /api → /api/actuator is found); a file-shaped path does not.
+    /// Auth-dir auto-recursion follows directory-shaped 401 responses. A 403
+    /// remains opt-in because a path-sensitive WAF denial does not prove that
+    /// the requested directory exists.
     #[test]
     fn detect_directory_auth_dir_shaped() {
         // 401 dir-shaped, auth on → recurse.
@@ -655,8 +656,9 @@ mod tests {
             detect_directory("https://x.com/api", 401, "", "", false, false, true).as_deref(),
             Some("https://x.com/api/")
         );
-        // 403 dir-shaped, auth on → recurse.
-        assert!(detect_directory("https://x.com/internal", 403, "", "", false, false, true).is_some());
+        // 403 stays off under automatic auth recursion and needs opt-in.
+        assert!(detect_directory("https://x.com/internal", 403, "", "", false, false, true).is_none());
+        assert!(detect_directory("https://x.com/internal", 403, "", "", false, true, true).is_some());
         // 401 FILE-shaped (.php) → NOT recursed (no children to find).
         assert!(detect_directory("https://x.com/admin.php", 401, "", "", false, false, true).is_none());
         // auth off → 401 never recurses.

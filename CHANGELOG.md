@@ -2,6 +2,12 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.6.8] — 2026-08-01
+
+### Fixed
+- Automatic auth recursion now follows directory-shaped `401` responses only; path-sensitive `403` responses require the existing explicit opt-in.
+- Nested auth candidates are compared with a random sibling under the same parent, preventing selective prefix auth walls from consuming the directory cap while preserving one expansion of a protected root.
+
 ## [0.6.7] — 2026-07-31
 
 ### Fixed

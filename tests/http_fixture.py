@@ -134,6 +134,27 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 self._send(404, b"not found", "text/plain")
             return
 
+        if mode == "auth_selective":
+            if path == "/protected/child":
+                self._send(200, b"REAL protected child", "text/plain")
+            elif path == "/protected" or path.startswith("/protected/"):
+                self._send(401, b"protected area", "text/plain")
+            elif path == "/team/private/child":
+                self._send(200, b"REAL nested protected child", "text/plain")
+            elif path == "/team/private" or path.startswith("/team/private/"):
+                self._send(401, b"nested protected area", "text/plain")
+            elif path.startswith("/team/"):
+                self._send(404, b"not found", "text/plain")
+            elif path == "/v1":
+                self._send(404, b"not found", "text/plain")
+            elif path.startswith("/v1/"):
+                self._send(401, b"prefix auth wall", "text/plain")
+            elif path == "/admin" or path.startswith("/admin/"):
+                self._send(403, b"path-sensitive gateway block", "text/plain")
+            else:
+                self._send(404, b"not found", "text/plain")
+            return
+
         if mode == "flow":
             if path == "/healthz":
                 self._send(200, b"REAL explicit health endpoint", "text/plain")
@@ -192,7 +213,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--modes",
-        default="mixed,echo,status,auth,flow,backup,cross_a,cross_b,redirect,capture",
+        default="mixed,echo,status,auth,auth_selective,flow,backup,cross_a,cross_b,redirect,capture",
     )
     args = parser.parse_args()
 

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 /// Max distinct 401/403 *paths* a single host may spend bypass attempts on.
-/// Bounds traffic / WAF exposure on auth-heavy hosts (Codex's concern).
+/// Bounds traffic and WAF exposure on auth-heavy hosts.
 pub const PER_HOST_PATH_BUDGET: usize = 40;
 
 static HOST_BUDGET: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
@@ -47,9 +47,9 @@ pub struct Variant {
     pub path: String,
 }
 
-/// Curated, conservative bypass variants for a 401/403 at `path` (≤4 per path,
-/// per Codex). Header-override techniques first (highest signal), then one
-/// path-mutation. The caller dispatches them in order and stops at the first
+/// Curated, conservative bypass variants for a 401/403 at `path` (≤4 per path).
+/// Header-override techniques run first (highest signal), then one path
+/// mutation. The caller dispatches them in order and stops at the first
 /// content-confirmed success.
 pub fn variants(path: &str) -> Vec<Variant> {
     let base = path.trim_end_matches('/');
