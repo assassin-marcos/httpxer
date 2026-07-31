@@ -22,7 +22,7 @@ One tool, two jobs:
 - **Enrich mode** — reads a hostname list, probes each over HTTP(S), emits one NDJSON record per host with DNS / CDN / Wappalyzer tech-detect / HTTP fingerprint. Drop-in for ProjectDiscovery `httpx -json` (use `--httpx-compat` for byte-identical field shape).
 - **Fuzz mode** — host × wordlist Cartesian probe with **recursive** dir bruteforce (incl. **auto-recursion into protected `401`/`403` dirs**), **crawl** (HTML/robots/sitemap link extraction), **content-aware wildcard detection** (static catchall + per-request-nonce catchall + path-echo), a **native, content-confirmed `401`/`403` bypass engine**, and dirsearch-style **live progress bar + findings stream**.
 
-Both modes share a 16-slot **BoringSSL** pool that rotates real-browser JA3/JA4/HTTP-2 fingerprints per probe — defeats static WAF rule-blocks (Cloudflare, Akamai, Imperva, AWS, Datadome).
+Both modes share a 16-slot **BoringSSL** browser-emulation pool. Enrich mode samples the pool per probe; fuzz mode pins one profile per host so wildcard pre-flight and wordlist probes see the same UA-dependent response. Distinct hosts are still distributed across the pool.
 
 ## Install
 
@@ -115,9 +115,9 @@ httpxer -u https://example.com/ \
 
 Most directory bruteforcers drown in false positives on CDN-fronted / SPA / soft-404 targets. httpxer's detector is multi-sample + multi-layer. Pre-flight probes a mix of **random-hex paths + realistic decoys** (`.conf`, `.config`, `.env`, `/.git/HEAD`) **concurrently**, so detection sees the same catchall your wordlist will hit:
 
-- **Layer 1 — static catchall**: samples agree on `(content_type, content_length, snippet_md5)` → identical-page wildcard fingerprint. Matching probes are suppressed.
-- **Layer 1b — content-aware catchall**: the catchall returns a **near-constant-size body that varies per request** (a request-id / nonce / timestamp in the first bytes). This defeats Layer 1 (md5 differs every time) *and* Layer 2 (size doesn't scale with path). httpxer fingerprints it by the **normalized body** — UUIDs, long hex/digit runs and timestamps are blanked before hashing — and at runtime matches by that **normalized-content hash, never by size alone**. A real page that happens to be the same size as the catchall but has *different content* is therefore **never dropped**. Guards: bounded content-length spread + a raw-body token-similarity backstop, so the normalizer can't fuse two genuinely different pages.
-- **Layer 2 — path-echo / dynamic-CL**: when bodies differ but `content_length = k × path_length + base` fits linearly (server reflects the path in the body), the slope `k` predicts the wildcard CL for any new probe path.
+- **Layer 1 — static catchall**: at least two same-status samples agree on `(content_type, content_length, snippet_md5)` within the configured length tolerance. Separate status and extension-family signatures are retained instead of overwriting one another.
+- **Layer 1b — content-aware catchall**: the catchall body varies per request (for example, a request ID or timestamp). UUIDs, long hex/digit runs and timestamps are normalized before hashing. Bounded drift uses normalized-content and token-similarity guards; wide length drift additionally requires the normalized first 2 KiB to agree exactly. Matching is content-aware, never size-only.
+- **Layer 2 — path-echo / dynamic-CL**: with at least three samples, `content_length = k × path_length + base` must fit within residual bounds. The slope `k` then predicts the wildcard length for each probe path.
 - **Bodyless catchall**: the host answers **`2xx` with zero bytes** for *every* path. There is no body to fingerprint, so every layer above is blind to it by construction. `200` + no body across **3 distinct paths** is itself the signature — httpxer learns it per `(host, status, content_type)` and suppresses from then on. A *lone* legitimate empty `200` (a `/ping`-style endpoint) stays below the threshold and is still emitted.
 
 This closes the case where a constant-size catchall with a per-request token used to emit *every* wordlist hit as a fake `200`. The host fingerprint also applies under **recursed directories** (so catchall noise doesn't reappear one level down).
@@ -166,13 +166,13 @@ Everything is decided at runtime:
 
 **Zero-false-positive gate.** Naive backup scanning drowns in soft-404s — sites that answer `200 OK` with an HTML "not found" page for any filename. Every candidate must clear all of:
 
-- Status `200`/`206` only (`401`/`403` are surfaced as REVIEW, never CONFIRMED; a `302` to a login page is not a finding — redirects aren't followed)
+- Status `200`/`206` only. Other statuses are not emitted by backup discovery, and redirects are not followed.
 - Soft-404 baseline calibrated from 3 impossible filenames per host; ≥0.95 body similarity is discarded
 - Content-Type sanity — `text/html` on a `.zip`/`.sql`/`.db` is discarded unless the bytes say otherwise
 - **Magic bytes** — ZIP `50 4B 03 04`, GZIP `1F 8B`, BZIP2, XZ, 7Z, RAR, TAR `ustar`@257, `SQLite format 3`, MS Access — or a plaintext SQL-dump marker
 - Edge-security interstitials (challenge/blocked pages) filtered out
 
-Only `status OK + size OK + (magic OR SQL text) + baseline-dissimilar` reaches **CONFIRMED**. Everything else lands in a **REVIEW** bucket instead of your findings.
+Only `status OK + size OK + (magic OR SQL text) + baseline-dissimilar` reaches **CONFIRMED**. A remaining plausible `200`/`206` can be marked **REVIEW**; hard gate failures are discarded.
 
 **Bandwidth-safe.** `HEAD` first; only a promising result earns a ranged `GET` for the first 1024 bytes. The archive itself is never downloaded — a 4 GB `backup.tar.gz` costs ~1 KB to confirm.
 
@@ -185,11 +185,11 @@ When a probe hits `401`/`403`, httpxer automatically retries it with a small, co
 - **Header overrides** — `X-Original-URL`, `X-Rewrite-URL`, `X-Forwarded-For: 127.0.0.1`
 - **Path mutations** — e.g. `…/..;/`
 
-A bypass is reported **only when confirmed**: the retry returns `2xx`/`3xx`, its (normalized) content **differs** from the original block page, **and** it doesn't match the host catchall — so there are no fake-`200`s. Confirmed hits are emitted with a `bypass:"<technique>"` tag and a visible `[bypass] /admin 403→200 via X-Original-URL` line. Traffic is bounded by a per-host budget; it only ever *adds* findings, never suppresses. Pass **`--safe`** to disable it entirely (for programs/targets where bypass attempts are out of scope).
+A bypass is reported **only when confirmed**: the retry returns a `2xx` with a non-empty body, its normalized content **differs** from the original block page, and it doesn't match the host catchall. Redirects and empty bodies are not accepted as proof of access. Confirmed hits are emitted with a `bypass:"<technique>"` tag and a visible `[bypass] /admin 403→200 via X-Original-URL` line. Traffic is bounded by a per-host budget; it only ever *adds* findings, never suppresses. Pass **`--safe`** to disable it entirely (for programs/targets where bypass attempts are out of scope).
 
 ## TLS impersonation
 
-Browser-grade fingerprint rotation via [`wreq`](https://github.com/penumbra-x/rquest) (BoringSSL — Chrome's TLS stack). 16 profiles in the pool:
+Browser-grade fingerprint emulation via [`wreq`](https://github.com/penumbra-x/rquest) and BoringSSL. There are 16 profiles in the pool:
 
 | Family | Versions |
 |---|---|
@@ -200,13 +200,13 @@ Browser-grade fingerprint rotation via [`wreq`](https://github.com/penumbra-x/rq
 | Mobile Safari (iOS) | 17.4.1, 18.1.1 |
 | Mobile Firefox (Android) | 135 |
 
-Each profile sends the exact cipher-suite ordering, TLS extensions, signature algorithms, ALPN, HTTP/2 SETTINGS frame, and matching headers (`sec-ch-ua`, `sec-fetch-*`, `Accept-Encoding: gzip, deflate, br, zstd`) of that browser version.
+Each `wreq` profile configures browser-specific TLS and HTTP/2 behavior plus matching request headers. Fuzz mode deliberately keeps one profile stable per host so pre-flight fingerprints remain comparable with later probes.
 
 Verify against a TLS-echo service:
 ```bash
-printf 'https://tls.peet.ws/api/all?n=%s\n' 1 2 3 4 5 > urls.txt
-httpxer -l urls.txt -o out.jsonl --with-body --no-tech -t 5
-# Inspect 5+ unique JA4s in out.jsonl — all real-browser families
+printf 'https://tls.peet.ws/api/all?n=%s\n' {1..64} > urls.txt
+httpxer -l urls.txt -o out.jsonl --with-body --no-tech -t 8
+# Enrich mode samples profiles randomly; inspect the observed JA4 distribution.
 ```
 
 ## Output
@@ -237,7 +237,7 @@ httpxer ... -H "Authorization: Bearer eyJ..." -H "X-Tenant-Id: 42"
 # Bearer token
 httpxer ... --bearer eyJhbGciOiJIUzI1NiJ9.xyz
 
-# Cookie jar (initial seed; Set-Cookie auto-persists)
+# Static Cookie header seed (Set-Cookie responses are not persisted)
 httpxer ... --cookie "sid=abc123" --cookie "csrf=token"
 ```
 
@@ -265,7 +265,7 @@ httpxer ... --cookie "sid=abc123" --cookie "csrf=token"
 | `--recurse-on-200` / `--recurse-on-403` | off | Treat these statuses as directories too |
 | `-H "K: V"` | — | Custom header (repeatable) |
 | `--bearer <TOK>` | — | `Authorization: Bearer TOK` |
-| `--cookie "K=V"` | — | Cookie (repeatable; jar persists) |
+| `--cookie "K=V"` | — | Static Cookie header value (repeatable) |
 | `--fuzz-follow-redirects` | off (auto-on with `--crawl`) | Follow redirects in fuzz mode |
 | `--no-backup-fuzz` | backup discovery on | Disable host-derived backup discovery |
 | `--backup-dry-run` | off | Print backup candidates, send no requests |
@@ -285,7 +285,7 @@ Full reference: `httpxer --help`.
 - **IP reputation** — rotate egress IPs at a higher layer (proxies / residential pool)
 - **JS endpoint extraction** — crawl parses HTML/robots/sitemap; endpoints embedded inside JavaScript bodies aren't parsed (planned)
 
-Static-signature defenses (JA4 rule-blocks, header-pattern rules, UA blocklists) are defeated. Behavioral defenses still apply.
+Browser emulation can reduce simple static-signature blocks, but it is not a bypass guarantee. Behavioral defenses still apply.
 
 ## Build from source
 

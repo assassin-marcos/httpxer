@@ -1,10 +1,9 @@
 //! Async HTTP(S) probing with TLS impersonation (JA3/JA4 + HTTP/2 SETTINGS
 //! fingerprint matching real Chrome / Firefox / Safari / Edge versions).
 //!
-//! Per probe we pick a random preconfigured client from a rotating pool, so
-//! a scan from one IP presents dozens of different real-browser fingerprints
-//! to a WAF — no static signature for Cloudflare / Akamai / Imperva /
-//! Datadome / PerimeterX to rule-block on.
+//! Enrich mode samples a preconfigured browser client per probe. Fuzz mode
+//! selects one deterministic profile per host so wildcard pre-flight and
+//! wordlist responses remain comparable on UA-dependent applications.
 //!
 //! Why wreq + BoringSSL instead of reqwest + native-tls/rustls:
 //! reqwest's TLS ClientHello is fixed and visibly non-Chrome (cipher suite
@@ -24,6 +23,9 @@
 //!    rotate egress IPs at a higher layer if they hit those.
 
 use once_cell::sync::OnceCell;
+use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Once;
 use std::time::{Duration, Instant};
 use wreq::Client;
 use wreq_util::Emulation;
@@ -119,27 +121,41 @@ pub fn extract_title(html: &str) -> Option<String> {
 
 /// Resolve a Location header value relative to the URL it came from.
 pub fn resolve_redirect_url(base: &str, loc: &str) -> String {
-    if loc.starts_with("http://") || loc.starts_with("https://") {
-        return loc.to_string();
-    }
-    let scheme_end = match base.find("://") {
-        Some(i) => i + 3,
-        None => return loc.to_string(),
+    url::Url::parse(base)
+        .and_then(|url| url.join(loc))
+        .map(Into::into)
+        .unwrap_or_else(|_| loc.to_string())
+}
+
+fn same_origin(left: &str, right: &str) -> bool {
+    let (Ok(left), Ok(right)) = (url::Url::parse(left), url::Url::parse(right)) else {
+        return false;
     };
-    let host_end = base[scheme_end..]
-        .find('/')
-        .map(|i| scheme_end + i)
-        .unwrap_or(base.len());
-    let origin = &base[..host_end];
-    if loc.starts_with('/') {
-        format!("{}{}", origin, loc)
-    } else {
-        let last_slash = base
-            .rfind('/')
-            .filter(|&i| i >= scheme_end + 2)
-            .unwrap_or(host_end);
-        format!("{}/{}", &base[..last_slash], loc)
+    left.scheme() == right.scheme()
+        && left.host_str().map(str::to_ascii_lowercase)
+            == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+/// Consume at most `cap` decoded response bytes. Stopping early drops the
+/// response body so a server that ignores Range cannot force an entire archive
+/// or an unbounded stream into memory.
+pub async fn read_body_capped(mut response: wreq::Response, cap: usize) -> Result<Vec<u8>, String> {
+    let mut body = Vec::with_capacity(cap.min(16 * 1024));
+    while body.len() < cap {
+        let chunk = response.chunk().await.map_err(|e| e.to_string())?;
+        let Some(chunk) = chunk else { break };
+        if append_capped(&mut body, &chunk, cap) {
+            break;
+        }
     }
+    Ok(body)
+}
+
+fn append_capped(body: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
+    let remaining = cap.saturating_sub(body.len());
+    body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    chunk.len() >= remaining
 }
 
 /// One slot in the impersonation pool. Each slot is a fully-built client
@@ -161,6 +177,11 @@ pub struct PoolSlot {
 }
 
 static POOL: OnceCell<Vec<PoolSlot>> = OnceCell::new();
+static WREQ_POOL_HOOK: Once = Once::new();
+static WREQ_POOL_RETRIES: AtomicUsize = AtomicUsize::new(0);
+static WREQ_POOL_FAILURES: AtomicUsize = AtomicUsize::new(0);
+const WREQ_POOL_ASSERTION: &str =
+    "assertion failed: Pin::new(&mut rx).poll(cx).is_pending()";
 
 /// v0.5.0 — user auth for the ENRICH probe path (`-H`, `--bearer`, `--cookie`).
 ///
@@ -174,6 +195,72 @@ static POOL: OnceCell<Vec<PoolSlot>> = OnceCell::new();
 /// adds no new parameters to three public signatures and their call sites.
 /// Set once at startup via `init_auth`; empty when no auth flags were given.
 static AUTH: OnceCell<(Vec<(String, String)>, Option<String>)> = OnceCell::new();
+
+fn is_wreq_pool_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    payload
+        .downcast_ref::<&str>()
+        .is_some_and(|message| message.contains(WREQ_POOL_ASSERTION))
+        || payload
+            .downcast_ref::<String>()
+            .is_some_and(|message| message.contains(WREQ_POOL_ASSERTION))
+}
+
+fn install_wreq_pool_panic_hook() {
+    WREQ_POOL_HOOK.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let exact_pool_assertion = info
+                .location()
+                .is_some_and(|location| {
+                    location.file().contains("wreq-")
+                        && location.file().ends_with("/src/util/client/pool.rs")
+                })
+                && is_wreq_pool_panic(info.payload());
+            if !exact_pool_assertion {
+                default_hook(info);
+            }
+        }));
+    });
+}
+
+/// Retry only the known wreq 5.3 checkout race. Any unrelated panic resumes
+/// unwinding so application defects remain visible.
+pub async fn retry_wreq_pool_once<F, Fut, T>(mut operation: F) -> Result<T, ()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = T>,
+{
+    use futures::FutureExt as _;
+
+    match std::panic::AssertUnwindSafe(operation())
+        .catch_unwind()
+        .await
+    {
+        Ok(output) => Ok(output),
+        Err(payload) if is_wreq_pool_panic(payload.as_ref()) => {
+            WREQ_POOL_RETRIES.fetch_add(1, Ordering::Relaxed);
+            match std::panic::AssertUnwindSafe(operation())
+                .catch_unwind()
+                .await
+            {
+                Ok(output) => Ok(output),
+                Err(payload) if is_wreq_pool_panic(payload.as_ref()) => {
+                    WREQ_POOL_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    Err(())
+                }
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+pub fn wreq_pool_panic_stats() -> (usize, usize) {
+    (
+        WREQ_POOL_RETRIES.load(Ordering::Relaxed),
+        WREQ_POOL_FAILURES.load(Ordering::Relaxed),
+    )
+}
 
 /// Install the user's auth headers + initial cookie for enrich-mode probes.
 /// Idempotent — a second call is ignored (matches `init_pool` semantics).
@@ -200,6 +287,7 @@ pub fn init_pool(
     no_impersonate: bool,
     proxy_url: Option<&str>,
 ) -> anyhow::Result<()> {
+    install_wreq_pool_panic_hook();
     // Pre-validate the proxy URL once, outside the OnceCell init closure,
     // so we can surface the error to the caller as a normal Result rather
     // than panicking inside `get_or_init`. The closure then clones the
@@ -376,15 +464,17 @@ pub async fn http_probe_once(
                 "Accept",
                 "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             );
-        // v0.5.0 — attach user auth (`-H` / `--bearer` / `--cookie`). Applied on
-        // EVERY hop so a redirect chain keeps carrying credentials, matching the
-        // fuzz path (`dispatch_one`). Absent when no auth flags were passed.
-        if let Some((extra, cookie)) = AUTH.get() {
+        // User-supplied headers and cookies are scoped to the original origin.
+        // Replaying them after a cross-origin redirect would disclose bearer
+        // tokens, API keys or session cookies to the redirect destination.
+        if same_origin(url, &current) {
+            if let Some((extra, cookie)) = AUTH.get() {
             for (n, v) in extra {
                 req = req.header(n.as_str(), v.as_str());
             }
             if let Some(c) = cookie {
                 req = req.header("Cookie", c.as_str());
+            }
             }
         }
         let resp = match req.send().await {
@@ -551,11 +641,11 @@ pub async fn http_probe_with_retry(
     follow: bool,
     max_redirects: usize,
 ) -> Option<HttpProbeResult> {
-    if let Some(r) = http_probe_once(url, follow, max_redirects).await {
+    if let Ok(Some(r)) = retry_wreq_pool_once(|| http_probe_once(url, follow, max_redirects)).await {
         return Some(r);
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
-    if let Some(r) = http_probe_once(url, follow, max_redirects).await {
+    if let Ok(Some(r)) = retry_wreq_pool_once(|| http_probe_once(url, follow, max_redirects)).await {
         return Some(r);
     }
     // Scheme flip is useful on non-standard ports only — :80 / :443 rarely
@@ -578,7 +668,9 @@ pub async fn http_probe_with_retry(
     } else {
         return None;
     };
-    http_probe_once(&alt, follow, max_redirects).await
+    retry_wreq_pool_once(|| http_probe_once(&alt, follow, max_redirects))
+        .await
+        .unwrap_or(None)
 }
 
 #[cfg(test)]
@@ -608,6 +700,56 @@ mod tests {
             "https://a.com/x/z"
         );
         assert_eq!(resolve_redirect_url("https://a.com", "z"), "https://a.com/z");
+    }
+
+    #[test]
+    fn resolve_redirect_url_handles_rfc3986_forms() {
+        assert_eq!(
+            resolve_redirect_url("https://a.com/x/y", "?q=1"),
+            "https://a.com/x/y?q=1"
+        );
+        assert_eq!(
+            resolve_redirect_url("https://a.com/x/y", "//b.com/z"),
+            "https://b.com/z"
+        );
+        assert_eq!(
+            resolve_redirect_url("https://a.com/x/y", "../z"),
+            "https://a.com/z"
+        );
+    }
+
+    #[test]
+    fn redirect_credentials_require_same_origin() {
+        assert!(same_origin("https://a.com/x", "https://a.com/y"));
+        assert!(same_origin("https://a.com/x", "https://a.com:443/y"));
+        assert!(!same_origin("https://a.com/x", "http://a.com/y"));
+        assert!(!same_origin("https://a.com/x", "https://a.com:8443/y"));
+        assert!(!same_origin("https://a.com/x", "https://b.com/y"));
+    }
+
+    #[test]
+    fn capped_append_never_exceeds_limit() {
+        let mut body = vec![1, 2];
+        assert!(append_capped(&mut body, &[3, 4, 5, 6], 4));
+        assert_eq!(body, vec![1, 2, 3, 4]);
+        assert!(append_capped(&mut body, &[7], 4));
+        assert_eq!(body.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn known_wreq_pool_assertion_is_retried_once() {
+        let attempts = AtomicUsize::new(0);
+        let result = retry_wreq_pool_once(|| async {
+            if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                panic!("{}", WREQ_POOL_ASSERTION);
+            }
+            7usize
+        })
+        .await;
+
+        assert_eq!(result, Ok(7));
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert!(!is_wreq_pool_panic(&"different panic"));
     }
 
     #[test]

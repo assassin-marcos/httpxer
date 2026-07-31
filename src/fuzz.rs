@@ -59,7 +59,36 @@ const PROBER_TAG: &str = concat!("httpxer/", env!("CARGO_PKG_VERSION"));
 /// One-shot guard for the JSONL writer error log — we surface the first
 /// `writeln!` failure to stderr so a disk-full scenario doesn't silently
 /// eat records, but stay quiet thereafter so the log isn't drowned.
-static WRITE_ERR_LOGGED: AtomicBool = AtomicBool::new(false);
+struct OutputSink {
+    file: Mutex<std::fs::File>,
+    emitted_urls: Mutex<HashSet<String>>,
+    failed: AtomicBool,
+    error: std::sync::Mutex<Option<String>>,
+}
+
+impl OutputSink {
+    fn new(file: std::fs::File, emitted_urls: HashSet<String>) -> Self {
+        Self {
+            file: Mutex::new(file),
+            emitted_urls: Mutex::new(emitted_urls),
+            failed: AtomicBool::new(false),
+            error: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn fail(&self, message: String) {
+        if !self.failed.swap(true, Ordering::AcqRel) {
+            if let Ok(mut error) = self.error.lock() {
+                *error = Some(message.clone());
+            }
+            eprintln!("[!] fuzz: output failure: {}", message);
+        }
+    }
+
+    fn failure(&self) -> Option<String> {
+        self.error.lock().ok().and_then(|error| error.clone())
+    }
+}
 
 /// JSONL record emitted by fuzz mode. Field names + order match
 /// retroh4ck-prober v0.1.0 output so existing downstream parsers continue
@@ -266,7 +295,9 @@ pub struct FuzzCfg {
     pub via_proxy: bool, // true iff --proxy was set
     pub threads: usize,
     pub timeout_ms: u64,
-    pub rate_limit_rps: f64,
+    /// Shared request gate for every fuzz-phase HTTP request, including
+    /// backup discovery, pre-flight, retries, siblings, canaries and bypasses.
+    pub request_limiter: Arc<ratelimit::HostRateLimiter>,
     // ── Recursion (v0.3.7) ─────────────────────────────────────────────
     /// Max recursion depth. 0 = off (backwards compatible with v0.3.6).
     pub recursion_depth: u8,
@@ -295,6 +326,8 @@ pub struct FuzzCfg {
     /// Exact content-lengths to drop from output (v0.3.10 — dirsearch
     /// `--exclude-sizes` parity). Empty = no size filter.
     pub exclude_sizes: Vec<i64>,
+    /// Root sizes learned by `--exclude-root-size`, scoped by canonical origin.
+    pub exclude_sizes_by_origin: std::collections::HashMap<String, Vec<i64>>,
     // ── Misc behavior (v0.3.7) ─────────────────────────────────────────
     /// Follow redirects within fuzz probes (default off — 3xx is a finding).
     /// Auto-on when crawl_enabled (crawl needs terminal URL + body), unless
@@ -415,6 +448,36 @@ pub fn read_words(path_spec: &str) -> Result<Vec<String>> {
         );
     }
     Ok(out)
+}
+
+fn read_existing_fuzz_urls(path: &str, format: OutputFormat) -> HashSet<String> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        _ => return HashSet::new(),
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return HashSet::new();
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| match format {
+            OutputFormat::Json => serde_json::from_str::<serde_json::Value>(&line)
+                .ok()
+                .and_then(|value| value.get("url")?.as_str().map(ToString::to_string)),
+            OutputFormat::Plain => line.split_whitespace().next_back().map(ToString::to_string),
+        })
+        .filter(|url| url::Url::parse(url).is_ok())
+        .map(|url| output_url_key(&url))
+        .collect()
+}
+
+fn output_url_key(raw: &str) -> String {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return raw.to_string();
+    };
+    url.set_fragment(None);
+    url.to_string()
 }
 
 /// `"foo"` → `"/foo"`, `"//foo"` → `"/foo"`, `""` → `""`. Trims whitespace.
@@ -690,6 +753,8 @@ fn short_err(s: &str) -> String {
 /// Parsed (and shaped) response — the intermediate form between the wire
 /// response and the JSONL record.
 struct ParsedResp {
+    /// URL that produced this response after any manually followed redirects.
+    effective_url: String,
     status: u16,
     content_length: i64,
     content_type: String,
@@ -715,7 +780,7 @@ struct ParsedResp {
 /// via `Quota::with_period`. The previous integer-rounded path silently
 /// promoted any 0 < rps < 0.5 to disabled and 0.5 ≤ rps < 1.5 to exactly
 /// 1 rps, which surprised users with sub-1 limits.
-mod ratelimit {
+pub(crate) mod ratelimit {
     use governor::{
         clock::DefaultClock,
         state::{InMemoryState, NotKeyed},
@@ -740,7 +805,9 @@ mod ratelimit {
                 None
             } else if rps_f64 >= 1.0 {
                 let n = rps_f64.round().min(100_000.0) as u32;
-                NonZeroU32::new(n).map(Quota::per_second)
+                NonZeroU32::new(n).map(|n| {
+                    Quota::per_second(n).allow_burst(NonZeroU32::new(1).unwrap())
+                })
             } else {
                 // Fractional rps — one token every (1/rps) seconds. Cap the
                 // period at 1 h so 0.0001-style inputs don't construct a
@@ -754,6 +821,7 @@ mod ratelimit {
             }
         }
 
+        #[cfg(test)]
         pub fn enabled(&self) -> bool {
             self.quota.is_some()
         }
@@ -780,49 +848,26 @@ mod ratelimit {
 /// Returns the parsed response on success, or an error string otherwise.
 /// Reads at most `BODY_READ_CAP` bytes of body — beyond that we drop the
 /// connection.
-async fn dispatch_one(
+async fn dispatch_once(
     url: &str,
-    host_key: &str,
+    limiter: &ratelimit::HostRateLimiter,
     body_preview_bytes: usize,
     extra_headers: &[(String, String)],
     initial_cookie_header: Option<&str>,
-    follow_redirects: bool,
-    max_redirects: usize,
+    attach_user_headers: bool,
 ) -> Result<(ParsedResp, &'static str, String), String> {
+    let request_host = bare_host(url);
+    limiter.acquire(&request_host).await;
     // Pin one TLS profile per host so the wildcard fingerprint computed at
     // pre-flight (snippet_md5 etc.) matches what the actual fuzz probes
     // against the same host see — random per-request rotation made the
     // signatures diverge on UA-varying servers.
-    let slot = probe::pick_pool_slot_for(host_key)
+    let slot = probe::pick_pool_slot_for(&request_host)
         .ok_or_else(|| "probe pool not initialised".to_string())?;
-    // Redirect policy: per-request override. Crawl mode wants the terminal
-    // body (so we can parse links from the final landing page); fuzz mode
-    // default keeps 3xx as a finding.
-    // Hop budget comes from the caller (`--max-redirects`). A 0 budget maps to
-    // "don't follow" so the 3xx stays a finding instead of surfacing as a
-    // TooManyRedirects error.
-    //
-    // `+ 1` is NOT a fudge factor. wreq's `Policy::limited(max)` compares
-    // against `attempt.previous.len()`, and `previous` already contains the
-    // ORIGINAL request URL when the first 3xx is evaluated
-    // (wreq-5.3.0/src/redirect.rs:136 — `if attempt.previous.len() >= max`),
-    // so `limited(n)` chases only `n - 1` hops. Verified against a local
-    // 2-hop chain (`/r1`→`/r2`→`/r3`): `limited(1)` errored on the FIRST
-    // redirect, `limited(2)` on the second, `limited(3)` was the first value
-    // that reached `/r3`. `--max-redirects` is documented (and implemented in
-    // `probe::http_probe_once`) as a count of redirect HOPS, so hops → limit
-    // is `hops + 1`. Without this, `--max-redirects 1 --crawl` turned every
-    // single 3xx into a "too many redirects" error record, which the default
-    // (no `--include-errors`) then dropped — silently losing findings.
-    let redirect_policy = if follow_redirects && max_redirects > 0 {
-        Policy::limited(max_redirects.saturating_add(1))
-    } else {
-        Policy::none()
-    };
     let mut req = slot
         .client
         .get(url)
-        .redirect(redirect_policy)
+        .redirect(Policy::none())
         .header("Accept-Language", slot.accept_lang)
         .header(
             "Accept",
@@ -830,17 +875,19 @@ async fn dispatch_one(
         );
     // Auth headers — user-supplied via -H / --bearer. Validated at CLI
     // parse so the per-request attach is safe.
-    for (n, v) in extra_headers {
-        req = req.header(n.as_str(), v.as_str());
-    }
+    if attach_user_headers {
+        for (n, v) in extra_headers {
+            req = req.header(n.as_str(), v.as_str());
+        }
     // User-supplied cookies via --cookie, attached as a fixed header. This is
     // the WHOLE cookie story: the pool clients are built without
     // `.cookie_store(true)`, so response Set-Cookie is never captured and the
     // same static value goes out on every probe. (An earlier comment here
     // promised jar wiring "in v0.3.8"; it was never implemented, and the
     // stale promise was reading as if session persistence already worked.)
-    if let Some(c) = initial_cookie_header {
-        req = req.header("Cookie", c);
+        if let Some(c) = initial_cookie_header {
+            req = req.header("Cookie", c);
+        }
     }
     let resp = req.send().await.map_err(|e| short_err(&e.to_string()))?;
 
@@ -877,19 +924,9 @@ async fn dispatch_one(
     }
 
     // Body — streamed, capped at BODY_READ_CAP.
-    let mut body_bytes: Vec<u8> = Vec::with_capacity(16 * 1024);
-    let mut resp_mut = resp;
-    while let Ok(Some(chunk)) = resp_mut.chunk().await {
-        let remaining = BODY_READ_CAP.saturating_sub(body_bytes.len());
-        if remaining == 0 {
-            break;
-        }
-        if chunk.len() > remaining {
-            body_bytes.extend_from_slice(&chunk[..remaining]);
-            break;
-        }
-        body_bytes.extend_from_slice(&chunk);
-    }
+    let body_bytes = probe::read_body_capped(resp, BODY_READ_CAP)
+        .await
+        .map_err(|e| short_err(&e))?;
     let body_len = body_bytes.len();
     let content_length: i64 = header_cl.unwrap_or(body_len as i64);
 
@@ -915,6 +952,7 @@ async fn dispatch_one(
     let ua = ua_string(slot.tag);
     Ok((
         ParsedResp {
+            effective_url: url.to_string(),
             status,
             content_length,
             content_type,
@@ -931,6 +969,87 @@ async fn dispatch_one(
     ))
 }
 
+fn same_origin_url(left: &str, right: &str) -> bool {
+    let (Ok(left), Ok(right)) = (url::Url::parse(left), url::Url::parse(right)) else {
+        return false;
+    };
+    left.scheme() == right.scheme()
+        && left.host_str().map(str::to_ascii_lowercase)
+            == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn should_follow_redirect(
+    status: u16,
+    location: &str,
+    follow_redirects: bool,
+    max_redirects: usize,
+) -> bool {
+    follow_redirects
+        && max_redirects > 0
+        && matches!(status, 301 | 302 | 303 | 307 | 308)
+        && !location.is_empty()
+}
+
+/// Issue a GET and optionally follow redirects one hop at a time. Keeping the
+/// loop here ensures every hop passes through the request limiter and user
+/// credentials are only attached while the chain remains on the start origin.
+async fn dispatch_one(
+    url: &str,
+    limiter: &ratelimit::HostRateLimiter,
+    body_preview_bytes: usize,
+    extra_headers: &[(String, String)],
+    initial_cookie_header: Option<&str>,
+    follow_redirects: bool,
+    max_redirects: usize,
+) -> Result<(ParsedResp, &'static str, String), String> {
+    let mut current = url.to_string();
+    let mut followed = 0usize;
+    loop {
+        let result = dispatch_once(
+            &current,
+            limiter,
+            body_preview_bytes,
+            extra_headers,
+            initial_cookie_header,
+            same_origin_url(url, &current),
+        )
+        .await?;
+        if !should_follow_redirect(
+            result.0.status,
+            &result.0.location,
+            follow_redirects,
+            max_redirects,
+        ) {
+            return Ok(result);
+        }
+        if followed >= max_redirects {
+            return Err(format!("too many redirects (limit {})", max_redirects));
+        }
+        let next = probe::resolve_redirect_url(&current, &result.0.location);
+        let supported = url::Url::parse(&next)
+            .map(|url| matches!(url.scheme(), "http" | "https"))
+            .unwrap_or(false);
+        if !supported {
+            return Ok(result);
+        }
+        current = next;
+        followed += 1;
+    }
+}
+
+fn content_length_excluded(
+    global_sizes: &[i64],
+    sizes_by_origin: &std::collections::HashMap<String, Vec<i64>>,
+    url: &str,
+    content_length: i64,
+) -> bool {
+    global_sizes.contains(&content_length)
+        || sizes_by_origin
+            .get(&origin_key(url))
+            .is_some_and(|sizes| sizes.contains(&content_length))
+}
+
 /// Run ONE wildcard pre-flight probe with a random hex path of the given
 /// length. Returns a `ProbeSample` for the v0.3.9 layered detector, or
 /// `None` when the probe didn't yield a usable body (status outside
@@ -944,26 +1063,61 @@ async fn dispatch_one(
 /// fires on dictionary-looking filenames (`.conf`/`.config`/`.git`), so probing
 /// only random hex can under-sample its behavior. These random-prefixed
 /// (non-existent) decoys make detection see the same catchall the wordlist hits.
-fn decoy_preflight_paths() -> Vec<String> {
-    let r = || {
-        let mut s = String::with_capacity(8);
-        for _ in 0..8 {
-            let n = fastrand::u8(0..16);
-            s.push(if n < 10 {
-                (b'0' + n) as char
-            } else {
-                (b'a' + (n - 10)) as char
-            });
+#[derive(Debug, Clone)]
+struct PreflightPath {
+    family: &'static str,
+    path: String,
+}
+
+type PreflightSampleGroups = std::collections::HashMap<
+    (String, u16, String),
+    Vec<crate::wildcard::ProbeSample>,
+>;
+
+fn detect_preflight_groups(
+    groups: PreflightSampleGroups,
+    tolerance: i64,
+) -> (usize, Vec<(String, usize, crate::wildcard::WildcardSig)>) {
+    let mut eligible = 0usize;
+    let mut detected = Vec::new();
+    for ((family, _, _), samples) in groups {
+        if samples.len() < 2 {
+            continue;
         }
-        s
-    };
-    vec![
-        format!("/{}.conf", r()),
-        format!("/{}.config", r()),
-        format!("/{}.log", r()),
-        format!("/{}.env", r()),
-        format!("/{}/.git/HEAD", r()),
-    ]
+        eligible += 1;
+        if let Some(signature) = wildcard::detect(&samples, tolerance) {
+            detected.push((family, samples.len(), signature));
+        }
+    }
+    (eligible, detected)
+}
+
+fn decoy_preflight_paths() -> Vec<PreflightPath> {
+    let mut out = Vec::with_capacity(10);
+    for i in 0..2 {
+        let prefix = random_hex_path(8 + i * 5);
+        out.push(PreflightPath {
+            family: "conf",
+            path: format!("{}.conf", prefix),
+        });
+        out.push(PreflightPath {
+            family: "config",
+            path: format!("{}.config", prefix),
+        });
+        out.push(PreflightPath {
+            family: "log",
+            path: format!("{}.log", prefix),
+        });
+        out.push(PreflightPath {
+            family: "env",
+            path: format!("{}.env", prefix),
+        });
+        out.push(PreflightPath {
+            family: "git-head",
+            path: format!("{}/.git/HEAD", prefix),
+        });
+    }
+    out
 }
 
 /// Run ONE wildcard pre-flight probe against an explicit `path`. Returns a
@@ -983,6 +1137,7 @@ enum PreflightOutcome {
 
 async fn wildcard_preflight_probe(
     host_input: &str,
+    limiter: &ratelimit::HostRateLimiter,
     body_preview_bytes: usize,
     extra_headers: &[(String, String)],
     initial_cookie_header: Option<&str>,
@@ -994,7 +1149,7 @@ async fn wildcard_preflight_probe(
     // instead of the catchall.
     let (parsed, _tag, _ua) = match dispatch_one(
         &url,
-        host_input,
+        limiter,
         body_preview_bytes,
         extra_headers,
         initial_cookie_header,
@@ -1160,7 +1315,7 @@ fn host_to_input(host: &str) -> String {
 /// Strip scheme + path so `https://target.com/foo` → `target.com`. The scheme's
 /// default port is dropped too (v0.4.7) so `x.com` and `x.com:443` are ONE host
 /// for the per-host budgets, bypass budget and the output `host` field.
-fn bare_host(s: &str) -> String {
+pub(crate) fn bare_host(s: &str) -> String {
     let (default_port, stripped) = if let Some(r) = s.strip_prefix("https://") {
         (":443", r)
     } else if let Some(r) = s.strip_prefix("http://") {
@@ -1411,20 +1566,36 @@ pub async fn run(
     no_resume: bool,
     wildcard_policy: WildcardPolicy,
 ) -> Result<()> {
-    // ── Resume guard: drop overwrite on --no-resume; otherwise we always
-    //    truncate (fuzz mode resumes by re-running, not by partial JSONL
-    //    skip — the donor never implemented mid-run resume and we keep the
-    //    same semantics for output-schema parity).
+    // `--no-resume` means a clean output file. Otherwise retain the file and
+    // avoid re-emitting exact result URLs already present in it. We do not
+    // mark an entire host complete from one finding: an interrupted scan may
+    // have written only its first result.
     if no_resume {
-        let _ = std::fs::remove_file(output_path);
+        if let Err(error) = std::fs::remove_file(output_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error).with_context(|| format!("remove output {}", output_path));
+            }
+        }
+    }
+    let resumed_urls = if no_resume {
+        HashSet::new()
+    } else {
+        read_existing_fuzz_urls(output_path, cfg.output_format)
+    };
+    if !resumed_urls.is_empty() {
+        eprintln!(
+            "[+] resume: {} existing finding URLs will be re-probed for discovery but not emitted twice",
+            resumed_urls.len()
+        );
     }
 
-    let out_file = Arc::new(Mutex::new(
+    let out_file = Arc::new(OutputSink::new(
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(output_path)
             .with_context(|| format!("open output {}", output_path))?,
+        resumed_urls.clone(),
     ));
 
     // v0.4.8 — total is a LIVE counter, not a fixed round-0 estimate. Recursion
@@ -1438,7 +1609,7 @@ pub async fn run(
     // Post-v0.5.3 — both counters now live inside `Progress`, which mints a
     // `ProbeTicket` at spawn time and only lets THAT ticket bump the numerator.
     // The pairing is no longer a convention a new spawn site can forget.
-    let initial_total = hosts.len() * words.len();
+    let initial_total = hosts.len().saturating_mul(words.len());
     let progress = Arc::new(Progress::new(initial_total));
     eprintln!(
         "[+] fuzz: {} hosts × {} paths = {} probes (threads={}, retries={}, wildcard={})",
@@ -1466,7 +1637,7 @@ pub async fn run(
     //    suppression, stderr warning.
     let mut wildcard_map = WildcardMap::new();
     if !matches!(wildcard_policy, WildcardPolicy::Off) {
-        let n_samples = cfg.wildcard_samples.max(1) as usize;
+        let n_samples = cfg.wildcard_samples.max(2) as usize;
         // Varying hex lengths give the Layer 2 slope detector different
         // x-values. With n_samples=3 we use [16, 32, 64]; with other N
         // we round-robin / extend the pattern.
@@ -1478,24 +1649,43 @@ pub async fn run(
             // them CONCURRENTLY (was sequential): wall-clock = slowest single
             // probe, not the sum. Decoys make detection see the same catchall
             // the dictionary hits (extension-sensitive servers).
-            let mut paths: Vec<String> =
-                hex_lens.iter().map(|&n| random_hex_path(n)).collect();
+            let mut paths: Vec<PreflightPath> = hex_lens
+                .iter()
+                .map(|&n| PreflightPath {
+                    family: "generic",
+                    path: random_hex_path(n),
+                })
+                .collect();
             paths.extend(decoy_preflight_paths());
             let total_preflight = paths.len();
-            let futs = paths.iter().map(|p| {
-                wildcard_preflight_probe(
-                    &input,
-                    cfg.body_preview_bytes,
-                    &cfg.extra_headers,
-                    cfg.initial_cookie_header.as_deref(),
-                    p,
+            let futs = paths.iter().map(|p| async {
+                (
+                    p.family,
+                    probe::retry_wreq_pool_once(|| {
+                        wildcard_preflight_probe(
+                            &input,
+                            &cfg.request_limiter,
+                            cfg.body_preview_bytes,
+                            &cfg.extra_headers,
+                            cfg.initial_cookie_header.as_deref(),
+                            &p.path,
+                        )
+                    })
+                    .await
+                    .unwrap_or(None),
                 )
             });
-            let mut samples: Vec<crate::wildcard::ProbeSample> = Vec::new();
+            let mut sample_groups = PreflightSampleGroups::new();
             let mut auth_probes: Vec<crate::wildcard::AuthCatchall> = Vec::new();
-            for outcome in futures::future::join_all(futs).await.into_iter().flatten() {
+            let mut usable = 0usize;
+            for (family, outcome) in futures::future::join_all(futs).await {
+                let Some(outcome) = outcome else { continue };
+                usable += 1;
                 match outcome {
-                    PreflightOutcome::Sample(s) => samples.push(s),
+                    PreflightOutcome::Sample(s) => {
+                        let key = (family.to_string(), s.status, s.content_type.clone());
+                        sample_groups.entry(key).or_default().push(s);
+                    }
                     PreflightOutcome::Auth(a) => auth_probes.push(a),
                 }
             }
@@ -1507,86 +1697,66 @@ pub async fn run(
             // first N dir-shaped words each expand to a full wordlist pass for
             // the coverage of one. Two agreeing probes required so a single
             // random 401 can't disable auth-recursion on a normal host.
-            if let Some(first) = auth_probes.first() {
-                let agree = auth_probes
-                    .iter()
-                    .filter(|a| {
+            let mut learned_auth: Vec<crate::wildcard::AuthCatchall> = Vec::new();
+            for candidate in &auth_probes {
+                let agree = auth_probes.iter().filter(|a| {
+                    candidate.matches(
+                        a.status,
+                        a.content_length,
+                        &a.content_type,
+                        &a.snippet_md5,
+                    )
+                });
+                if agree.count() >= 2
+                    && !learned_auth.iter().any(|a| {
                         a.matches(
-                            first.status,
-                            first.content_length,
-                            &first.content_type,
-                            &first.snippet_md5,
+                            candidate.status,
+                            candidate.content_length,
+                            &candidate.content_type,
+                            &candidate.snippet_md5,
                         )
                     })
-                    .count();
-                if agree >= 2 {
+                {
                     eprintln!(
                         "  [auth-catchall] {} status={} cl={} — every random path is {}; \
                          auth-dir recursion disabled for this host",
-                        host, first.status, first.content_length, first.status
+                        host,
+                        candidate.status,
+                        candidate.content_length,
+                        candidate.status
                     );
-                    wildcard_map.insert_auth(input.clone(), first.clone());
+                    wildcard_map.insert_auth(input.clone(), candidate.clone());
+                    learned_auth.push(candidate.clone());
                 }
             }
 
-            match wildcard::detect(&samples, 10) {
-                Some(sig) if sig.k.is_some() => {
-                    eprintln!(
-                        "  [wildcard L2] {} k={} base={} (path-echo detected; {}/{} samples)",
-                        host,
-                        sig.k.unwrap(),
-                        sig.base.unwrap(),
-                        samples.len(),
-                        total_preflight
-                    );
-                    wildcard_map.insert(input, sig);
-                }
-                Some(sig) if sig.content_length < 0 => {
-                    eprintln!(
-                        "  [wildcard L1] {} prefix-only md5={} ({}/{} samples agreed)",
-                        host,
-                        sig.snippet_md5,
-                        samples.len(),
-                        total_preflight
-                    );
-                    wildcard_map.insert(input, sig);
-                }
-                Some(sig) if sig.snippet_md5.is_empty() => {
-                    eprintln!(
-                        "  [wildcard L1b] {} cl={} content-aware ({}/{} samples agreed on normalized body)",
-                        host,
-                        sig.content_length,
-                        samples.len(),
-                        total_preflight
-                    );
-                    wildcard_map.insert(input, sig);
-                }
-                Some(sig) => {
-                    eprintln!(
-                        "  [wildcard L1] {} cl={} md5={} ({}/{} samples agreed)",
-                        host,
-                        sig.content_length,
-                        sig.snippet_md5,
-                        samples.len(),
-                        total_preflight
-                    );
-                    wildcard_map.insert(input, sig);
-                }
-                None if samples.len() < total_preflight => {
-                    // Some probes failed entirely (404 / timeout / not 2xx-3xx).
-                    // Common case for well-behaved targets that 404 random
-                    // paths. NOT path-sensitive — just no wildcard to record.
-                }
-                None => {
-                    // All samples returned but BOTH layers disagreed → truly
-                    // path-sensitive. NO suppression (would over-suppress
-                    // real findings). Stderr warning for user awareness.
-                    eprintln!(
-                        "  [wildcard] {} → path-sensitive (L1 + L2 both rejected); \
-                         emitting all findings, recursion skipped here",
-                        host
-                    );
-                }
+            let (eligible_groups, detected_groups) = detect_preflight_groups(sample_groups, 10);
+            let detected = detected_groups.len();
+            for (family, sample_count, sig) in detected_groups {
+                let layer = if sig.k.is_some() {
+                    "L2"
+                } else if sig.snippet_md5.is_empty() {
+                    "L1b"
+                } else {
+                    "L1"
+                };
+                eprintln!(
+                    "  [wildcard {}] {} family={} status={} cl={} ({}/{} samples)",
+                    layer,
+                    host,
+                    family,
+                    sig.status,
+                    sig.content_length,
+                    sample_count,
+                    total_preflight
+                );
+                wildcard_map.insert(input.clone(), sig);
+            }
+            if detected == 0 && eligible_groups > 0 && usable == total_preflight {
+                eprintln!(
+                    "  [wildcard] {} → no stable response family detected; emitting findings",
+                    host
+                );
             }
         }
         if wildcard_map.is_empty() {
@@ -1598,31 +1768,10 @@ pub async fn run(
     // detectors write here). Budget scales with host count.
     let catchall = Arc::new(Mutex::new(CatchallCache::new(hosts.len())));
 
-    // ── Concurrency + rate limiter ─────────────────────────────────────
+    // ── Concurrency ────────────────────────────────────────────────────
     let sem = Arc::new(Semaphore::new(cfg.threads.max(1)));
-    let limiter = Arc::new(ratelimit::HostRateLimiter::new(cfg.rate_limit_rps));
     let cfg = Arc::new(cfg);
     let wildcard_policy_arc = Arc::new(wildcard_policy);
-
-    // v0.4.5 — wreq pool-panic resilience. Counters track how many probes hit
-    // the wreq 5.3 connection-pool assertion race (pool.rs:651) and were
-    // retried / ultimately lost. Quiet the (benign, retried) pool assertion on
-    // stderr so it doesn't look like a crash; all other panics print normally.
-    let panic_retries = Arc::new(AtomicUsize::new(0));
-    let panic_failed = Arc::new(AtomicUsize::new(0));
-    {
-        let default_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            let from_wreq_pool = info
-                .location()
-                .map(|l| l.file().contains("pool.rs"))
-                .unwrap_or(false);
-            if from_wreq_pool {
-                return; // caught + retried by run_probe_resilient
-            }
-            default_hook(info);
-        }));
-    }
 
     let started = Instant::now();
     let mut tasks: FuturesUnordered<tokio::task::JoinHandle<()>> = FuturesUnordered::new();
@@ -1735,15 +1884,12 @@ pub async fn run(
                 parent_url: String::new(),
             };
             let sem = sem.clone();
-            let limiter = limiter.clone();
             let cfg = cfg.clone();
             let wildcards = wildcards.clone();
             let catchall = catchall.clone();
             let out_file = out_file.clone();
             let policy = wildcard_policy_arc.clone();
             let disc = disc_tx.clone();
-            let pretries = panic_retries.clone();
-            let pfailed = panic_failed.clone();
 
             // Acquire BEFORE spawn — keeps the FuturesUnordered set bounded
             // to the semaphore size + the number of pending awaits, instead
@@ -1756,26 +1902,8 @@ pub async fn run(
             // total stays at the announced figure.
             tasks.push(progress.spawn_probe(async move {
                 let _p = permit;
-                if limiter.enabled() {
-                    // Key on the BARE host, never the raw `host_input`: for
-                    // recursion probes `host_input` is the discovered directory
-                    // URL, so keying on it would hand every discovered dir its
-                    // own independent quota bucket (50 dirs × `--rate-limit 10`
-                    // = ~500 req/s at the target).
-                    //
-                    // `bare_host(host_input)` — not `item.host` — because
-                    // `item.host` is derived differently per spawn site: crawl
-                    // items take it from `Url::host_str()`, which drops the
-                    // port, so on a non-default port (`:8080`) crawl probes
-                    // would land in a SECOND bucket ("x.com") while round-0 and
-                    // recursion probes use "x.com:8080". Deriving it from the
-                    // URL here is uniform across all three sites and equals
-                    // `item.host` in every default-port case.
-                    limiter.acquire(&bare_host(&item.host_input)).await;
-                }
                 run_probe_resilient(
-                    item, &cfg, &wildcards, &catchall, &out_file, *policy, &disc, &pretries,
-                    &pfailed,
+                    item, &cfg, &wildcards, &catchall, &out_file, *policy, &disc,
                 )
                 .await;
             }));
@@ -1906,30 +2034,21 @@ pub async fn run(
                         parent_url: parent.clone(),
                     };
                     let sem_c = sem.clone();
-                    let limiter_c = limiter.clone();
                     let cfg_c = cfg.clone();
                     let wildcards_c = wildcards.clone();
                     let catchall_c = catchall.clone();
                     let out_file_c = out_file.clone();
                     let policy_c = wildcard_policy_arc.clone();
                     let disc_c = disc_tx.clone();
-                    let pretries_c = panic_retries.clone();
-                    let pfailed_c = panic_failed.clone();
                     let permit = sem_c.acquire_owned().await.ok();
                     // Recursion probe: past the prepaid round-0 pool, so this
                     // reservation grows the live denominator — at the spawn,
                     // inseparably from the completion it authorises.
                     tasks.push(progress.spawn_probe(async move {
                         let _p = permit;
-                        if limiter_c.enabled() {
-                            // Bare host derived from the URL (`host_input` is
-                            // the discovered dir URL here) — one quota bucket
-                            // per host. See the round-0 spawn loop for why.
-                            limiter_c.acquire(&bare_host(&item.host_input)).await;
-                        }
                         run_probe_resilient(
                             item, &cfg_c, &wildcards_c, &catchall_c, &out_file_c, *policy_c,
-                            &disc_c, &pretries_c, &pfailed_c,
+                            &disc_c,
                         )
                         .await;
                     }));
@@ -1964,29 +2083,19 @@ pub async fn run(
                     parent_url: parent.clone(),
                 };
                 let sem_c = sem.clone();
-                let limiter_c = limiter.clone();
                 let cfg_c = cfg.clone();
                 let wildcards_c = wildcards.clone();
                 let catchall_c = catchall.clone();
                 let out_file_c = out_file.clone();
                 let policy_c = wildcard_policy_arc.clone();
                 let disc_c = disc_tx.clone();
-                let pretries_c = panic_retries.clone();
-                let pfailed_c = panic_failed.clone();
                 let permit = sem_c.acquire_owned().await.ok();
                 // Crawl probe: same deal — reservation and spawn are one call.
                 tasks.push(progress.spawn_probe(async move {
                     let _p = permit;
-                    if limiter_c.enabled() {
-                        // Bare host derived from the URL — keeps crawl probes in
-                        // the SAME bucket as this host's round-0 / recursion
-                        // probes even on a non-default port (`item.host` is
-                        // port-less for crawl items). See the round-0 spawn loop.
-                        limiter_c.acquire(&bare_host(&item.host_input)).await;
-                    }
                     run_probe_resilient(
                         item, &cfg_c, &wildcards_c, &catchall_c, &out_file_c, *policy_c,
-                        &disc_c, &pretries_c, &pfailed_c,
+                        &disc_c,
                     )
                     .await;
                 }));
@@ -2035,14 +2144,19 @@ pub async fn run(
     }
 
     {
-        let mut f = out_file.lock().await;
-        let _ = f.flush();
+        let mut f = out_file.file.lock().await;
+        if let Err(error) = f.flush() {
+            out_file.fail(error.to_string());
+        }
     }
     let elapsed = started.elapsed().as_secs_f64();
     // The TRUE executed count: probes whose task future actually resolved, not
     // the number of slots reserved. Every task has been joined by now, so the
     // two agree — but `completed` is the one that means "ran".
     let executed = progress.snapshot().completed;
+    if let Some(error) = out_file.failure() {
+        anyhow::bail!("output {} failed: {}", output_path, error);
+    }
     eprintln!(
         "[+] fuzz done: {} probes in {:.2}s ({:.0} rps avg) → {}",
         executed,
@@ -2051,8 +2165,7 @@ pub async fn run(
         output_path,
     );
     // v0.4.5 — honest accounting of the wreq pool-panic race (if any fired).
-    let pr = panic_retries.load(Ordering::Relaxed);
-    let pf = panic_failed.load(Ordering::Relaxed);
+    let (pr, pf) = probe::wreq_pool_panic_stats();
     if pr > 0 {
         eprintln!(
             "[+] connection-pool resilience: {} probe(s) hit the wreq pool race and were retried; {} still failed after retry",
@@ -2094,7 +2207,7 @@ async fn attempt_auth_bypass(
         headers.extend(v.headers.iter().cloned());
         let Ok((p, _tag, _ua)) = dispatch_one(
             &url,
-            &item.host_input,
+            &cfg.request_limiter,
             cfg.body_preview_bytes,
             &headers,
             cfg.initial_cookie_header.as_deref(),
@@ -2119,13 +2232,13 @@ async fn attempt_auth_bypass(
             continue;
         }
         // Must not be the host catchall (no fake-200s).
-        let plen = decoded_path_len(v.path.split(['?', '#']).next().unwrap_or(&v.path));
-        if wildcards.matches_body(
+        if wildcards.matches_url_body(
             &item.host_input,
+            &url,
+            p.status,
             p.content_length,
             &p.content_type,
             &p.snippet_md5,
-            plen,
             &p.raw_body,
         ) {
             continue;
@@ -2170,10 +2283,12 @@ struct FreqEntry {
 /// Live, shared per-run cache for per-directory catchall detection.
 #[derive(Default)]
 struct CatchallCache {
-    /// Confirmed catchall sigs (from BOTH detectors). Checked content-aware.
-    learned: Vec<crate::wildcard::WildcardSig>,
-    /// (content_type, normalized_snippet_md5) → distinct paths seen + a sig.
-    freq: std::collections::HashMap<(String, String), FreqEntry>,
+    /// Confirmed catchall signatures keyed by their scope. Frequency-learned
+    /// signatures use the canonical origin; sibling signatures use the exact
+    /// parent directory. Neither can leak into another host.
+    learned: std::collections::HashMap<String, Vec<crate::wildcard::WildcardSig>>,
+    /// (origin, status, content_type, normalized_snippet_md5) → observations.
+    freq: std::collections::HashMap<(String, u16, String, String), FreqEntry>,
     /// Detector C (v0.6.1, bodyless catchall): (host_input, status,
     /// content_type) → distinct paths that answered with NO body at all.
     empty_freq: std::collections::HashMap<(String, u16, String), std::collections::HashSet<String>>,
@@ -2184,34 +2299,41 @@ struct CatchallCache {
     /// Parents whose sibling-probe is IN FLIGHT right now. Concurrent hits under
     /// the same parent wait on this instead of leaking (v0.4.6 race close).
     inflight: std::collections::HashSet<String>,
-    /// Remaining sibling-probe budget for this run.
-    parents_budget: usize,
+    /// Sibling-probe count per origin. One noisy host cannot consume the
+    /// entire multi-host run's detection budget.
+    parents_used: std::collections::HashMap<String, usize>,
 }
 
 /// True if any learned catchall sig content-matches this response. Shared by
 /// steps (a) and the wait-loop so the check stays identical everywhere.
 fn any_learned_matches(
-    learned: &[crate::wildcard::WildcardSig],
+    learned: &std::collections::HashMap<String, Vec<crate::wildcard::WildcardSig>>,
+    origin: &str,
+    parent: &str,
+    full_url: &str,
     parsed: &ParsedResp,
-    probe_path_len: usize,
 ) -> bool {
-    learned.iter().any(|s| {
-        s.matches_probe(
-            parsed.content_length,
-            &parsed.content_type,
-            &parsed.snippet_md5,
-            probe_path_len,
-            &parsed.raw_body,
-        )
+    [origin, parent].into_iter().any(|scope| {
+        let Some(sigs) = learned.get(scope) else {
+            return false;
+        };
+        let path_len = scoped_path_len(scope, full_url);
+        sigs.iter().any(|s| {
+            s.status == parsed.status
+                && s.matches_probe(
+                    parsed.content_length,
+                    &parsed.content_type,
+                    &parsed.snippet_md5,
+                    path_len,
+                    &parsed.raw_body,
+                )
+        })
     })
 }
 
 impl CatchallCache {
-    fn new(host_count: usize) -> Self {
-        Self {
-            parents_budget: MAX_CATCHALL_PARENTS_PER_HOST.saturating_mul(host_count.max(1)),
-            ..Default::default()
-        }
+    fn new(_host_count: usize) -> Self {
+        Self::default()
     }
 
     /// Detector A (frequency, zero traffic). Record one 2xx response's
@@ -2222,6 +2344,8 @@ impl CatchallCache {
     /// real varying-size endpoints can't inflate a bucket.
     fn note_frequency(
         &mut self,
+        origin: &str,
+        status: u16,
         ct: &str,
         norm_hash: &str,
         cl: i64,
@@ -2229,12 +2353,18 @@ impl CatchallCache {
     ) -> Option<crate::wildcard::WildcardSig> {
         let entry = self
             .freq
-            .entry((ct.to_string(), norm_hash.to_string()))
+            .entry((
+                origin.to_string(),
+                status,
+                ct.to_string(),
+                norm_hash.to_string(),
+            ))
             .or_default();
         match &entry.sig {
             Some(s) if (s.content_length - cl).abs() > FREQ_CL_TOL => return None,
             None => {
                 entry.sig = Some(crate::wildcard::WildcardSig {
+                    status,
                     content_length: cl,
                     content_type: ct.to_string(),
                     snippet_md5: String::new(),
@@ -2251,12 +2381,14 @@ impl CatchallCache {
             return None;
         }
         let sig = entry.sig.clone()?;
-        let dup = self.learned.iter().any(|s| {
-            s.content_type == sig.content_type
+        let learned = self.learned.entry(origin.to_string()).or_default();
+        let dup = learned.iter().any(|s| {
+            s.status == sig.status
+                && s.content_type == sig.content_type
                 && s.normalized_snippet_md5 == sig.normalized_snippet_md5
         });
         if !dup {
-            self.learned.push(sig.clone());
+            learned.push(sig.clone());
         }
         Some(sig)
     }
@@ -2319,13 +2451,34 @@ fn parent_prefix(url: &str) -> String {
     }
 }
 
+pub(crate) fn origin_key(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return bare_host(url);
+    };
+    let Some(host) = parsed.host_str() else {
+        return bare_host(url);
+    };
+    match parsed.port() {
+        Some(port) => format!("{}://{}:{}", parsed.scheme(), host, port),
+        None => format!("{}://{}", parsed.scheme(), host),
+    }
+}
+
+fn scoped_path_len(scope: &str, full_url: &str) -> usize {
+    let relative = full_url.strip_prefix(scope).unwrap_or(full_url);
+    let path = relative
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(relative);
+    decoded_path_len(path)
+}
+
 /// Hybrid per-directory catchall test. Returns `true` if this 2xx response is a
 /// per-prefix catchall shell that should be SUPPRESSED (and not recursed).
 /// Never holds the cache lock across the network probe.
 async fn catchall_suppresses(
     item: &ProbeItem,
     parsed: &ParsedResp,
-    probe_path_len: usize,
     cfg: &FuzzCfg,
     cache: &Arc<Mutex<CatchallCache>>,
 ) -> bool {
@@ -2339,11 +2492,15 @@ async fn catchall_suppresses(
     //     let hosts answering `200` + no body for EVERY path flood the output
     //     (v0.6.0 bug). Handled here on its own frequency rule, then out —
     //     content matching has nothing to work with.
+    let full_url = format!("{}{}", item.host_input, item.path);
+    let origin = origin_key(&full_url);
+    let parent = parent_prefix(&full_url);
+
     if parsed.raw_body.is_empty() {
         let promoted = {
             let mut c = cache.lock().await;
             c.note_empty_body(
-                &item.host_input,
+                &origin,
                 parsed.status,
                 &parsed.content_type,
                 &item.path,
@@ -2373,7 +2530,7 @@ async fn catchall_suppresses(
     // (a) Match against already-learned sigs (content-aware, zero probes).
     {
         let c = cache.lock().await;
-        if any_learned_matches(&c.learned, parsed, probe_path_len) {
+        if any_learned_matches(&c.learned, &origin, &parent, &full_url, parsed) {
             return true;
         }
     }
@@ -2381,8 +2538,6 @@ async fn catchall_suppresses(
     // (b) Sibling-probe (Detector B): the FIRST hit under a new parent probes
     //     two random siblings to confirm the shell; concurrent hits under the
     //     same parent WAIT for that probe (never leak) rather than emitting.
-    let full_url = format!("{}{}", item.host_input, item.path);
-    let parent = parent_prefix(&full_url);
     enum Role {
         Probe,
         Wait,
@@ -2392,9 +2547,12 @@ async fn catchall_suppresses(
         let mut c = cache.lock().await;
         if c.inflight.contains(&parent) {
             Role::Wait
-        } else if !c.probed_parents.contains(&parent) && c.parents_budget > 0 {
+        } else if !c.probed_parents.contains(&parent)
+            && c.parents_used.get(&origin).copied().unwrap_or(0)
+                < MAX_CATCHALL_PARENTS_PER_HOST
+        {
             c.probed_parents.insert(parent.clone());
-            c.parents_budget -= 1;
+            *c.parents_used.entry(origin.clone()).or_default() += 1;
             c.inflight.insert(parent.clone());
             Role::Probe
         } else {
@@ -2412,6 +2570,7 @@ async fn catchall_suppresses(
             let futs = spaths.iter().map(|p| {
                 wildcard_preflight_probe(
                     &parent,
+                    &cfg.request_limiter,
                     cfg.body_preview_bytes,
                     &cfg.extra_headers,
                     cfg.initial_cookie_header.as_deref(),
@@ -2448,17 +2607,22 @@ async fn catchall_suppresses(
                         "  [catchall] {} cl={} content-aware (sibling-probe)",
                         parent, sig.content_length
                     );
-                    c.learned.push(sig.clone());
+                    let sigs = c.learned.entry(parent.clone()).or_default();
+                    if !sigs.contains(sig) {
+                        sigs.push(sig.clone());
+                    }
                 }
             }
             if let Some(sig) = learned_sig {
-                if sig.matches_probe(
+                if sig.status == parsed.status
+                    && sig.matches_probe(
                     parsed.content_length,
                     &parsed.content_type,
                     &parsed.snippet_md5,
-                    probe_path_len,
+                    scoped_path_len(&parent, &full_url),
                     &parsed.raw_body,
-                ) {
+                )
+                {
                     return true;
                 }
             }
@@ -2473,7 +2637,7 @@ async fn catchall_suppresses(
             for _ in 0..max_polls {
                 {
                     let c = cache.lock().await;
-                    if any_learned_matches(&c.learned, parsed, probe_path_len) {
+                    if any_learned_matches(&c.learned, &origin, &parent, &full_url, parsed) {
                         return true;
                     }
                     if !c.inflight.contains(&parent) {
@@ -2491,6 +2655,8 @@ async fn catchall_suppresses(
     let norm_hash = crate::wildcard::md5_hex(&crate::wildcard::normalize_snippet(&parsed.raw_body));
     let mut c = cache.lock().await;
     if let Some(sig) = c.note_frequency(
+        &origin,
+        parsed.status,
         &parsed.content_type,
         &norm_hash,
         parsed.content_length,
@@ -2517,42 +2683,22 @@ async fn run_probe_resilient(
     cfg: &FuzzCfg,
     wildcards: &Arc<WildcardMap>,
     catchall: &Arc<Mutex<CatchallCache>>,
-    out_file: &Arc<Mutex<std::fs::File>>,
+    out_file: &Arc<OutputSink>,
     wildcard_policy: WildcardPolicy,
     disc_tx: &tokio::sync::mpsc::UnboundedSender<Discovery>,
-    panic_retries: &AtomicUsize,
-    panic_failed: &AtomicUsize,
 ) {
-    use futures::FutureExt as _;
-    let item_retry = item.clone();
-    let r = std::panic::AssertUnwindSafe(run_probe(
-        item,
-        cfg,
-        wildcards,
-        catchall,
-        out_file,
-        wildcard_policy,
-        disc_tx,
-    ))
-    .catch_unwind()
-    .await;
-    if r.is_err() {
-        panic_retries.fetch_add(1, Ordering::Relaxed);
-        let r2 = std::panic::AssertUnwindSafe(run_probe(
-            item_retry,
+    let _ = probe::retry_wreq_pool_once(|| {
+        run_probe(
+            item.clone(),
             cfg,
             wildcards,
             catchall,
             out_file,
             wildcard_policy,
             disc_tx,
-        ))
-        .catch_unwind()
-        .await;
-        if r2.is_err() {
-            panic_failed.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+        )
+    })
+    .await;
 }
 
 async fn run_probe(
@@ -2560,10 +2706,13 @@ async fn run_probe(
     cfg: &FuzzCfg,
     wildcards: &Arc<WildcardMap>,
     catchall: &Arc<Mutex<CatchallCache>>,
-    out_file: &Arc<Mutex<std::fs::File>>,
+    out_file: &Arc<OutputSink>,
     wildcard_policy: WildcardPolicy,
     disc_tx: &tokio::sync::mpsc::UnboundedSender<Discovery>,
 ) {
+    if out_file.failed.load(Ordering::Acquire) {
+        return;
+    }
     let url = format!("{}{}", item.host_input, item.path);
 
     let started = Instant::now();
@@ -2579,7 +2728,7 @@ async fn run_probe(
         attempts += 1;
         match dispatch_one(
             &url,
-            &item.host_input,
+            &cfg.request_limiter,
             cfg.body_preview_bytes,
             &cfg.extra_headers,
             cfg.initial_cookie_header.as_deref(),
@@ -2612,31 +2761,18 @@ async fn run_probe(
         Some(parsed) => {
             // Wildcard check before status filter. Key matches the
             // pre-flight insertion above: full host_input, not bare host.
-            // v0.3.9: pass `probe_path_len` so Layer 2 (path-echo) can
-            // verify `CL ≈ k × path_len + base`.
-            //
-            // Strip query + fragment from the path AND percent-decode it
-            // before measuring length — servers echoing the path back
-            // ALMOST ALWAYS reflect only the URL path component (not the
-            // query) and reflect it DECODED (`/%2e%2e/admin` is rendered
-            // as `/../admin` = 9 bytes vs 18 raw). Counting raw encoded
-            // length inflates the expected CL and pushes real findings
-            // outside the tolerance window. Caught 244 FPs total in the
-            // v0.3.9 path_echo benchmark before this two-step fix.
-            let probe_path_only = item
-                .path
-                .split(|c| c == '?' || c == '#')
-                .next()
-                .unwrap_or(&item.path);
-            let probe_path_len = decoded_path_len(probe_path_only);
+            // The host-level matcher derives Layer 2's decoded path length
+            // from the complete URL relative to the pre-flight scope that
+            // produced the signature. This stays correct in recursive rounds.
             let mut is_wildcard = false;
             if !matches!(wildcard_policy, WildcardPolicy::Off)
-                && wildcards.matches_body(
+                && wildcards.matches_url_body(
                     &item.host_input,
+                    &url,
+                    parsed.status,
                     parsed.content_length,
                     &parsed.content_type,
                     &parsed.snippet_md5,
-                    probe_path_len,
                     &parsed.raw_body,
                 )
             {
@@ -2651,7 +2787,7 @@ async fn run_probe(
             // host layer already flagged it, when policy is Off, or on non-2xx.
             if !is_wildcard
                 && !matches!(wildcard_policy, WildcardPolicy::Off)
-                && catchall_suppresses(&item, &parsed, probe_path_len, cfg, catchall).await
+                && catchall_suppresses(&item, &parsed, cfg, catchall).await
             {
                 is_wildcard = true;
             }
@@ -2711,7 +2847,7 @@ async fn run_probe(
                         let canary = format!("{}{:08x}", dir_url, fastrand::u32(..));
                         match dispatch_one(
                             &canary,
-                            &item.host_input,
+                            &cfg.request_limiter,
                             cfg.body_preview_bytes,
                             &cfg.extra_headers,
                             cfg.initial_cookie_header.as_deref(),
@@ -2720,12 +2856,13 @@ async fn run_probe(
                         )
                         .await
                         {
-                            Ok((child, _, _)) => wildcards.matches_body(
+                            Ok((child, _, _)) => wildcards.matches_url_body(
                                 &item.host_input,
+                                &canary,
+                                child.status,
                                 child.content_length,
                                 &child.content_type,
                                 &child.snippet_md5,
-                                0,
                                 &child.raw_body,
                             ),
                             Err(_) => false,
@@ -2815,9 +2952,12 @@ async fn run_probe(
                 return;
             }
             // v0.3.10 — `--exclude-sizes` exact content-length match.
-            if !cfg.exclude_sizes.is_empty()
-                && cfg.exclude_sizes.contains(&parsed.content_length)
-            {
+            if content_length_excluded(
+                &cfg.exclude_sizes,
+                &cfg.exclude_sizes_by_origin,
+                &url,
+                parsed.content_length,
+            ) {
                 return;
             }
 
@@ -2883,15 +3023,16 @@ async fn run_probe(
                     max_links_per_page: cfg.max_links_per_page,
                     scope_hosts: cfg.scope_hosts.clone(),
                 };
+                let crawl_base = &parsed.effective_url;
                 let links = crate::crawl::extract_urls(
                     &parsed.raw_body,
                     &parsed.content_type,
-                    &url,
+                    crawl_base,
                     &crawl_cfg,
                 );
-                let source_tag = if url.ends_with("/robots.txt") {
+                let source_tag = if crawl_base.ends_with("/robots.txt") {
                     "crawl-robots"
-                } else if url.ends_with("/sitemap.xml") {
+                } else if crawl_base.ends_with("/sitemap.xml") {
                     "crawl-sitemap"
                 } else {
                     "crawl-html"
@@ -2901,7 +3042,7 @@ async fn run_probe(
                         canonical_url: crate::recurse::canonical_url_key(&link),
                         source: source_tag.to_string(),
                         depth: next_depth,
-                        parent: url.clone(),
+                        parent: crawl_base.clone(),
                     });
                 }
             }
@@ -2961,11 +3102,16 @@ async fn run_probe(
 /// interleave mid-line, and `\r\x1b[K` clears the progress bar line so
 /// the next ticker redraw lands cleanly below the finding.
 async fn write_record(
-    out_file: &Arc<Mutex<std::fs::File>>,
+    out_file: &Arc<OutputSink>,
     rec: &FuzzRecord,
     format: OutputFormat,
     live: bool,
 ) {
+    let canonical_url = output_url_key(&rec.url);
+    if !out_file.emitted_urls.lock().await.insert(canonical_url) {
+        return;
+    }
+
     // ── 1. Live findings to stderr (UX) ──────────────────────────────
     // Compute is_tty per-call. `IsTerminal::is_terminal()` is a cheap
     // ioctl(TIOCGWINSZ)-style check — sub-microsecond, fine to call
@@ -2998,10 +3144,16 @@ async fn write_record(
     }
 
     // ── 2. File output in chosen format ──────────────────────────────
+    if out_file.failed.load(Ordering::Acquire) {
+        return;
+    }
     let line = match format {
         OutputFormat::Json => match serde_json::to_string(rec) {
             Ok(s) => s,
-            Err(_) => return,
+            Err(error) => {
+                out_file.fail(error.to_string());
+                return;
+            }
         },
         OutputFormat::Plain => {
             // Plain mode strips the heavy body_preview / VIEWSTATE blob
@@ -3009,14 +3161,9 @@ async fn write_record(
             format_finding_line(rec.status_code, rec.content_length, &rec.url, false)
         }
     };
-    let mut f = out_file.lock().await;
+    let mut f = out_file.file.lock().await;
     if let Err(e) = writeln!(*f, "{}", line) {
-        if !WRITE_ERR_LOGGED.swap(true, Ordering::Relaxed) {
-            eprintln!(
-                "[!] fuzz: output write failed: {} (further write errors will be silent)",
-                e
-            );
-        }
+        out_file.fail(e.to_string());
     }
 }
 
@@ -3243,6 +3390,16 @@ mod tests {
 
     // ── v0.4.6 per-directory catchall helpers ────────────────────────────
 
+    fn note_frequency(
+        cache: &mut CatchallCache,
+        ct: &str,
+        hash: &str,
+        cl: i64,
+        path: &str,
+    ) -> Option<crate::wildcard::WildcardSig> {
+        cache.note_frequency("https://fixture.test", 200, ct, hash, cl, path)
+    }
+
     #[test]
     fn parent_prefix_strips_last_segment() {
         assert_eq!(
@@ -3267,19 +3424,19 @@ mod tests {
     fn frequency_promotes_only_at_k_distinct_paths() {
         let mut c = CatchallCache::new(1);
         // Two distinct paths of the same shell → not yet a catchall.
-        assert!(c.note_frequency("text/html", "hashA", 1232, "/crm/a").is_none());
-        assert!(c.note_frequency("text/html", "hashA", 1232, "/crm/b").is_none());
+        assert!(note_frequency(&mut c, "text/html", "hashA", 1232, "/crm/a").is_none());
+        assert!(note_frequency(&mut c, "text/html", "hashA", 1232, "/crm/b").is_none());
         // The K-th (3rd) distinct path promotes it.
         let sig = c
-            .note_frequency("text/html", "hashA", 1230, "/crm/c")
+            .note_frequency("https://fixture.test", 200, "text/html", "hashA", 1230, "/crm/c")
             .expect("promotes at K distinct paths");
         assert_eq!(sig.normalized_snippet_md5, "hashA");
         assert!(sig.snippet_md5.is_empty(), "content-aware sig (no exact md5)");
         // A repeat of an already-seen path must NOT advance the count.
         let mut c2 = CatchallCache::new(1);
-        assert!(c2.note_frequency("text/html", "h", 500, "/x").is_none());
-        assert!(c2.note_frequency("text/html", "h", 500, "/x").is_none());
-        assert!(c2.note_frequency("text/html", "h", 500, "/x").is_none());
+        assert!(note_frequency(&mut c2, "text/html", "h", 500, "/x").is_none());
+        assert!(note_frequency(&mut c2, "text/html", "h", 500, "/x").is_none());
+        assert!(note_frequency(&mut c2, "text/html", "h", 500, "/x").is_none());
     }
 
     #[test]
@@ -3287,14 +3444,37 @@ mod tests {
         let mut c = CatchallCache::new(1);
         // Same normalized prefix but a real varying-size endpoint (CL drifts
         // far beyond FREQ_CL_TOL) must never promote → real results survive.
-        assert!(c.note_frequency("application/json", "shape", 100, "/api/a").is_none());
-        assert!(c.note_frequency("application/json", "shape", 4000, "/api/b").is_none());
-        assert!(c.note_frequency("application/json", "shape", 9000, "/api/c").is_none());
+        assert!(note_frequency(&mut c, "application/json", "shape", 100, "/api/a").is_none());
+        assert!(note_frequency(&mut c, "application/json", "shape", 4000, "/api/b").is_none());
+        assert!(note_frequency(&mut c, "application/json", "shape", 9000, "/api/c").is_none());
         // Distinct content hashes never accumulate toward one catchall.
         let mut c2 = CatchallCache::new(1);
-        assert!(c2.note_frequency("text/html", "h1", 800, "/p1").is_none());
-        assert!(c2.note_frequency("text/html", "h2", 800, "/p2").is_none());
-        assert!(c2.note_frequency("text/html", "h3", 800, "/p3").is_none());
+        assert!(note_frequency(&mut c2, "text/html", "h1", 800, "/p1").is_none());
+        assert!(note_frequency(&mut c2, "text/html", "h2", 800, "/p2").is_none());
+        assert!(note_frequency(&mut c2, "text/html", "h3", 800, "/p3").is_none());
+    }
+
+    #[test]
+    fn frequency_learning_is_isolated_by_origin_and_status() {
+        let mut cache = CatchallCache::new(2);
+        assert!(cache
+            .note_frequency("https://a.test", 200, "text/html", "same", 100, "/a")
+            .is_none());
+        assert!(cache
+            .note_frequency("https://a.test", 200, "text/html", "same", 100, "/b")
+            .is_none());
+        // Neither another host nor another status may supply A's third vote.
+        assert!(cache
+            .note_frequency("https://b.test", 200, "text/html", "same", 100, "/c")
+            .is_none());
+        assert!(cache
+            .note_frequency("https://a.test", 302, "text/html", "same", 100, "/d")
+            .is_none());
+        assert!(cache
+            .note_frequency("https://a.test", 200, "text/html", "same", 100, "/c")
+            .is_some());
+        assert!(cache.learned.contains_key("https://a.test"));
+        assert!(!cache.learned.contains_key("https://b.test"));
     }
 
     #[test]
@@ -3373,6 +3553,58 @@ mod tests {
     }
 
     #[test]
+    fn decoy_preflight_has_two_independent_samples_per_family() {
+        let paths = decoy_preflight_paths();
+        for family in ["conf", "config", "log", "env", "git-head"] {
+            let family_paths: Vec<&str> = paths
+                .iter()
+                .filter(|path| path.family == family)
+                .map(|path| path.path.as_str())
+                .collect();
+            assert_eq!(family_paths.len(), 2, "family={}", family);
+            assert_ne!(family_paths[0], family_paths[1]);
+        }
+    }
+
+    #[test]
+    fn extension_family_is_learned_when_generic_paths_are_sensitive() {
+        let sample = |content_length: i64,
+                      snippet_md5: &str,
+                      path_len: usize,
+                      raw_body: &str| crate::wildcard::ProbeSample {
+            status: 200,
+            content_length,
+            content_type: "text/html".into(),
+            snippet_md5: snippet_md5.into(),
+            path_len,
+            raw_body: raw_body.into(),
+        };
+        let mut groups = PreflightSampleGroups::new();
+        groups.insert(
+            ("generic".into(), 200, "text/html".into()),
+            vec![
+                sample(100, "generic-a", 17, "first unrelated page"),
+                sample(150, "generic-b", 33, "second unrelated page"),
+                sample(175, "generic-c", 65, "third unrelated page"),
+            ],
+        );
+        groups.insert(
+            ("conf".into(), 200, "text/html".into()),
+            vec![
+                sample(393, "conf-shell", 14, "same conf shell"),
+                sample(393, "conf-shell", 19, "same conf shell"),
+            ],
+        );
+
+        let (eligible, detected) = detect_preflight_groups(groups, 10);
+        assert_eq!(eligible, 2);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].0, "conf");
+        assert_eq!(detected[0].2.status, 200);
+        assert_eq!(detected[0].2.content_length, 393);
+    }
+
+    #[test]
     fn html_escape_order_matters() {
         assert_eq!(html_escape_body_preview("<a>"), "&lt;a&gt;");
         assert_eq!(html_escape_body_preview("\"foo\""), "&#34;foo&#34;");
@@ -3427,6 +3659,22 @@ mod tests {
             host_to_input("http://target.com:8080"),
             "http://target.com:8080"
         );
+    }
+
+    #[test]
+    fn origin_key_preserves_scheme_and_non_default_port() {
+        assert_eq!(origin_key("https://x.com/a"), "https://x.com");
+        assert_eq!(origin_key("http://x.com/a"), "http://x.com");
+        assert_eq!(origin_key("https://x.com:8443/a"), "https://x.com:8443");
+    }
+
+    #[test]
+    fn redirect_auth_scope_requires_exact_origin() {
+        assert!(same_origin_url("https://x.com/a", "https://x.com/b"));
+        assert!(same_origin_url("https://x.com/a", "https://x.com:443/b"));
+        assert!(!same_origin_url("https://x.com/a", "http://x.com/b"));
+        assert!(!same_origin_url("https://x.com/a", "https://x.com:8443/b"));
+        assert!(!same_origin_url("https://x.com/a", "https://other.test/b"));
     }
 
     #[test]
@@ -3579,6 +3827,147 @@ mod tests {
         assert!(HostRateLimiter::new(0.5).enabled(), "0.5 rps must enable");
         assert!(HostRateLimiter::new(1.0).enabled(), "1 rps must enable");
         assert!(HostRateLimiter::new(50.0).enabled(), "50 rps must enable");
+    }
+
+    #[tokio::test]
+    async fn host_rate_limiter_paces_without_initial_burst() {
+        let limiter = ratelimit::HostRateLimiter::new(20.0);
+        let started = Instant::now();
+        limiter.acquire("x.test").await;
+        limiter.acquire("x.test").await;
+        limiter.acquire("x.test").await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(80),
+            "three requests at 20 rps must span roughly 100ms"
+        );
+    }
+
+    #[test]
+    fn resume_parser_reads_json_and_plain_urls() {
+        let base = std::env::temp_dir().join(format!(
+            "httpxer-resume-{}-{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        let json_path = base.with_extension("jsonl");
+        let plain_path = base.with_extension("txt");
+        std::fs::write(
+            &json_path,
+            "{\"url\":\"https://x.test/a?ignored=1\"}\nnot-json\n",
+        )
+        .unwrap();
+        std::fs::write(&plain_path, "200 10B https://x.test/b\n").unwrap();
+        assert!(read_existing_fuzz_urls(json_path.to_str().unwrap(), OutputFormat::Json)
+            .contains("https://x.test/a?ignored=1"));
+        assert!(read_existing_fuzz_urls(plain_path.to_str().unwrap(), OutputFormat::Plain)
+            .contains("https://x.test/b"));
+        let _ = std::fs::remove_file(json_path);
+        let _ = std::fs::remove_file(plain_path);
+    }
+
+    #[test]
+    fn zero_redirect_limit_preserves_redirect_response() {
+        assert!(!should_follow_redirect(302, "/login", true, 0));
+        assert!(should_follow_redirect(302, "/login", true, 1));
+        assert!(!should_follow_redirect(200, "/login", true, 1));
+        assert!(!should_follow_redirect(302, "", true, 1));
+        assert!(!should_follow_redirect(302, "/login", false, 1));
+    }
+
+    #[test]
+    fn learned_root_size_is_scoped_to_origin() {
+        let mut by_origin = std::collections::HashMap::new();
+        by_origin.insert("https://a.test".to_string(), vec![393]);
+
+        assert!(content_length_excluded(
+            &[],
+            &by_origin,
+            "https://a.test/path",
+            393,
+        ));
+        assert!(!content_length_excluded(
+            &[],
+            &by_origin,
+            "https://b.test/path",
+            393,
+        ));
+        assert!(content_length_excluded(
+            &[393],
+            &by_origin,
+            "https://b.test/path",
+            393,
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn output_write_failure_is_recorded() {
+        let file = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+        let sink = Arc::new(OutputSink::new(file, HashSet::new()));
+        write_record(
+            &sink,
+            &provenance_test_record(),
+            OutputFormat::Json,
+            false,
+        )
+        .await;
+        assert!(sink.failed.load(Ordering::Acquire));
+        assert!(sink.failure().is_some());
+    }
+
+    #[tokio::test]
+    async fn resumed_url_is_reprobed_but_not_emitted_twice() {
+        let path = std::env::temp_dir().join(format!(
+            "httpxer-output-dedupe-{}-{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let mut emitted = HashSet::new();
+        emitted.insert(output_url_key("https://x.com/a"));
+        let sink = Arc::new(OutputSink::new(file, emitted));
+
+        write_record(
+            &sink,
+            &provenance_test_record(),
+            OutputFormat::Json,
+            false,
+        )
+        .await;
+        sink.file.lock().await.flush().unwrap();
+
+        assert!(std::fs::read_to_string(&path).unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn output_dedupe_preserves_distinct_queries() {
+        let path = std::env::temp_dir().join(format!(
+            "httpxer-output-query-{}-{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let sink = Arc::new(OutputSink::new(file, HashSet::new()));
+        let mut first = provenance_test_record();
+        first.url = "https://x.com/login?action=a".into();
+        let mut second = provenance_test_record();
+        second.url = "https://x.com/login?action=b".into();
+
+        write_record(&sink, &first, OutputFormat::Json, false).await;
+        write_record(&sink, &second, OutputFormat::Json, false).await;
+        sink.file.lock().await.flush().unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+        let _ = std::fs::remove_file(path);
     }
 
     /// Minimal FuzzRecord for schema tests. Provenance tags default to `None`

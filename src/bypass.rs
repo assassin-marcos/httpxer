@@ -3,9 +3,10 @@
 //! When a probe hits `401`/`403` on a directory-shaped path, the fuzz worker
 //! retries it with a small battery of well-known access-control bypass
 //! techniques (path-override headers + path mutations). A retry is reported
-//! ONLY when it returns 2xx/3xx, its (normalized) content DIFFERS from the
-//! original block page, AND it doesn't match the host catchall — so we never
-//! emit a fake-200. It is auto-on but conservative: a per-host path budget
+//! ONLY when it returns a 2xx with a non-empty body, its normalized content
+//! DIFFERS from the original block page, AND it doesn't match the host
+//! catchall. Redirects and empty bodies are not accepted as proof of access.
+//! It is auto-on but conservative: a per-host path budget
 //! bounds traffic, each path stops at the first confirmed bypass, and `--safe`
 //! disables it entirely.
 //!

@@ -2,6 +2,16 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.6.5] — 2026-07-31
+
+### Fixed
+- **Wildcard accuracy:** status-aware multi-family signatures, extension decoys, three-sample path-echo fitting, recursive scope matching, and content-aware wide-drift guards.
+- **Recursion and resume:** final redirect URLs drive crawl resolution, existing findings are re-probed for child discovery without duplicate output, and query-distinct findings stay distinct.
+- **HTTP safety and pacing:** every retry, redirect, pre-flight, backup, bypass, canary, and root-size request shares the host limiter; credentials are stripped on cross-origin redirects.
+- **Stability and resource bounds:** the known connection-pool assertion is retried once, response bodies are capped, resume files stream line-by-line, and output write failures stop the run.
+- **Backup and root-size parity:** backup fingerprints use real SHA-256, candidate caps retain directory coverage, authenticated request context is shared, and learned root sizes are origin-scoped.
+- **Enrich identity:** DNS resolution strips ports while endpoint and resume identities retain non-default ports, including native and compatibility output parsing.
+
 ## [0.6.4] — 2026-07-30
 
 ### Fixed

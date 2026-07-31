@@ -921,14 +921,20 @@ fn read_existing_subdomains(path: &str) -> HashSet<String> {
         Ok(_) => return HashSet::new(),
         Err(_) => return HashSet::new(),
     }
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return HashSet::new();
     };
     let mut out = HashSet::new();
-    for line in content.lines() {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(s) = v.get("subdomain").and_then(|s| s.as_str()) {
-                out.insert(s.to_string());
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            for key in ["subdomain", "host", "input", "url"] {
+                if let Some(s) = v.get(key).and_then(|s| s.as_str()) {
+                    let host = extract_host(s);
+                    if !host.is_empty() {
+                        out.insert(host);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -972,16 +978,38 @@ fn update_check_allowed_early(argv: &[String]) -> bool {
     true
 }
 
-/// Strip scheme + path/query/fragment so `https://foo.com/bar?x=1` becomes
-/// `foo.com`. Without stripping `?` and `#`, inputs like
-/// `https://foo.com?x=1` would resolve DNS as `foo.com?x=1` and silently
-/// fail — and the resume-skip cache would miss its own dedupe key.
+/// Extract the endpoint authority used for record and resume identity. Keep a
+/// non-default port so services on the same DNS name remain distinct.
 fn extract_host(input: &str) -> String {
-    let s = input
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
-    let host_end = s.find(['/', '?', '#']).unwrap_or(s.len());
-    s[..host_end].to_string()
+    let candidate = if input.starts_with("https://") || input.starts_with("http://") {
+        input.to_string()
+    } else {
+        format!("https://{}", input)
+    };
+    let Ok(url) = url::Url::parse(&candidate) else {
+        return String::new();
+    };
+    let Some(host) = url.host_str() else {
+        return String::new();
+    };
+    match url.port() {
+        Some(port) if host.contains(':') => format!("[{}]:{}", host, port),
+        Some(port) => format!("{}:{}", host, port),
+        None => host.to_string(),
+    }
+}
+
+/// DNS accepts a hostname only, never an authority containing a port.
+fn extract_dns_host(input: &str) -> String {
+    let candidate = if input.starts_with("https://") || input.starts_with("http://") {
+        input.to_string()
+    } else {
+        format!("https://{}", input)
+    };
+    url::Url::parse(&candidate)
+        .ok()
+        .and_then(|url| url.host_str().map(ToString::to_string))
+        .unwrap_or_default()
 }
 
 #[tokio::main]
@@ -1164,8 +1192,11 @@ async fn main() -> Result<()> {
         // Build the impersonation pool once — fuzz uses the same pool
         // enrich does, so the init logic is identical.
         probe::init_pool(args.timeout_ms, args.no_impersonate, args.proxy.as_deref())?;
+        let request_limiter = Arc::new(fuzz::ratelimit::HostRateLimiter::new(args.rate_limit));
         if !args.no_impersonate {
-            eprintln!("[+] TLS impersonation: rotating real-browser JA3/JA4 + HTTP/2 fingerprints");
+            eprintln!(
+                "[+] TLS impersonation: stable real-browser JA3/JA4 + HTTP/2 profile per host"
+            );
         } else {
             eprintln!("[+] TLS impersonation: DISABLED (--no-impersonate)");
         }
@@ -1185,6 +1216,11 @@ async fn main() -> Result<()> {
                 },
                 dry_run: args.backup_dry_run,
                 concurrency: args.threads,
+                request: backup_fuzz::RequestCtx {
+                    limiter: request_limiter.clone(),
+                    extra_headers: extra_headers.clone(),
+                    cookie_header: initial_cookie_header.clone(),
+                },
             };
             eprintln!(
                 "[+] backup discovery: host-derived candidates, auto-tuned per host{}",
@@ -1240,7 +1276,7 @@ async fn main() -> Result<()> {
 
         // Exclude-sizes: parse comma-separated bytes (accept trailing 'B').
         // Empty string = no size filter.
-        let mut exclude_sizes: Vec<i64> = args
+        let exclude_sizes: Vec<i64> = args
             .exclude_sizes
             .split(',')
             .filter_map(|s| {
@@ -1261,6 +1297,8 @@ async fn main() -> Result<()> {
         // edges — a real inconsistency.) Pool is already initialised above via
         // `probe::init_pool`. Redirects off (matches fuzz default — a 3xx root
         // is a finding, not a body to measure).
+        let mut exclude_sizes_by_origin: std::collections::HashMap<String, Vec<i64>> =
+            std::collections::HashMap::new();
         if args.exclude_root_size {
             for h in &hosts {
                 let url = if h.starts_with("http://") || h.starts_with("https://") {
@@ -1268,23 +1306,31 @@ async fn main() -> Result<()> {
                 } else {
                     format!("https://{}", h)
                 };
-                let Some(slot) = probe::pick_pool_slot_for(&url) else {
+                let Some(slot) = probe::pick_pool_slot_for(&fuzz::bare_host(&url)) else {
                     continue;
                 };
-                let mut req = slot
-                    .client
-                    .get(&url)
-                    .redirect(wreq::redirect::Policy::none())
-                    .header("Accept-Language", slot.accept_lang)
-                    .header(
-                        "Accept",
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    );
-                for (n, v) in &extra_headers {
-                    req = req.header(n.as_str(), v.as_str());
-                }
-                match req.send().await {
-                    Ok(resp) => {
+                let response = probe::retry_wreq_pool_once(|| async {
+                    let mut req = slot
+                        .client
+                        .get(&url)
+                        .redirect(wreq::redirect::Policy::none())
+                        .header("Accept-Language", slot.accept_lang)
+                        .header(
+                            "Accept",
+                            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                        );
+                    for (n, v) in &extra_headers {
+                        req = req.header(n.as_str(), v.as_str());
+                    }
+                    if let Some(cookie) = initial_cookie_header.as_deref() {
+                        req = req.header("Cookie", cookie);
+                    }
+                    request_limiter.acquire(&fuzz::bare_host(&url)).await;
+                    req.send().await
+                })
+                .await;
+                match response {
+                    Ok(Ok(resp)) => {
                         if !matches!(resp.status().as_u16(), 200..=399) {
                             continue;
                         }
@@ -1295,22 +1341,29 @@ async fn main() -> Result<()> {
                             .and_then(|s| s.parse::<i64>().ok());
                         let size = match cl {
                             Some(n) => n,
-                            None => match resp.bytes().await {
-                                Ok(b) => b.len() as i64,
+                            None => match probe::read_body_capped(resp, 256 * 1024).await {
+                                Ok(b) if b.len() < 256 * 1024 => b.len() as i64,
                                 Err(_) => -1,
+                                _ => -1,
                             },
                         };
-                        if size > 0 && !exclude_sizes.contains(&size) {
+                        let origin = fuzz::origin_key(&url);
+                        let root_sizes = exclude_sizes_by_origin.entry(origin).or_default();
+                        if size > 0 && !root_sizes.contains(&size) {
                             eprintln!(
-                                "[+] root-size {} → adding {} to --exclude-sizes",
+                                "[+] root-size {} → excluding {} bytes for this origin",
                                 url, size
                             );
-                            exclude_sizes.push(size);
+                            root_sizes.push(size);
                         }
                     }
-                    Err(e) => eprintln!(
+                    Ok(Err(e)) => eprintln!(
                         "[!] root-size probe failed for {}: {} (skipping)",
                         url, e
+                    ),
+                    Err(()) => eprintln!(
+                        "[!] root-size probe exhausted connection-pool retry for {} (skipping)",
+                        url
                     ),
                 }
             }
@@ -1376,7 +1429,7 @@ async fn main() -> Result<()> {
             via_proxy: args.proxy.is_some(),
             threads: args.threads,
             timeout_ms: args.timeout_ms,
-            rate_limit_rps: args.rate_limit,
+            request_limiter: request_limiter.clone(),
             recursion_depth,
             recurse_on_200: args.recurse_on_200,
             recurse_on_403: args.recurse_on_403,
@@ -1392,6 +1445,7 @@ async fn main() -> Result<()> {
             max_links_per_page: args.max_links_per_page,
             scope_hosts,
             exclude_sizes,
+            exclude_sizes_by_origin,
             fuzz_follow_redirects,
             // Honour `--max-redirects` in fuzz mode too (was hardcoded to 10;
             // 10 is also the flag's default, so unchanged unless passed).
@@ -1461,7 +1515,7 @@ async fn main() -> Result<()> {
 
     // 5. DNS resolve everything (A+AAAA+CNAME).
     let resolver = dns::build_resolver(args.dns_timeout);
-    let host_strings: Vec<String> = hosts.iter().map(|h| extract_host(h)).collect();
+    let host_strings: Vec<String> = hosts.iter().map(|h| extract_dns_host(h)).collect();
     eprintln!(
         "[+] resolving {} hosts ({} concurrent)…",
         host_strings.len(),
@@ -1522,7 +1576,8 @@ async fn main() -> Result<()> {
 
     for input in hosts {
         let host = extract_host(&input);
-        let dns_rec = dns_map.get(&host).cloned();
+        let dns_host = extract_dns_host(&input);
+        let dns_rec = dns_map.get(&dns_host).cloned();
         let cdn_table = cdn_table.clone();
         let tech_engine = tech_engine.clone();
         let domain = domain_arc.clone();
@@ -1573,7 +1628,7 @@ async fn main() -> Result<()> {
                 if url_or_host.starts_with("http://") || url_or_host.starts_with("https://") {
                     url_or_host.trim_end_matches('/').to_string()
                 } else {
-                    format!("https://{}", host)
+                    format!("https://{}", url_or_host.trim_end_matches('/'))
                 };
             let (raw_scheme, raw_port, raw_path) = parse_url_parts(&raw_input);
 
@@ -1711,6 +1766,13 @@ async fn main() -> Result<()> {
     }
     out_file.flush()?;
     eprintln!("[+] done: wrote {} records to {}", completed, output_path);
+    let (pool_retries, pool_failures) = probe::wreq_pool_panic_stats();
+    if pool_retries > 0 {
+        eprintln!(
+            "[+] connection-pool resilience: {} probe(s) hit the wreq pool race and were retried; {} still failed after retry",
+            pool_retries, pool_failures
+        );
+    }
     Ok(())
 }
 
@@ -1874,9 +1936,8 @@ mod tests {
         assert_eq!(v["error"], "dns: no records");
     }
 
-    /// extract_host must strip the path, the query, AND the fragment so
-    /// `https://foo.com?x=1` resolves DNS as `foo.com`. Regression for the
-    /// `'?'`/`'#'` cases that the original `.find('/')` missed.
+    /// Endpoint identity strips path/query/fragment but preserves a
+    /// non-default port for resume and output records.
     #[test]
     fn extract_host_strips_path_query_fragment() {
         assert_eq!(extract_host("https://foo.com/bar"), "foo.com");
@@ -1884,7 +1945,43 @@ mod tests {
         assert_eq!(extract_host("https://foo.com#section"), "foo.com");
         assert_eq!(extract_host("https://foo.com?x=1#section"), "foo.com");
         assert_eq!(extract_host("https://foo.com:8080/bar"), "foo.com:8080");
+        assert_eq!(extract_host("foo.com:8080/path"), "foo.com:8080");
+        assert_eq!(extract_host("foo.com:443"), "foo.com");
+        assert_eq!(extract_host("foo.com:80"), "foo.com:80");
         assert_eq!(extract_host("foo.com"), "foo.com");
+    }
+
+    #[test]
+    fn dns_host_strips_ports_without_collapsing_endpoint_identity() {
+        assert_eq!(extract_dns_host("https://foo.com:8080/bar"), "foo.com");
+        assert_eq!(extract_dns_host("foo.com:8443/path"), "foo.com");
+        assert_ne!(
+            extract_host("foo.com:8080"),
+            extract_host("foo.com:8443")
+        );
+    }
+
+    #[test]
+    fn resume_reader_accepts_native_and_httpx_compat_records() {
+        let path = std::env::temp_dir().join(format!(
+            "httpxer-enrich-resume-{}-{}.jsonl",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"subdomain\":\"native.test\"}\n",
+                "{\"host\":\"compat.test\",\"input\":\"compat.test\"}\n",
+                "{\"input\":\"https://input.test:8443/a\"}\n"
+            ),
+        )
+        .unwrap();
+        let hosts = read_existing_subdomains(path.to_str().unwrap());
+        assert!(hosts.contains("native.test"));
+        assert!(hosts.contains("compat.test"));
+        assert!(hosts.contains("input.test:8443"));
+        let _ = std::fs::remove_file(path);
     }
 
     /// `banner_should_show_early` suppresses on suppression flags, lets

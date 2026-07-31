@@ -59,6 +59,9 @@ const L1B_TOKEN_PREFIX_BYTES: usize = 2048;
 /// IDs in error bodies without over-suppressing real findings).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WildcardSig {
+    /// Status code observed for every sample that formed this signature.
+    /// A 302 shell must never suppress a byte-identical 200 endpoint.
+    pub status: u16,
     pub content_length: i64,
     pub content_type: String,
     pub snippet_md5: String,
@@ -74,7 +77,8 @@ pub struct WildcardSig {
     pub tolerance: i64,
     /// **Layer 1b (content-aware catchall)** — md5 of the *normalized* body
     /// (`normalize_snippet`): volatile tokens (UUIDs, long hex/number runs,
-    /// timestamps) blanked, whitespace collapsed. Set when the server returns
+    /// timestamps) blanked and whitespace collapsed across the first 2 KiB.
+    /// Set when the server returns
     /// a near-constant-size body that differs only in a per-request nonce.
     /// Empty for L1 / L2 sigs. When non-empty (and `snippet_md5` empty,
     /// `k` None), runtime matching is by normalized CONTENT — never size-only
@@ -84,8 +88,20 @@ pub struct WildcardSig {
 
 impl WildcardSig {
     /// Backwards-compat constructor — Layer 1 only, default tolerance.
+    #[cfg(test)]
     pub fn layer1(content_length: i64, content_type: String, snippet_md5: String) -> Self {
+        Self::layer1_with_status(200, content_length, content_type, snippet_md5)
+    }
+
+    #[cfg(test)]
+    pub fn layer1_with_status(
+        status: u16,
+        content_length: i64,
+        content_type: String,
+        snippet_md5: String,
+    ) -> Self {
         Self {
+            status,
             content_length,
             content_type,
             snippet_md5,
@@ -100,7 +116,8 @@ impl WildcardSig {
     /// shared by both `WildcardMap::matches_body` (host-level) and the
     /// per-directory catchall cache (v0.4.6): Layer 1b matches by NORMALIZED
     /// body only (never size-only, so a real same-size page survives); Layer 1
-    /// by exact md5 + CL tolerance (or any CL when `content_length < 0`);
+    /// by exact md5 + CL tolerance; wide-drift shells use the normalized 2 KiB
+    /// body shape with no content-length constraint;
     /// Layer 2 by the path-echo formula `CL ≈ k × path_len + base`.
     pub fn matches_probe(
         &self,
@@ -120,8 +137,7 @@ impl WildcardSig {
                 && md5_hex(&normalize_snippet(raw_body)) == self.normalized_snippet_md5;
         }
 
-        // Layer 1 — static catchall (CT + exact md5; CL within tolerance, or
-        // any CL when content_length < 0 = app-shell fallback).
+        // Layer 1 — static catchall (CT + exact md5; CL within tolerance).
         if !self.snippet_md5.is_empty() && self.content_type == ct && self.snippet_md5 == md5 {
             if self.content_length < 0 {
                 return true;
@@ -162,7 +178,7 @@ pub struct ProbeSample {
 
 /// Normalize a response body for content-aware catchall fingerprinting:
 /// blank out per-request volatile tokens (UUIDs, long hex/number runs,
-/// ISO timestamps) and collapse whitespace, then keep the first 200 chars.
+/// ISO timestamps) and collapse whitespace across the first 2 KiB.
 /// Two catchall responses that differ ONLY in a nonce normalize to the same
 /// string; two genuinely different pages do not. Conservative by design —
 /// these patterns are essentially absent from real HTML/JSON body prefixes
@@ -189,12 +205,13 @@ pub(crate) fn normalize_snippet(body: &str) -> String {
     for re in res.iter() {
         s = re.replace_all(&s, "\u{1}").into_owned();
     }
-    // Collapse whitespace, then keep the first 200 chars of the normalized text.
+    // Retain enough normalized structure to distinguish pages that share a
+    // common HTML head but diverge in their actual content.
     s.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
-        .take(200)
+        .take(L1B_TOKEN_PREFIX_BYTES)
         .collect()
 }
 
@@ -257,10 +274,12 @@ fn base_input_key(s: &str) -> String {
 
 /// Backwards-compat helper — pure Layer 1 (static catchall) agreement
 /// check. Use `detect()` for the layered v0.3.9 detector.
+#[cfg(test)]
 pub fn agreed_from_samples(samples: &[WildcardSig]) -> Option<WildcardSig> {
     let first = samples.first()?.clone();
     if samples.iter().all(|s| {
-        s.content_length == first.content_length
+        s.status == first.status
+            && s.content_length == first.content_length
             && s.content_type == first.content_type
             && s.snippet_md5 == first.snippet_md5
     }) {
@@ -286,10 +305,16 @@ pub fn agreed_from_samples(samples: &[WildcardSig]) -> Option<WildcardSig> {
 /// `tolerance` (typical: 10) absorbs timestamp / request-ID jitter that
 /// would otherwise defeat exact-match agreement.
 pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
-    if samples.is_empty() {
+    // One response is not evidence of a catchall. Requiring two independent
+    // paths prevents a legitimate random-looking endpoint from becoming a
+    // host-wide suppression rule.
+    if samples.len() < 2 {
         return None;
     }
     let first = &samples[0];
+    if !samples.iter().all(|s| s.status == first.status) {
+        return None;
+    }
 
     // ── Layer 1: static catchall (allow learned CL tolerance for jitter). ─────
     let same_ct_and_prefix = samples
@@ -307,7 +332,7 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
             .max()
             .unwrap_or(first.content_length);
         let spread = max_cl - min_cl;
-        let (content_length, learned_tolerance) = if spread <= MAX_DYNAMIC_LAYER1_TOLERANCE {
+        if spread <= MAX_DYNAMIC_LAYER1_TOLERANCE {
             let learned_tolerance = if spread <= tolerance {
                 tolerance
             } else {
@@ -315,23 +340,42 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
             };
             // Store the midpoint so runtime matching covers both sides of the
             // learned range with one tolerance value.
-            (min_cl + spread / 2, learned_tolerance)
-        } else {
-            // App-shell fallback: random paths agree on the first body chunk
-            // but carry large request-specific payload differences later in
-            // the body. In this mode, matching is CT + first-body fingerprint
-            // only; content length is intentionally ignored at runtime.
-            (-1, 0)
-        };
-        return Some(WildcardSig {
-            content_length,
-            content_type: first.content_type.clone(),
-            snippet_md5: first.snippet_md5.clone(),
-            k: None,
-            base: None,
-            tolerance: learned_tolerance,
-            normalized_snippet_md5: String::new(),
-        });
+            return Some(WildcardSig {
+                status: first.status,
+                content_length: min_cl + spread / 2,
+                content_type: first.content_type.clone(),
+                snippet_md5: first.snippet_md5.clone(),
+                k: None,
+                base: None,
+                tolerance: learned_tolerance,
+                normalized_snippet_md5: String::new(),
+            });
+        }
+
+        // Wide-drift app-shell fallback. Sharing only body[:200] is not enough:
+        // unrelated pages often have the same HTML head. Require the normalized
+        // first 2 KiB and raw token shape to agree, then use that same shape at
+        // runtime while intentionally ignoring content length.
+        if samples.iter().all(|sample| !sample.raw_body.is_empty()) {
+            let normalized: Vec<String> = samples
+                .iter()
+                .map(|sample| md5_hex(&normalize_snippet(&sample.raw_body)))
+                .collect();
+            if normalized.iter().all(|hash| *hash == normalized[0])
+                && min_pairwise_token_ratio(samples) >= L1B_TOKEN_RATIO_MIN
+            {
+                return Some(WildcardSig {
+                    status: first.status,
+                    content_length: -1,
+                    content_type: first.content_type.clone(),
+                    snippet_md5: String::new(),
+                    k: None,
+                    base: None,
+                    tolerance: 0,
+                    normalized_snippet_md5: normalized[0].clone(),
+                });
+            }
+        }
     }
 
     // ── Layer 1b (content-aware): same CT + bounded CL spread, body varies
@@ -377,6 +421,7 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
                     spread.saturating_add(DYNAMIC_LAYER1_SLACK)
                 };
                 return Some(WildcardSig {
+                    status: first.status,
                     content_length: min_cl + spread / 2,
                     content_type: first.content_type.clone(),
                     snippet_md5: String::new(),
@@ -390,8 +435,9 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
     }
 
     // ── Layer 2: linear CL = k × path_len + base. ─────────────────────
-    // Need at least 2 samples with DIFFERENT path_lens to compute slope.
-    if samples.len() < 2 {
+    // Two points always define a line, so they cannot validate a path-echo
+    // model. Require a third independent path to reject coincidental slopes.
+    if samples.len() < 3 {
         return None;
     }
     let same_ct = samples.iter().all(|s| s.content_type == first.content_type);
@@ -425,6 +471,7 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
         }
     }
     Some(WildcardSig {
+        status: first.status,
         content_length: -1,
         content_type: first.content_type.clone(),
         snippet_md5: String::new(),
@@ -479,12 +526,12 @@ impl AuthCatchall {
 /// pre-flight then handed out to workers as `Arc<WildcardMap>`.
 #[derive(Debug, Default)]
 pub struct WildcardMap {
-    inner: HashMap<String, WildcardSig>,
+    inner: HashMap<String, Vec<WildcardSig>>,
     /// host → blanket `401`/`403` fingerprint. Separate from `inner` because
     /// it suppresses *recursion targets*, not findings: an auth-catchall host
     /// still emits and probes normally, it just stops manufacturing phantom
     /// directories. See [`AuthCatchall`].
-    auth: HashMap<String, AuthCatchall>,
+    auth: HashMap<String, Vec<AuthCatchall>>,
 }
 
 impl WildcardMap {
@@ -496,12 +543,15 @@ impl WildcardMap {
     }
 
     pub fn insert(&mut self, host: String, sig: WildcardSig) {
-        self.inner.insert(host, sig);
+        let sigs = self.inner.entry(host).or_default();
+        if !sigs.contains(&sig) {
+            sigs.push(sig);
+        }
     }
 
     #[allow(dead_code)]
-    pub fn get(&self, host: &str) -> Option<&WildcardSig> {
-        self.inner.get(host)
+    pub fn get(&self, host: &str) -> Option<&[WildcardSig]> {
+        self.inner.get(host).map(Vec::as_slice)
     }
 
     /// Back-compat wrapper — matching without the response body. Cannot fire
@@ -510,7 +560,7 @@ impl WildcardMap {
     /// only exercise Layer 1 (exact md5) and Layer 2 (formula).
     #[allow(dead_code)]
     pub fn matches(&self, host: &str, cl: i64, ct: &str, md5: &str, probe_path_len: usize) -> bool {
-        self.matches_body(host, cl, ct, md5, probe_path_len, "")
+        self.matches_body(host, 200, cl, ct, md5, probe_path_len, "")
     }
 
     /// True if this probe matches the recorded wildcard signature for this
@@ -521,35 +571,54 @@ impl WildcardMap {
     pub fn matches_body(
         &self,
         host: &str,
+        status: u16,
         cl: i64,
         ct: &str,
         md5: &str,
         probe_path_len: usize,
         raw_body: &str,
     ) -> bool {
-        // Exact key first; then fall back to the base scheme://authority key.
-        // Recursion passes a DISCOVERED DIR URL (e.g. https://x.com/api) as the
-        // host, but the round-0 fingerprint is stored under the base input
-        // (https://x.com) — without this fallback the host catchall wouldn't be
-        // suppressed under recursed dirs (catchall junk would leak). v0.4.5.
-        let sig = match self.inner.get(host) {
-            Some(s) => s,
-            None => {
-                let base = base_input_key(host);
-                match self.inner.get(&base) {
-                    Some(s) => s,
-                    None => return false,
-                }
-            }
+        let Some((_, sigs)) = self.lookup(&self.inner, host) else {
+            return false;
         };
-        // Per-sig content-aware match (shared with the per-directory catchall
-        // cache in fuzz.rs). Layers L1b / L1 / L2 in order.
-        sig.matches_probe(cl, ct, md5, probe_path_len, raw_body)
+        sigs.iter().any(|sig| {
+            sig.status == status && sig.matches_probe(cl, ct, md5, probe_path_len, raw_body)
+        })
+    }
+
+    /// Match using the complete response URL. The path length for Layer 2 is
+    /// derived relative to the actual pre-flight scope key, including when a
+    /// recursive probe is several directories below that key.
+    pub fn matches_url_body(
+        &self,
+        host: &str,
+        url: &str,
+        status: u16,
+        cl: i64,
+        ct: &str,
+        md5: &str,
+        raw_body: &str,
+    ) -> bool {
+        let Some((scope, sigs)) = self.lookup(&self.inner, host) else {
+            return false;
+        };
+        let relative = url.strip_prefix(scope).unwrap_or(url);
+        let path = relative
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(relative);
+        let path_len = decoded_path_len(path);
+        sigs.iter().any(|sig| {
+            sig.status == status && sig.matches_probe(cl, ct, md5, path_len, raw_body)
+        })
     }
 
     /// Record this host's blanket `401`/`403` fingerprint (see [`AuthCatchall`]).
     pub fn insert_auth(&mut self, host: String, sig: AuthCatchall) {
-        self.auth.insert(host, sig);
+        let sigs = self.auth.entry(host).or_default();
+        if !sigs.contains(&sig) {
+            sigs.push(sig);
+        }
     }
 
     /// True if this `401`/`403` is indistinguishable from what the host
@@ -563,25 +632,70 @@ impl WildcardMap {
         if !matches!(status, 401 | 403) {
             return false;
         }
-        let sig = match self.auth.get(host) {
-            Some(s) => s,
-            None => match self.auth.get(&base_input_key(host)) {
-                Some(s) => s,
-                None => return false,
-            },
+        let Some((_, sigs)) = self.lookup(&self.auth, host) else {
+            return false;
         };
-        sig.matches(status, cl, ct, md5)
+        sigs.iter().any(|sig| sig.matches(status, cl, ct, md5))
     }
 
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.inner.values().map(Vec::len).sum()
     }
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+
+    fn lookup<'a, T>(
+        &'a self,
+        map: &'a HashMap<String, Vec<T>>,
+        host: &str,
+    ) -> Option<(&'a str, &'a [T])> {
+        if let Some(values) = map.get(host) {
+            return Some((host_key(map, host)?, values.as_slice()));
+        }
+        map.iter()
+            .filter(|(scope, _)| scope_contains(scope, host))
+            .max_by_key(|(scope, _)| scope.len())
+            .map(|(scope, values)| (scope.as_str(), values.as_slice()))
+            .or_else(|| {
+                let base = base_input_key(host);
+                map.get_key_value(&base)
+                    .map(|(scope, values)| (scope.as_str(), values.as_slice()))
+            })
+    }
+}
+
+fn host_key<'a, T>(map: &'a HashMap<String, Vec<T>>, key: &str) -> Option<&'a str> {
+    map.get_key_value(key).map(|(stored, _)| stored.as_str())
+}
+
+fn scope_contains(scope: &str, candidate: &str) -> bool {
+    let Some(rest) = candidate.strip_prefix(scope) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('/') || rest.starts_with('?') || rest.starts_with('#')
+}
+
+fn decoded_path_len(path: &str) -> usize {
+    let bytes = path.as_bytes();
+    let mut len = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            i += 3;
+        } else {
+            i += 1;
+        }
+        len += 1;
+    }
+    len
 }
 
 #[cfg(test)]
@@ -710,6 +824,15 @@ mod tests {
         assert_eq!(sig.content_type, "text/html");
     }
 
+    #[test]
+    fn detect_layer2_rejects_two_point_coincidence() {
+        let samples = vec![
+            s(251, "text/html", "md5-A", 17),
+            s(299, "text/html", "md5-B", 33),
+        ];
+        assert!(detect(&samples, 10).is_none());
+    }
+
     /// Same as above but with ±2 bytes per-sample jitter (e.g. timestamp
     /// fluctuation in error body). Should still detect K=3.
     #[test]
@@ -766,36 +889,52 @@ mod tests {
         ));
     }
 
-    /// App-shell fallback: a shared prefix with very large size spread is still
-    /// a wildcard when the samples came from random paths. Content length is
-    /// too noisy to use, so runtime matching falls back to CT + first-body hash.
+    /// App-shell fallback: wide size drift is accepted only when the normalized
+    /// 2 KiB body shape agrees, not merely the first 200-byte digest.
     #[test]
-    fn detect_layer1_ignores_length_for_wide_same_prefix_spread() {
+    fn detect_wide_drift_requires_matching_body_shape() {
+        let shell = "<html><head>shared header</head><body>same application shell</body></html>";
         let samples = vec![
-            s(49_189, "text/html; charset=utf-8", "same-prefix", 17),
-            s(55_523, "text/html; charset=utf-8", "same-prefix", 33),
-            s(55_785, "text/html; charset=utf-8", "same-prefix", 65),
+            sb(49_189, "text/html; charset=utf-8", "same-prefix", 17, shell),
+            sb(55_523, "text/html; charset=utf-8", "same-prefix", 33, shell),
+            sb(55_785, "text/html; charset=utf-8", "same-prefix", 65, shell),
         ];
         let sig = detect(&samples, 10).expect("same-prefix app shell is a wildcard");
         assert_eq!(sig.content_length, -1, "wide drift must ignore CL");
         assert_eq!(sig.tolerance, 0);
+        assert!(sig.snippet_md5.is_empty());
+        assert!(!sig.normalized_snippet_md5.is_empty());
 
         let mut m = WildcardMap::new();
         m.insert("x.com".into(), sig);
-        assert!(m.matches(
+        assert!(m.matches_body(
             "x.com",
+            200,
             120_000,
             "text/html; charset=utf-8",
             "same-prefix",
             128,
+            shell,
         ));
-        assert!(!m.matches(
+        assert!(!m.matches_body(
             "x.com",
+            200,
             120_000,
             "text/html; charset=utf-8",
-            "different-prefix",
+            "same-prefix",
             128,
+            "<html><head>shared header</head><body>real admin dashboard</body></html>",
         ));
+    }
+
+    #[test]
+    fn detect_wide_drift_rejects_common_prefix_only() {
+        let samples = vec![
+            sb(49_189, "text/html", "same-prefix", 17, "common head page one"),
+            sb(55_523, "text/html", "same-prefix", 33, "common head page two"),
+            sb(55_785, "text/html", "same-prefix", 65, "common head page three"),
+        ];
+        assert!(detect(&samples, 10).is_none());
     }
 
     /// Truly path-sensitive server — neither layer fits → None.
@@ -818,6 +957,7 @@ mod tests {
         m.insert(
             "x.com".into(),
             WildcardSig {
+                status: 200,
                 content_length: -1,
                 content_type: "text/html".into(),
                 snippet_md5: String::new(),
@@ -844,6 +984,7 @@ mod tests {
         m.insert(
             "x.com".into(),
             WildcardSig {
+                status: 200,
                 content_length: -1,
                 content_type: "text/html".into(),
                 snippet_md5: String::new(),
@@ -1024,17 +1165,17 @@ mod tests {
         m.insert("x.com".into(), sig);
         // Same catchall template, brand-new nonce → suppressed.
         assert!(m.matches_body(
-            "x.com", 393, "text/html", "z", 7,
+            "x.com", 200, 393, "text/html", "z", 7,
             &body("99998888777766665555444433332222"),
         ));
         // Real same-size page, genuinely different content → NOT suppressed.
         assert!(!m.matches_body(
-            "x.com", 393, "text/html", "z", 7,
+            "x.com", 200, 393, "text/html", "z", 7,
             "<html><body><h1>Welcome admin</h1><p>secret internal dashboard here</p></body></html>",
         ));
         // Wrong CT → not suppressed.
         assert!(!m.matches_body(
-            "x.com", 393, "application/json", "z", 7,
+            "x.com", 200, 393, "application/json", "z", 7,
             &body("1111222233334444aaaabbbbccccdddd"),
         ));
     }
@@ -1063,6 +1204,67 @@ mod tests {
         ];
         let sig = detect(&samples, 10).unwrap();
         assert_eq!(sig.snippet_md5, "same-md5", "L1 wins when md5 agrees");
+    }
+
+    #[test]
+    fn detect_rejects_mixed_status_samples() {
+        let mut samples = vec![
+            s(393, "text/html", "same", 17),
+            s(393, "text/html", "same", 33),
+        ];
+        samples[1].status = 302;
+        assert!(detect(&samples, 10).is_none());
+    }
+
+    #[test]
+    fn map_keeps_multiple_families_and_matches_status() {
+        let mut map = WildcardMap::new();
+        map.insert(
+            "https://x.com".into(),
+            WildcardSig::layer1_with_status(200, 100, "text/html".into(), "html".into()),
+        );
+        map.insert(
+            "https://x.com".into(),
+            WildcardSig::layer1_with_status(302, 20, "text/plain".into(), "redirect".into()),
+        );
+        assert_eq!(map.len(), 2);
+        assert!(map.matches_body(
+            "https://x.com", 200, 100, "text/html", "html", 4, ""
+        ));
+        assert!(map.matches_body(
+            "https://x.com", 302, 20, "text/plain", "redirect", 4, ""
+        ));
+        assert!(!map.matches_body(
+            "https://x.com", 200, 20, "text/plain", "redirect", 4, ""
+        ));
+    }
+
+    #[test]
+    fn recursive_url_uses_longest_scope_for_layer2_length() {
+        let mut map = WildcardMap::new();
+        map.insert(
+            "https://x.com/api".into(),
+            WildcardSig {
+                status: 200,
+                content_length: -1,
+                content_type: "text/plain".into(),
+                snippet_md5: String::new(),
+                k: Some(1),
+                base: Some(20),
+                tolerance: 0,
+                normalized_snippet_md5: String::new(),
+            },
+        );
+        // Relative to /api, the recursive path is /blocked/child (14 bytes).
+        assert!(map.matches_url_body(
+            "https://x.com/api/blocked",
+            "https://x.com/api/blocked/child",
+            200,
+            34,
+            "text/plain",
+            "unused",
+            ""
+        ));
     }
 
     /// Content-aware L1b must NOT fire when CL spread is too wide (>256):

@@ -28,6 +28,7 @@
 use crate::probe;
 use serde::Serialize;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 // ───────────────────────────── extension matrix ─────────────────────────────
 // Class 1 - archive containers.
@@ -226,7 +227,7 @@ pub fn join_url(base: &str, entry: &str) -> Result<String, String> {
 pub fn derive_tokens(host: &str, path_segment: Option<&str>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut push = |t: String, out: &mut Vec<String>, seen: &mut HashSet<String>| {
+    let push = |t: String, out: &mut Vec<String>, seen: &mut HashSet<String>| {
         let t = t.trim_matches('.').to_ascii_lowercase();
         if !t.is_empty() && seen.insert(t.clone()) {
             out.push(t);
@@ -456,7 +457,7 @@ pub fn generate_candidates(host: &str, path_segment: Option<&str>, cfg: &BackupC
     }
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut push = |c: String, out: &mut Vec<String>, seen: &mut HashSet<String>| {
+    let push = |c: String, out: &mut Vec<String>, seen: &mut HashSet<String>| {
         if out.len() < cfg.max_perms && seen.insert(c.clone()) {
             out.push(c);
         }
@@ -522,6 +523,18 @@ pub fn with_backup_dirs(candidates: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+fn merge_backup_dir_candidates(mut candidates: Vec<String>, max_perms: usize) -> Vec<String> {
+    if max_perms == 0 || candidates.is_empty() {
+        return Vec::new();
+    }
+    let expanded = with_backup_dirs(&candidates);
+    let reserve = expanded.len().min((max_perms / 4).max(1));
+    candidates.truncate(max_perms.saturating_sub(reserve));
+    candidates.extend(expanded.into_iter().take(reserve));
+    candidates.truncate(max_perms);
+    candidates
 }
 
 // ──────────────────────────────── detection ────────────────────────────────
@@ -706,11 +719,9 @@ pub fn classify(ev: &Evidence) -> (Verdict, f64, Option<&'static str>, bool) {
 
 /// Hex sha256 of the first bytes, used for cross-candidate dedup.
 pub fn first_bytes_sha256(body: &[u8]) -> String {
-    use md5::Digest;
-    // The pool already depends on md-5; a 128-bit digest is ample for dedup
-    // of identical soft-404 bodies and keeps the dependency surface flat.
+    use sha2::Digest;
     let head = &body[..body.len().min(1024)];
-    let mut h = md5::Md5::new();
+    let mut h = sha2::Sha256::new();
     h.update(head);
     hex::encode(h.finalize())
 }
@@ -728,17 +739,21 @@ pub async fn probe_candidate(
     candidate: &str,
     baseline: Option<&[u8]>,
     magic_verify: bool,
+    request: &RequestCtx,
 ) -> Option<BackupFinding> {
     let slot = probe::pick_pool_slot_for(host_key)?;
 
     // Step 1 - HEAD. Redirects are never followed: a 302 to a login page is
     // not a finding.
-    let head_resp = slot
-        .client
-        .head(url)
-        .redirect(wreq::redirect::Policy::none())
-        .send()
-        .await;
+    gate_request(request, url).await;
+    let head_resp = apply_request_ctx(
+        slot.client
+            .head(url)
+            .redirect(wreq::redirect::Policy::none()),
+        request,
+    )
+    .send()
+    .await;
 
     let (mut status, mut content_length, mut content_type, mut method) = match head_resp {
         Ok(r) => {
@@ -765,13 +780,16 @@ pub async fn probe_candidate(
     // Step 2 - ranged GET for the signature bytes only.
     let mut body_head: Vec<u8> = Vec::new();
     if magic_verify || head_unusable {
-        let get_resp = slot
-            .client
-            .get(url)
-            .redirect(wreq::redirect::Policy::none())
-            .header("Range", "bytes=0-1023")
-            .send()
-            .await;
+        gate_request(request, url).await;
+        let get_resp = apply_request_ctx(
+            slot.client
+                .get(url)
+                .redirect(wreq::redirect::Policy::none())
+                .header("Range", "bytes=0-1023"),
+            request,
+        )
+        .send()
+        .await;
         if let Ok(r) = get_resp {
             status = r.status().as_u16();
             if content_length.is_none() {
@@ -785,9 +803,8 @@ pub async fn probe_candidate(
                     .map(|s| s.to_string());
             }
             method = "GET(range)".to_string();
-            if let Ok(b) = r.bytes().await {
-                body_head = b.to_vec();
-                body_head.truncate(1024);
+            if let Ok(b) = probe::read_body_capped(r, 1024).await {
+                body_head = b;
             }
         }
     }
@@ -852,25 +869,63 @@ pub struct PhaseOpts {
     pub cfg: BackupCfg,
     pub dry_run: bool,
     pub concurrency: usize,
+    pub request: RequestCtx,
+}
+
+#[derive(Clone)]
+pub struct RequestCtx {
+    pub limiter: Arc<crate::fuzz::ratelimit::HostRateLimiter>,
+    pub extra_headers: Vec<(String, String)>,
+    pub cookie_header: Option<String>,
+}
+
+fn request_host_key(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    let Some(host) = parsed.host_str() else {
+        return url.to_string();
+    };
+    match parsed.port() {
+        Some(port) => format!("{}:{}", host, port),
+        None => host.to_string(),
+    }
+}
+
+async fn gate_request(ctx: &RequestCtx, url: &str) {
+    ctx.limiter.acquire(&request_host_key(url)).await;
+}
+
+fn apply_request_ctx(mut req: wreq::RequestBuilder, ctx: &RequestCtx) -> wreq::RequestBuilder {
+    for (name, value) in &ctx.extra_headers {
+        req = req.header(name.as_str(), value.as_str());
+    }
+    if let Some(cookie) = &ctx.cookie_header {
+        req = req.header("Cookie", cookie.as_str());
+    }
+    req
 }
 
 /// One request against the live base URL to learn the stack and how fast the
 /// host answers. Both feed automatic decisions: stack picks the extension
 /// ordering, latency scales the candidate cap so a slow or rate-limiting
 /// host gets probed less aggressively than a fast one.
-async fn profile_host(base: &str, host_key: &str) -> (Stack, usize) {
+async fn profile_host(base: &str, host_key: &str, request: &RequestCtx) -> (Stack, usize) {
     let started = std::time::Instant::now();
     let slot = match probe::pick_pool_slot_for(host_key) {
         Some(s) => s,
         None => return (Stack::Unknown, 120),
     };
-    let resp = slot
-        .client
-        .get(base)
-        .redirect(wreq::redirect::Policy::none())
-        .header("Range", "bytes=0-2047")
-        .send()
-        .await;
+    gate_request(request, base).await;
+    let resp = apply_request_ctx(
+        slot.client
+            .get(base)
+            .redirect(wreq::redirect::Policy::none())
+            .header("Range", "bytes=0-2047"),
+        request,
+    )
+    .send()
+    .await;
 
     let (stack, ok) = match resp {
         Ok(r) => {
@@ -880,7 +935,7 @@ async fn profile_host(base: &str, host_key: &str) -> (Stack, usize) {
                 .get("x-powered-by")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
-            let body = r.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+            let body = probe::read_body_capped(r, 2048).await.unwrap_or_default();
             (stack_from_signals(server.as_deref(), powered.as_deref(), &body), true)
         }
         Err(_) => (Stack::Unknown, false),
@@ -907,16 +962,19 @@ async fn profile_host(base: &str, host_key: &str) -> (Stack, usize) {
 /// Probe two sentinel directories. The other prefixes are only worth
 /// expanding into when a host demonstrably exposes a backup directory, so
 /// this costs 2 requests instead of a flag the user has to guess at.
-async fn backup_dir_exists(root: &str, host_key: &str) -> bool {
+async fn backup_dir_exists(root: &str, host_key: &str, request: &RequestCtx) -> bool {
     for probe_dir in ["backup/", "bak/"] {
         if let Ok(u) = join_url(root, probe_dir) {
             if let Some(slot) = probe::pick_pool_slot_for(host_key) {
-                if let Ok(r) = slot
-                    .client
-                    .head(&u)
-                    .redirect(wreq::redirect::Policy::none())
-                    .send()
-                    .await
+                gate_request(request, &u).await;
+                if let Ok(r) = apply_request_ctx(
+                    slot.client
+                        .head(&u)
+                        .redirect(wreq::redirect::Policy::none()),
+                    request,
+                )
+                .send()
+                .await
                 {
                     let s = r.status().as_u16();
                     // 200 = listing, 403 = exists but denied. Both prove the
@@ -931,6 +989,23 @@ async fn backup_dir_exists(root: &str, host_key: &str) -> bool {
     false
 }
 
+async fn baseline_sample(url: &str, host_key: &str, request: &RequestCtx) -> Option<Vec<u8>> {
+    let slot = probe::pick_pool_slot_for(host_key)?;
+    gate_request(request, url).await;
+    let response = apply_request_ctx(
+        slot.client
+            .get(url)
+            .redirect(wreq::redirect::Policy::none())
+            .header("Range", "bytes=0-1023"),
+        request,
+    )
+    .send()
+    .await
+    .ok()?;
+    let body = probe::read_body_capped(response, 1024).await.ok()?;
+    (!body.is_empty()).then_some(body)
+}
+
 /// Run host-derived backup discovery across `hosts`.
 ///
 /// Returns the findings that survived the verdict gate. Nothing here touches
@@ -940,7 +1015,7 @@ pub async fn run_phase(hosts: &[String], opts: &PhaseOpts) -> Vec<BackupFinding>
     use futures::stream::{FuturesUnordered, StreamExt};
 
     let mut findings: Vec<BackupFinding> = Vec::new();
-    let mut dedup: HashSet<String> = HashSet::new();
+    let mut emitted_urls: HashSet<String> = HashSet::new();
 
     for raw_host in hosts {
         let bases = match normalize_base(raw_host) {
@@ -968,7 +1043,11 @@ pub async fn run_phase(hosts: &[String], opts: &PhaseOpts) -> Vec<BackupFinding>
         // a dry run so previewing candidates never touches the network.
         let mut cfg = opts.cfg.clone();
         if !opts.dry_run {
-            let (stack, cap) = profile_host(&bases.root, &host_only).await;
+            let (stack, cap) = probe::retry_wreq_pool_once(|| {
+                profile_host(&bases.root, &host_only, &opts.request)
+            })
+            .await
+            .unwrap_or((Stack::Unknown, 60));
             cfg.stack = stack;
             cfg.max_perms = cap.min(MAX_PERMS_CEILING);
             eprintln!(
@@ -979,10 +1058,18 @@ pub async fn run_phase(hosts: &[String], opts: &PhaseOpts) -> Vec<BackupFinding>
 
         let mut candidates = generate_candidates(&host_only, seg.as_deref(), &cfg);
         // Expand into backup directories only when the host actually has one.
-        if !opts.dry_run && backup_dir_exists(&bases.root, &host_only).await {
+        let backup_dir_detected = if opts.dry_run {
+            false
+        } else {
+            probe::retry_wreq_pool_once(|| {
+                backup_dir_exists(&bases.root, &host_only, &opts.request)
+            })
+            .await
+            .unwrap_or(false)
+        };
+        if backup_dir_detected {
             eprintln!("  [backup] {} exposes a backup directory - expanding", host_only);
-            candidates.extend(with_backup_dirs(&candidates));
-            candidates.truncate(cfg.max_perms);
+            candidates = merge_backup_dir_candidates(candidates, cfg.max_perms);
         }
 
         // Both bases always, deduped when identical. There is no reason to
@@ -1016,24 +1103,14 @@ pub async fn run_phase(hosts: &[String], opts: &PhaseOpts) -> Vec<BackupFinding>
                 "zzz-nonexistent-g7h8i9.tar.gz",
             ] {
                 if let Ok(u) = join_url(&bases.root, probe_name) {
-                    if let Some(slot) = probe::pick_pool_slot_for(&host_only) {
-                        if let Ok(r) = slot
-                            .client
-                            .get(&u)
-                            .redirect(wreq::redirect::Policy::none())
-                            .header("Range", "bytes=0-1023")
-                            .send()
-                            .await
-                        {
-                            if let Ok(b) = r.bytes().await {
-                                let mut v = b.to_vec();
-                                v.truncate(1024);
-                                if !v.is_empty() {
-                                    sample = Some(v);
-                                    break;
-                                }
-                            }
-                        }
+                    if let Some(value) = probe::retry_wreq_pool_once(|| {
+                        baseline_sample(&u, &host_only, &opts.request)
+                    })
+                    .await
+                    .unwrap_or(None)
+                    {
+                        sample = Some(value);
+                        break;
                     }
                 }
             }
@@ -1059,11 +1136,25 @@ pub async fn run_phase(hosts: &[String], opts: &PhaseOpts) -> Vec<BackupFinding>
             let hk = host_only.clone();
             let ho = host_only.clone();
             let bl = baseline.clone();
+            let request = opts.request.clone();
             Box::pin(async move {
                 // Magic-byte verification is unconditional: it is the single
                 // check that separates a real archive from an HTML soft-404
                 // served with 200, so it is not something to make optional.
-                probe_candidate(&u, &hk, &bt, &ho, &c, bl.as_deref(), true).await
+                probe::retry_wreq_pool_once(|| {
+                    probe_candidate(
+                        &u,
+                        &hk,
+                        &bt,
+                        &ho,
+                        &c,
+                        bl.as_deref(),
+                        true,
+                        &request,
+                    )
+                })
+                .await
+                .unwrap_or(None)
             })
         };
 
@@ -1075,8 +1166,9 @@ pub async fn run_phase(hosts: &[String], opts: &PhaseOpts) -> Vec<BackupFinding>
         }
         while let Some(res) = inflight.next().await {
             if let Some(f) = res {
-                // Collapse identical bodies across candidates into one finding.
-                if dedup.insert(f.first_bytes_sha256.clone()) {
+                // Distinct URLs are distinct findings even when their first
+                // archive block is identical. Only collapse duplicate joins.
+                if emitted_urls.insert(f.url.clone()) {
                     findings.push(f);
                 }
             }
@@ -1340,6 +1432,32 @@ mod tests {
         let cfg = BackupCfg { max_perms: 25, ..Default::default() };
         let c = generate_candidates("www.abc.com", None, &cfg);
         assert_eq!(c.len(), 25);
+    }
+
+    #[test]
+    fn backup_directory_expansion_survives_the_candidate_cap() {
+        let cfg = BackupCfg { max_perms: 25, ..Default::default() };
+        let base = generate_candidates("www.abc.com", None, &cfg);
+        assert_eq!(base.len(), 25);
+        let merged = merge_backup_dir_candidates(base, 25);
+        assert_eq!(merged.len(), 25);
+        assert!(
+            merged.iter().any(|candidate| {
+                BACKUP_DIRS
+                    .iter()
+                    .any(|dir| candidate.starts_with(&format!("{}/", dir)))
+            }),
+            "at least one verified backup-directory candidate must remain"
+        );
+    }
+
+    #[test]
+    fn first_bytes_sha256_is_really_sha256() {
+        assert_eq!(
+            first_bytes_sha256(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(first_bytes_sha256(b"archive").len(), 64);
     }
 
     #[test]
