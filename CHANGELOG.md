@@ -2,6 +2,19 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.6.9] — 2026-08-01
+
+### Fixed
+- Response-aware recursion now rejects file-like paths and common `/.well-known/` leaf resources even when a server normalizes them with an exact trailing-slash redirect.
+- `--recurse-on-200` now requires directory evidence and no longer expands attachments, terminal/static MIME responses, or generic non-slash `200` pages.
+- Real hidden directories, ACME challenge prefixes, dotted version directories, autoindexes, and header-confirmed directories remain eligible for recursion.
+
+### Changed
+- Directory classification reuses the response already collected by the fuzz probe, adding no network requests to the scan.
+
+### Verified
+- The full locked test suite, optimized release build, and a wire-level recursion fixture passed before release.
+
 ## [0.6.8] — 2026-08-01
 
 ### Fixed

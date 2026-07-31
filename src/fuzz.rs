@@ -2948,9 +2948,13 @@ async fn run_probe(
                     );
                 if let Some(dir_url) = crate::recurse::detect_directory(
                     &url,
-                    parsed.status,
-                    &parsed.location,
-                    &parsed.body_preview_for_output,
+                    crate::recurse::DirectoryResponse {
+                        status: parsed.status,
+                        location: &parsed.location,
+                        content_type: &parsed.content_type,
+                        body: &parsed.raw_body,
+                        headers: &parsed.headers,
+                    },
                     cfg.recurse_on_200,
                     cfg.recurse_on_403,
                     cfg.recurse_on_auth,

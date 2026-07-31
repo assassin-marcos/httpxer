@@ -20,6 +20,7 @@
 //! The smart `--exclude-subdirs` default list lives here too — built-in
 //! asset/traversal noise that the user shouldn't have to specify.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -263,76 +264,344 @@ pub fn last_path_segment(url: &str) -> Option<String> {
         .map(|s| s.to_ascii_lowercase())
 }
 
+/// Strong file suffixes that should never become recursion roots. Some
+/// gateways normalize every known route to a trailing slash, including files
+/// such as `security.txt -> security.txt/`. Redirect parity alone therefore
+/// does not prove that appending a complete wordlist below the path is useful.
+const FILE_LIKE_EXTENSIONS: &[&str] = &[
+    "7z", "apk", "ashx", "asmx", "asp", "aspx", "atom", "avif", "axd", "bak",
+    "backup", "bash", "bat", "bin", "bmp", "bz2", "c", "cer", "cfg", "cgi",
+    "class", "conf", "config", "cpp", "crt", "cs", "css", "csv", "db", "deb",
+    "dll", "do", "doc", "docx", "ear", "env", "eot", "exe", "flac", "gif",
+    "go", "gql", "graphql", "gz", "h", "htaccess", "htm", "html", "ico", "ini",
+    "jar", "java", "jpeg", "jpg", "js", "json", "jsp", "jspx", "key", "lock",
+    "log", "m4a", "m4v", "map", "md", "mdb", "mjs", "mkv", "mov", "mp3",
+    "mp4", "msi", "npmrc", "old", "orig", "otf", "p12", "pdf", "pem", "pfx",
+    "php", "php3", "php4", "php5", "phtml", "pl", "png", "ppt", "pptx",
+    "properties", "proto", "ps1", "pub", "py", "pyc", "rar", "rb", "rpm", "rs",
+    "rss", "rtf", "save", "sh", "shtml", "sql", "sqlite", "sqlite3", "svg",
+    "swp", "tar", "tgz", "tiff", "tmp", "toml", "ts", "ttf", "txt", "war",
+    "wasm", "wav", "webm", "webp", "woff", "woff2", "wsdl", "xhtml", "xls",
+    "xlsx", "xml", "xz", "yaml", "yml", "zip",
+];
+
+/// Registered/common `/.well-known/` leaf resources without a conventional
+/// extension. These are documents or protocol endpoints, not directories to
+/// expand with a fuzzing wordlist. `acme-challenge` is intentionally absent:
+/// it is a genuine path prefix containing challenge tokens.
+const WELL_KNOWN_LEAF_RESOURCES: &[&str] = &[
+    "apple-app-site-association",
+    "assetlinks.json",
+    "change-password",
+    "dnt-policy.txt",
+    "gpc.json",
+    "host-meta",
+    "host-meta.json",
+    "jwks.json",
+    "mta-sts.txt",
+    "nodeinfo",
+    "oauth-authorization-server",
+    "openid-configuration",
+    "openapi.json",
+    "openapi.yaml",
+    "openapi.yml",
+    "security.txt",
+    "traffic-advice",
+    "webfinger",
+];
+
+const KNOWN_HIDDEN_DIRECTORIES: &[&str] = &[
+    ".aws",
+    ".config",
+    ".git",
+    ".hg",
+    ".idea",
+    ".ssh",
+    ".svn",
+    ".vscode",
+    ".well-known",
+];
+
+fn request_path(req_url: &str) -> &str {
+    let after_authority = req_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(req_url);
+    let path = after_authority
+        .find('/')
+        .map(|index| &after_authority[index..])
+        .unwrap_or("/");
+    path.split(['?', '#']).next().unwrap_or(path)
+}
+
+fn decoded_segment(segment: &str) -> Cow<'_, str> {
+    if segment.as_bytes().contains(&b'%') {
+        percent_encoding::percent_decode_str(segment).decode_utf8_lossy()
+    } else {
+        Cow::Borrowed(segment)
+    }
+}
+
+fn known_case_insensitive(values: &[&str], candidate: &str) -> bool {
+    values
+        .iter()
+        .any(|value| candidate.eq_ignore_ascii_case(value))
+}
+
+fn recursion_path_is_file_like(req_url: &str) -> bool {
+    let path = request_path(req_url);
+    let mut segments = path.trim_end_matches('/').rsplit('/');
+    let Some(last_raw) = segments.next().filter(|segment| !segment.is_empty()) else {
+        return false;
+    };
+    let last = decoded_segment(last_raw);
+
+    // Hidden directories are allowed even when their name resembles a file
+    // suffix (`.config`). Known hidden files such as `.env` and `.htaccess`
+    // are not in this allow-list and continue through extension detection.
+    if known_case_insensitive(KNOWN_HIDDEN_DIRECTORIES, &last) {
+        return false;
+    }
+
+    if let Some((_, extension)) = last.rsplit_once('.') {
+        if !extension.is_empty()
+            && known_case_insensitive(FILE_LIKE_EXTENSIONS, extension)
+        {
+            return true;
+        }
+    }
+
+    segments
+        .next()
+        .map(decoded_segment)
+        .is_some_and(|parent| parent.eq_ignore_ascii_case(".well-known"))
+        && known_case_insensitive(WELL_KNOWN_LEAF_RESOURCES, &last)
+}
+
+fn plausible_directory_path(req_url: &str) -> bool {
+    let path = request_path(req_url);
+    let Some(last_raw) = path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+    else {
+        return false;
+    };
+    // `detect_directory` has already applied the stronger file/resource gate.
+    let last = decoded_segment(last_raw);
+    if !last.contains('.') || known_case_insensitive(KNOWN_HIDDEN_DIRECTORIES, &last) {
+        return true;
+    }
+
+    // Preserve common dotted version directories (`v1.2`, `2.0.1`) without
+    // allowing arbitrary unknown dotted leaves into auth recursion.
+    let version = last
+        .strip_prefix('v')
+        .or_else(|| last.strip_prefix('V'))
+        .unwrap_or(&last);
+    version.bytes().any(|byte| byte == b'.')
+        && version.bytes().any(|byte| byte.is_ascii_digit())
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+fn terminal_content_type(content_type: &str) -> bool {
+    let mime = content_type.split(';').next().unwrap_or("").trim();
+    starts_with_ascii_case_insensitive(mime, "image/")
+        || starts_with_ascii_case_insensitive(mime, "audio/")
+        || starts_with_ascii_case_insensitive(mime, "video/")
+        || starts_with_ascii_case_insensitive(mime, "font/")
+        || [
+            "text/plain",
+            "text/css",
+            "text/csv",
+            "text/javascript",
+            "application/javascript",
+            "application/octet-stream",
+            "application/pdf",
+            "application/wasm",
+            "application/zip",
+            "application/gzip",
+            "application/x-7z-compressed",
+            "application/x-rar-compressed",
+            "application/x-tar",
+        ]
+        .iter()
+        .any(|blocked| mime.eq_ignore_ascii_case(blocked))
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    !needle.is_empty()
+        && haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn body_has_directory_index(body: &str) -> bool {
+    // Directory markers occur near the start. Capping inspection keeps this
+    // constant-bounded even though response bodies may be up to 256 KiB.
+    let mut end = body.len().min(16 * 1024);
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let sample = &body[..end];
+    [
+        "index of /",
+        "directory listing for",
+        "parent directory",
+        "httpd/unix-directory",
+    ]
+    .iter()
+    .any(|marker| contains_ascii_case_insensitive(sample, marker))
+}
+
+fn response_is_attachment(headers: &[(String, String)]) -> bool {
+    header_value(headers, "content-disposition").is_some_and(|value| {
+        contains_ascii_case_insensitive(value, "attachment")
+            || contains_ascii_case_insensitive(value, "filename=")
+    })
+}
+
+fn content_location_has_directory_parity(
+    req_url: &str,
+    directory_url: &str,
+    headers: &[(String, String)],
+) -> bool {
+    let Some(location) = header_value(headers, "content-location") else {
+        return false;
+    };
+    let resolved = crate::probe::resolve_redirect_url(req_url, location);
+    canonical_url_key(&resolved) == canonical_url_key(directory_url)
+}
+
+fn directory_url(req_url: &str) -> String {
+    if let Ok(mut parsed) = url::Url::parse(req_url) {
+        let path = format!("{}/", parsed.path().trim_end_matches('/'));
+        parsed.set_path(&path);
+        parsed.set_query(None);
+        parsed.set_fragment(None);
+        return parsed.to_string();
+    }
+    let base = req_url.split(['?', '#']).next().unwrap_or(req_url);
+    format!("{}/", base.trim_end_matches('/'))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DirectoryResponse<'a> {
+    pub status: u16,
+    pub location: &'a str,
+    pub content_type: &'a str,
+    pub body: &'a str,
+    pub headers: &'a [(String, String)],
+}
+
 /// Strict directory detector. Returns `Some(dir_url_with_trailing_slash)`
 /// when the response signals "directory worth recursing into".
 ///
-/// Patterns recognised (most-specific, lowest-FP first):
+/// Evidence recognised (most-specific, lowest-FP first):
 ///   1. **301/302/307/308** with `Location == URL + "/"` (classic Apache /
-///      nginx missing-trailing-slash redirect). Constant-Location
-///      catchalls (every path -> /login) FAIL this parity check.
-///   2. **200** with body containing `Index of /` (autoindex marker) —
-///      only when `recurse_on_200` is true.
-///   3. **403** — only when `recurse_on_403` is true (too WAF-prone by
-///      default).
+///      nginx missing-trailing-slash redirect). Constant-Location catchalls
+///      fail this parity check.
+///   2. **200** with an autoindex marker, directory `Content-Type`, matching
+///      `Content-Location`, or an explicit trailing-slash route with a
+///      non-terminal content type — only when `recurse_on_200` is true.
+///   3. **401/403** on a plausible directory-shaped route, with the caller's
+///      auth-catchall and sibling probes providing the network confirmation.
 ///
-/// `req_url` should be the URL we sent the request to (post-redirect-resolution).
-/// `status` / `location` / `body_preview` describe the response we got back.
+/// File-like paths, standard `/.well-known/` leaf resources, attachments and
+/// static/binary payloads do not become recursion roots. All checks use the
+/// response already collected by the fuzz probe and add no network requests.
 pub fn detect_directory(
     req_url: &str,
-    status: u16,
-    location: &str,
-    body_preview: &str,
+    response: DirectoryResponse<'_>,
     recurse_on_200: bool,
     recurse_on_403: bool,
     recurse_on_auth: bool,
 ) -> Option<String> {
+    let status_can_recurse = matches!(response.status, 301 | 302 | 307 | 308)
+        || (response.status == 200 && recurse_on_200)
+        || (response.status == 403 && recurse_on_403)
+        || (response.status == 401 && recurse_on_auth);
+    if !status_can_recurse {
+        return None;
+    }
+
+    // File-shaped routes remain valid findings, but never become recursion
+    // prefixes. This guard applies to every signal below, including explicit
+    // 403 recursion and misleading URL+"/" normalization redirects.
+    if recursion_path_is_file_like(req_url) || response_is_attachment(response.headers) {
+        return None;
+    }
+    let directory_url = directory_url(req_url);
+
     // Pattern 1: redirect-to-trailing-slash.
-    if matches!(status, 301 | 302 | 307 | 308) && !location.is_empty() {
-        let want = format!("{}/", req_url.trim_end_matches('/'));
-        let resolved = crate::probe::resolve_redirect_url(req_url, location);
-        if resolved == want {
-            return Some(want);
+    if matches!(response.status, 301 | 302 | 307 | 308) && !response.location.is_empty() {
+        let resolved = crate::probe::resolve_redirect_url(req_url, response.location);
+        if canonical_url_key(&resolved) == canonical_url_key(&directory_url) {
+            return Some(directory_url);
         }
         // Constant-Location catchall — Location is the same regardless
         // of the request path. NOT a directory; drop.
         return None;
     }
-    // Pattern 2: 200 + autoindex marker.
-    if status == 200 && recurse_on_200 {
-        if body_preview.contains("Index of /") || body_preview.contains("<h1>Index of") {
-            return Some(format!("{}/", req_url.trim_end_matches('/')));
+    // Pattern 2: response-backed 200 directory evidence. Autoindex and
+    // explicit directory headers outrank MIME rejection; a text/plain
+    // directory listing is still a directory.
+    if response.status == 200 && recurse_on_200 {
+        let mime = response.content_type.split(';').next().unwrap_or("").trim();
+        let directory_mime = mime.eq_ignore_ascii_case("httpd/unix-directory");
+        if body_has_directory_index(response.body)
+            || directory_mime
+            || content_location_has_directory_parity(
+                req_url,
+                &directory_url,
+                response.headers,
+            )
+        {
+            return Some(directory_url);
         }
+        if request_path(req_url).ends_with('/')
+            && !terminal_content_type(response.content_type)
+        {
+            return Some(directory_url);
+        }
+        return None;
     }
-    // Pattern 3: 403 explicit opt-in (legacy flag — recurses ANY 403).
-    if status == 403 && recurse_on_403 {
-        return Some(format!("{}/", req_url.trim_end_matches('/')));
+    // Pattern 3: 403 explicit opt-in, still constrained to a plausible
+    // directory path. The caller separately rejects blanket auth catchalls.
+    if response.status == 403 && recurse_on_403 && plausible_directory_path(req_url) {
+        return Some(directory_url);
     }
-    // Pattern 4 (v0.4.5): auth-dir auto-recursion. A 401 on a
-    // DIRECTORY-SHAPED path (no file extension, e.g. /api, /internal) is a
-    // protected directory worth descending into — its children may be
+    // Pattern 4 (v0.4.5): auth-dir auto-recursion. A 401 on a plausible
+    // directory path (e.g. /api, /internal, /.well-known, /v1.2) is a
+    // protected prefix worth descending into — its children may be
     // accessible (e.g. /api=401 but /api/actuator=200). A 403 is deliberately
     // excluded from the automatic path: gateways and WAFs commonly return
     // path-sensitive 403s for dictionary-looking names that do not identify a
     // real directory. Users who need exhaustive 403 recursion can opt in with
     // --recurse-on-403 (Pattern 3 above).
-    if recurse_on_auth && status == 401 && is_dir_shaped(req_url) {
-        return Some(format!("{}/", req_url.trim_end_matches('/')));
+    if recurse_on_auth && response.status == 401 && plausible_directory_path(req_url) {
+        return Some(directory_url);
     }
     None
-}
-
-/// True if the URL's last path segment looks like a directory (no file
-/// extension), e.g. `/api`, `/internal/v2` → true; `/x.php`, `/a.bak` → false.
-/// Used to gate auth-dir auto-recursion to plausible directories only.
-fn is_dir_shaped(req_url: &str) -> bool {
-    let after_scheme = req_url.split("://").nth(1).unwrap_or(req_url);
-    let path = after_scheme
-        .find('/')
-        .map(|i| &after_scheme[i..])
-        .unwrap_or("/");
-    let path = path.split(['?', '#']).next().unwrap_or(path);
-    let last = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-    !last.is_empty() && !last.contains('.')
 }
 
 /// Per-host recursion budget. One atomic counter so workers can charge
@@ -391,6 +660,30 @@ pub fn canonical_url_key(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn detect_basic(
+        req_url: &str,
+        status: u16,
+        location: &str,
+        body: &str,
+        recurse_on_200: bool,
+        recurse_on_403: bool,
+        recurse_on_auth: bool,
+    ) -> Option<String> {
+        detect_directory(
+            req_url,
+            DirectoryResponse {
+                status,
+                location,
+                content_type: "",
+                body,
+                headers: &[],
+            },
+            recurse_on_200,
+            recurse_on_403,
+            recurse_on_auth,
+        )
+    }
 
     #[test]
     fn exclude_mode_from_cli_parses() {
@@ -582,7 +875,7 @@ mod tests {
     fn detect_directory_redirect_parity() {
         // 301 with Location == URL + "/" → directory.
         assert_eq!(
-            detect_directory(
+            detect_basic(
                 "https://x.com/admin",
                 301,
                 "/admin/",
@@ -596,7 +889,7 @@ mod tests {
         );
         // 301 with constant Location → NOT a directory.
         assert_eq!(
-            detect_directory(
+            detect_basic(
                 "https://x.com/admin",
                 301,
                 "/login",
@@ -607,12 +900,261 @@ mod tests {
             ),
             None
         );
+        // Query/fragment state belongs to the finding, not the recursion root.
+        assert_eq!(
+            detect_basic(
+                "https://x.com/admin?view=compact#top",
+                301,
+                "/admin/",
+                "",
+                false,
+                false,
+                false,
+            )
+            .as_deref(),
+            Some("https://x.com/admin/")
+        );
+    }
+
+    #[test]
+    fn detect_directory_rejects_file_like_redirects() {
+        for path in [
+            "/.well-known/security.txt",
+            "/.well-known/jwks.json",
+            "/.well-known/openapi.yaml",
+            "/download/archive.tar.gz",
+            "/admin.php",
+        ] {
+            let request = format!("https://x.com{path}");
+            let location = format!("{path}/");
+            assert_eq!(
+                detect_basic(&request, 301, &location, "", false, false, false),
+                None,
+                "file-like path must not become a recursion root: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_directory_rejects_well_known_leaf_resources() {
+        for leaf in [
+            "apple-app-site-association",
+            "change-password",
+            "host-meta",
+            "nodeinfo",
+            "oauth-authorization-server",
+            "openid-configuration",
+            "webfinger",
+        ] {
+            let request = format!("https://x.com/.well-known/{leaf}");
+            let location = format!("/.well-known/{leaf}/");
+            assert_eq!(
+                detect_basic(&request, 301, &location, "", false, false, false),
+                None,
+                "well-known leaf must not become a recursion root: {leaf}"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_directory_keeps_real_dotted_and_well_known_directories() {
+        for (request, location) in [
+            ("https://x.com/.well-known", "/.well-known/"),
+            (
+                "https://x.com/.well-known/acme-challenge",
+                "/.well-known/acme-challenge/",
+            ),
+            ("https://x.com/releases/v1.2", "/releases/v1.2/"),
+        ] {
+            let expected = format!("{}/", request.trim_end_matches('/'));
+            assert_eq!(
+                detect_basic(request, 301, location, "", false, false, false)
+                    .as_deref(),
+                Some(expected.as_str()),
+                "real directory must remain eligible: {request}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_like_guard_applies_to_non_redirect_recursion_signals() {
+        assert!(detect_basic(
+            "https://x.com/security.txt",
+            200,
+            "",
+            "<h1>Index of /security.txt</h1>",
+            true,
+            false,
+            false
+        )
+        .is_none());
+        assert!(detect_basic(
+            "https://x.com/openapi.json",
+            403,
+            "",
+            "",
+            false,
+            true,
+            false
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn response_evidence_accepts_real_200_directories() {
+        for content_type in ["text/html", "application/json", ""] {
+            assert_eq!(
+                detect_directory(
+                    "https://x.com/api/",
+                    DirectoryResponse {
+                        status: 200,
+                        location: "",
+                        content_type,
+                        body: "<html><body>API root</body></html>",
+                        headers: &[],
+                    },
+                    true,
+                    false,
+                    false,
+                )
+                .as_deref(),
+                Some("https://x.com/api/")
+            );
+        }
+
+        let content_location = vec![("Content-Location".to_string(), "/admin/".to_string())];
+        assert_eq!(
+            detect_directory(
+                "https://x.com/admin",
+                DirectoryResponse {
+                    status: 200,
+                    location: "",
+                    content_type: "text/html",
+                    body: "",
+                    headers: &content_location,
+                },
+                true,
+                false,
+                false,
+            )
+            .as_deref(),
+            Some("https://x.com/admin/")
+        );
+
+        assert_eq!(
+            detect_directory(
+                "https://x.com/dav",
+                DirectoryResponse {
+                    status: 200,
+                    location: "",
+                    content_type: "httpd/unix-directory",
+                    body: "",
+                    headers: &[],
+                },
+                true,
+                false,
+                false,
+            )
+            .as_deref(),
+            Some("https://x.com/dav/")
+        );
+    }
+
+    #[test]
+    fn response_evidence_rejects_terminal_200_resources() {
+        for content_type in [
+            "text/plain; charset=utf-8",
+            "application/pdf",
+            "application/octet-stream",
+            "image/png",
+        ] {
+            assert!(detect_directory(
+                "https://x.com/download/",
+                DirectoryResponse {
+                    status: 200,
+                    location: "",
+                    content_type,
+                    body: "payload",
+                    headers: &[],
+                },
+                true,
+                false,
+                false,
+            )
+            .is_none());
+        }
+
+        let attachment = vec![(
+            "content-disposition".to_string(),
+            "attachment; filename=download".to_string(),
+        )];
+        assert!(detect_directory(
+            "https://x.com/download/",
+            DirectoryResponse {
+                status: 200,
+                location: "",
+                content_type: "text/html",
+                body: "",
+                headers: &attachment,
+            },
+            true,
+            false,
+            false,
+        )
+        .is_none());
+
+        // A generic 200 page without slash/header/index evidence is not enough.
+        assert!(detect_directory(
+            "https://x.com/dashboard",
+            DirectoryResponse {
+                status: 200,
+                location: "",
+                content_type: "text/html",
+                body: "<html><h1>Dashboard</h1></html>",
+                headers: &[],
+            },
+            true,
+            false,
+            false,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn file_shape_detection_handles_encoding_case_and_hidden_directories() {
+        assert!(detect_basic(
+            "https://x.com/schema%2EJSON",
+            301,
+            "/schema%2EJSON/",
+            "",
+            false,
+            false,
+            false,
+        )
+        .is_none());
+        assert_eq!(
+            detect_basic(
+                "https://x.com/.config",
+                301,
+                "/.config/",
+                "",
+                false,
+                false,
+                false,
+            )
+            .as_deref(),
+            Some("https://x.com/.config/")
+        );
+        assert_eq!(
+            directory_url("https://x.com/releases%20archive?download=1#top"),
+            "https://x.com/releases%20archive/"
+        );
     }
 
     #[test]
     fn detect_directory_autoindex() {
         assert_eq!(
-            detect_directory(
+            detect_basic(
                 "https://x.com/files",
                 200,
                 "",
@@ -626,7 +1168,7 @@ mod tests {
         );
         // recurse_on_200=false → no detection even with marker.
         assert_eq!(
-            detect_directory(
+            detect_basic(
                 "https://x.com/files",
                 200,
                 "",
@@ -641,9 +1183,8 @@ mod tests {
 
     #[test]
     fn detect_directory_403_opt_in() {
-        // Legacy --recurse-on-403 flag recurses ANY 403 (auth off here).
-        assert!(detect_directory("https://x.com/secret", 403, "", "", false, false, false).is_none());
-        assert!(detect_directory("https://x.com/secret", 403, "", "", false, true, false).is_some());
+        assert!(detect_basic("https://x.com/secret", 403, "", "", false, false, false).is_none());
+        assert!(detect_basic("https://x.com/secret", 403, "", "", false, true, false).is_some());
     }
 
     /// Auth-dir auto-recursion follows directory-shaped 401 responses. A 403
@@ -653,18 +1194,18 @@ mod tests {
     fn detect_directory_auth_dir_shaped() {
         // 401 dir-shaped, auth on → recurse.
         assert_eq!(
-            detect_directory("https://x.com/api", 401, "", "", false, false, true).as_deref(),
+            detect_basic("https://x.com/api", 401, "", "", false, false, true).as_deref(),
             Some("https://x.com/api/")
         );
         // 403 stays off under automatic auth recursion and needs opt-in.
-        assert!(detect_directory("https://x.com/internal", 403, "", "", false, false, true).is_none());
-        assert!(detect_directory("https://x.com/internal", 403, "", "", false, true, true).is_some());
+        assert!(detect_basic("https://x.com/internal", 403, "", "", false, false, true).is_none());
+        assert!(detect_basic("https://x.com/internal", 403, "", "", false, true, true).is_some());
         // 401 FILE-shaped (.php) → NOT recursed (no children to find).
-        assert!(detect_directory("https://x.com/admin.php", 401, "", "", false, false, true).is_none());
+        assert!(detect_basic("https://x.com/admin.php", 401, "", "", false, false, true).is_none());
         // auth off → 401 never recurses.
-        assert!(detect_directory("https://x.com/api", 401, "", "", false, false, false).is_none());
+        assert!(detect_basic("https://x.com/api", 401, "", "", false, false, false).is_none());
         // 200 must NOT be treated as an auth dir.
-        assert!(detect_directory("https://x.com/api", 200, "", "", false, false, true).is_none());
+        assert!(detect_basic("https://x.com/api", 200, "", "", false, false, true).is_none());
     }
 
     /// v0.4.10 — the dir cap is the one enforced recursion bound. Charging
