@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey.svg)]()
 
-**Current release:** [v0.6.10](https://github.com/assassin-marcos/httpxer/releases/tag/v0.6.10)
+**Current release:** [v0.6.11](https://github.com/assassin-marcos/httpxer/releases/tag/v0.6.11)
 
 ```
  _     _   _
@@ -22,7 +22,7 @@
 One tool, two jobs:
 
 - **Enrich mode** — reads a hostname list, probes each over HTTP(S), and emits one JSONL record per host with DNS, CDN, Wappalyzer-style technology detection, and HTTP metadata. `--httpx-compat` provides the common httpx JSON field shape; exact byte-for-byte parity is not promised.
-- **Fuzz mode** — host × wordlist Cartesian probe with **recursive** dir bruteforce (incl. smart auto-recursion into protected `401` dirs and opt-in `403` recursion), **crawl** (HTML/robots/sitemap link extraction), **content-aware wildcard detection** (static catchall + per-request-nonce catchall + path-echo), a **native, content-confirmed `401`/`403` bypass engine**, and dirsearch-style **live progress bar + findings stream**.
+- **Fuzz mode** — host × wordlist Cartesian probe with **recursive** dir bruteforce (incl. smart auto-recursion into protected `401` dirs and opt-in `403` recursion), **crawl** (HTML/robots/sitemap link extraction), **content-aware wildcard detection** (static catchall + per-request-nonce catchall + path-echo), a **native, content-confirmed `401`/`403` bypass engine**, and a live findings/progress stream showing the newest active host and wordlist path.
 
 Both modes share a 16-slot **BoringSSL** browser-emulation pool. Enrich mode samples the pool per probe; fuzz mode pins one profile per host so wildcard pre-flight and wordlist probes see the same UA-dependent response. Distinct hosts are still distributed across the pool.
 
@@ -248,7 +248,7 @@ Color-coded by status class when stderr is a TTY: green 2xx, yellow 3xx, cyan 40
 
 Full structured record per finding. Fuzz mode includes `depth`, `source`, `parent_url` for multi-round provenance, and `bypass` (the winning technique) on confirmed 401/403 bypasses. Enrich mode (`--httpx-compat`) uses common ProjectDiscovery httpx field names and array shapes, but consumers should not assume byte-for-byte output identity.
 
-Live findings stream to stderr above a `[N/total] X% | rps | eta` progress bar. `--no-live` hides findings only; `-q` hides findings and progress while retaining phase summaries.
+Live findings stream to stderr above a progress line like `[N/total] X% | rps | eta | host=example.com word=/admin | active=150 hosts=2`. Fuzzing is concurrent, so `host` and `word` identify the newest probe still in flight; `active` and `hosts` show the current number of requests and target hosts in flight. Long values are truncated and terminal control characters are neutralized. `--no-live` hides findings only; `-q` hides findings and progress while retaining phase summaries.
 
 ## Proxy rotation
 

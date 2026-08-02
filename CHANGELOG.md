@@ -2,6 +2,17 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.6.11] — 2026-08-03
+
+### Added
+- Live fuzz progress now shows the newest active host and dictionary path plus concurrent request and host counts during initial, recursive, and crawl probes.
+
+### Changed
+- Progress labels are length-bounded and terminal control characters are neutralized without changing request scheduling, output records, or scan logic.
+
+### Verified
+- A loopback pseudo-terminal scan displayed changing host/path activity through final completion; the locked test suite and optimized release build passed before release.
+
 ## [0.6.10] — 2026-08-02
 
 ### Fixed

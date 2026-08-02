@@ -27,9 +27,9 @@ use chrono::SecondsFormat;
 use futures::stream::{FuturesUnordered, StreamExt};
 use md5::{Digest, Md5};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader, IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
@@ -1415,6 +1415,106 @@ pub(crate) fn bare_host(s: &str) -> String {
 // observable point. A new spawn site cannot forget to count itself: it has no
 // route to the completion counter without a ticket.
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ActiveProbeSnapshot {
+    latest_host: Option<String>,
+    latest_path: Option<String>,
+    active_probes: usize,
+    active_hosts: usize,
+}
+
+#[derive(Debug)]
+struct ActiveProbe {
+    host: String,
+    path: String,
+}
+
+#[derive(Default)]
+struct ActiveProbeTracker {
+    next_id: AtomicU64,
+    probes: std::sync::Mutex<BTreeMap<u64, ActiveProbe>>,
+}
+
+impl ActiveProbeTracker {
+    fn enter(self: &Arc<Self>, host: String, path: String) -> ActiveProbeGuard {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.probes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id, ActiveProbe { host, path });
+        ActiveProbeGuard {
+            tracker: Arc::clone(self),
+            id,
+        }
+    }
+
+    fn snapshot(&self) -> ActiveProbeSnapshot {
+        let probes = self
+            .probes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let latest = probes.last_key_value().map(|(_, probe)| probe);
+        let active_hosts = probes
+            .values()
+            .map(|probe| probe.host.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        ActiveProbeSnapshot {
+            latest_host: latest.map(|probe| probe.host.clone()),
+            latest_path: latest.map(|probe| probe.path.clone()),
+            active_probes: probes.len(),
+            active_hosts,
+        }
+    }
+}
+
+struct ActiveProbeGuard {
+    tracker: Arc<ActiveProbeTracker>,
+    id: u64,
+}
+
+impl Drop for ActiveProbeGuard {
+    fn drop(&mut self) {
+        self.tracker
+            .probes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
+    }
+}
+
+fn sanitize_progress_field(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let clean = value
+        .chars()
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .collect::<String>();
+    let char_count = clean.chars().count();
+    if char_count <= max_chars {
+        return clean;
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let keep = max_chars.saturating_sub(3);
+    format!("{}...", clean.chars().take(keep).collect::<String>())
+}
+
+fn format_active_probe(snapshot: &ActiveProbeSnapshot) -> String {
+    match (&snapshot.latest_host, &snapshot.latest_path) {
+        (Some(host), Some(path)) => format!(
+            " | host={} word={} | active={} hosts={}",
+            sanitize_progress_field(host, 28),
+            sanitize_progress_field(path, 28),
+            snapshot.active_probes,
+            snapshot.active_hosts,
+        ),
+        _ => String::new(),
+    }
+}
+
 /// Live `completed / total` accounting for one fuzz run. See the module-level
 /// note above for the invariant this type exists to enforce.
 struct Progress {
@@ -1437,6 +1537,9 @@ struct Progress {
     /// `settle_prepaid()` can retire the unspent remainder with no risk of
     /// `total` dropping below `completed`.
     prepaid: AtomicUsize,
+    /// Concurrent probes currently holding a worker slot. The newest active
+    /// host/path is rendered beside the aggregate progress counters.
+    active: Arc<ActiveProbeTracker>,
 }
 
 /// Both counters read as one pair. Constructed only by `Progress::snapshot`,
@@ -1481,6 +1584,7 @@ impl Progress {
             completed: AtomicUsize::new(0),
             total: AtomicUsize::new(prepaid),
             prepaid: AtomicUsize::new(prepaid),
+            active: Arc::new(ActiveProbeTracker::default()),
         }
     }
 
@@ -1513,13 +1617,21 @@ impl Progress {
     /// bumped at exactly the place the task is created. The task owns the
     /// ticket, so the numerator moves when — and only when — that future
     /// resolves. This is the only probe-spawning entry point.
-    fn spawn_probe<F>(self: &Arc<Self>, fut: F) -> tokio::task::JoinHandle<()>
+    fn spawn_probe<F>(
+        self: &Arc<Self>,
+        host: String,
+        path: String,
+        fut: F,
+    ) -> tokio::task::JoinHandle<()>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let ticket = self.reserve();
+        let active = Arc::clone(&self.active);
         tokio::spawn(async move {
+            let activity = active.enter(host, path);
             fut.await;
+            drop(activity);
             ticket.complete();
         })
     }
@@ -1571,6 +1683,10 @@ impl Progress {
         let completed = self.completed.load(Ordering::Acquire);
         let total = self.total.load(Ordering::Relaxed);
         ProgressSnapshot { completed, total }
+    }
+
+    fn active_snapshot(&self) -> ActiveProbeSnapshot {
+        self.active.snapshot()
     }
 }
 
@@ -1856,18 +1972,21 @@ pub async fn run(
                 // independently-timed loads (that pairing is what let the
                 // numerator overtake the denominator on screen).
                 let snap = progress.snapshot();
+                let active = progress.active_snapshot();
+                let active_context = format_active_probe(&active);
                 if is_tty {
                     let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
                     let rps = snap.completed as f64 / elapsed;
                     let mut stderr = std::io::stderr();
                     let _ = write!(
                         stderr,
-                        "\r\x1b[K  [{}/{}] {}% | {:.0} rps | eta {}",
+                        "\r\x1b[K  [{}/{}] {}% | {:.0} rps | eta {}{}",
                         snap.completed,
                         snap.total,
                         snap.pct(),
                         rps,
-                        format_eta(snap.eta_secs(rps))
+                        format_eta(snap.eta_secs(rps)),
+                        active_context,
                     );
                     let _ = stderr.flush();
                 } else if show_progress {
@@ -1876,7 +1995,10 @@ pub async fn run(
                     // ticker-task variant uses 500 so the cadence
                     // matches a TTY's ~100 ms refresh visually.)
                     if snap.completed > 0 && snap.completed % 500 == 0 {
-                        eprintln!("  [fuzz {}/{}]", snap.completed, snap.total);
+                        eprintln!(
+                            "  [fuzz {}/{}]{}",
+                            snap.completed, snap.total, active_context
+                        );
                     }
                 }
             }
@@ -1947,6 +2069,8 @@ pub async fn run(
             let out_file = out_file.clone();
             let policy = wildcard_policy_arc.clone();
             let disc = disc_tx.clone();
+            let progress_host = item.host.clone();
+            let progress_path = item.path.clone();
 
             // Acquire BEFORE spawn — keeps the FuturesUnordered set bounded
             // to the semaphore size + the number of pending awaits, instead
@@ -1957,20 +2081,24 @@ pub async fn run(
             // and hands the numerator increment to the task's ticket. Round 0
             // draws from the prepaid `hosts × words` pool, so the displayed
             // total stays at the announced figure.
-            tasks.push(progress.spawn_probe(async move {
-                let _p = permit;
-                run_probe_resilient(
-                    item,
-                    &cfg,
-                    &wildcards,
-                    &catchall,
-                    &scoped_auth,
-                    &out_file,
-                    *policy,
-                    &disc,
-                )
-                .await;
-            }));
+            tasks.push(progress.spawn_probe(
+                progress_host,
+                progress_path,
+                async move {
+                    let _p = permit;
+                    run_probe_resilient(
+                        item,
+                        &cfg,
+                        &wildcards,
+                        &catchall,
+                        &scoped_auth,
+                        &out_file,
+                        *policy,
+                        &disc,
+                    )
+                    .await;
+                },
+            ));
 
             // Throttle the spawn queue if we hit a backlog of completed
             // tasks — drain a few so we don't grow unboundedly when paths
@@ -2120,24 +2248,30 @@ pub async fn run(
                     let out_file_c = out_file.clone();
                     let policy_c = wildcard_policy_arc.clone();
                     let disc_c = disc_tx.clone();
+                    let progress_host = item.host.clone();
+                    let progress_path = item.path.clone();
                     let permit = sem_c.acquire_owned().await.ok();
                     // Recursion probe: past the prepaid round-0 pool, so this
                     // reservation grows the live denominator — at the spawn,
                     // inseparably from the completion it authorises.
-                    tasks.push(progress.spawn_probe(async move {
-                        let _p = permit;
-                        run_probe_resilient(
-                            item,
-                            &cfg_c,
-                            &wildcards_c,
-                            &catchall_c,
-                            &scoped_auth_c,
-                            &out_file_c,
-                            *policy_c,
-                            &disc_c,
-                        )
-                        .await;
-                    }));
+                    tasks.push(progress.spawn_probe(
+                        progress_host,
+                        progress_path,
+                        async move {
+                            let _p = permit;
+                            run_probe_resilient(
+                                item,
+                                &cfg_c,
+                                &wildcards_c,
+                                &catchall_c,
+                                &scoped_auth_c,
+                                &out_file_c,
+                                *policy_c,
+                                &disc_c,
+                            )
+                            .await;
+                        },
+                    ));
                     while tasks.len() > spawn_backlog_cap {
                         tasks.next().await;
                     }
@@ -2176,22 +2310,28 @@ pub async fn run(
                 let out_file_c = out_file.clone();
                 let policy_c = wildcard_policy_arc.clone();
                 let disc_c = disc_tx.clone();
+                let progress_host = item.host.clone();
+                let progress_path = item.path.clone();
                 let permit = sem_c.acquire_owned().await.ok();
                 // Crawl probe: same deal — reservation and spawn are one call.
-                tasks.push(progress.spawn_probe(async move {
-                    let _p = permit;
-                    run_probe_resilient(
-                        item,
-                        &cfg_c,
-                        &wildcards_c,
-                        &catchall_c,
-                        &scoped_auth_c,
-                        &out_file_c,
-                        *policy_c,
-                        &disc_c,
-                    )
-                    .await;
-                }));
+                tasks.push(progress.spawn_probe(
+                    progress_host,
+                    progress_path,
+                    async move {
+                        let _p = permit;
+                        run_probe_resilient(
+                            item,
+                            &cfg_c,
+                            &wildcards_c,
+                            &catchall_c,
+                            &scoped_auth_c,
+                            &out_file_c,
+                            *policy_c,
+                            &disc_c,
+                        )
+                        .await;
+                    },
+                ));
                 while tasks.len() > spawn_backlog_cap {
                     tasks.next().await;
                 }
@@ -3622,6 +3762,90 @@ mod tests {
     //
     // Regression cover for the reported bar `[18000258/1255126] 1434%` — a
     // numerator that outran a denominator frozen at the round-0 estimate.
+
+    #[test]
+    fn active_probe_tracker_reports_latest_live_host_and_path() {
+        let tracker = Arc::new(ActiveProbeTracker::default());
+        let first = tracker.enter("one.test".into(), "/admin".into());
+        assert_eq!(
+            tracker.snapshot(),
+            ActiveProbeSnapshot {
+                latest_host: Some("one.test".into()),
+                latest_path: Some("/admin".into()),
+                active_probes: 1,
+                active_hosts: 1,
+            }
+        );
+
+        let second = tracker.enter("two.test".into(), "/api/login".into());
+        assert_eq!(
+            tracker.snapshot(),
+            ActiveProbeSnapshot {
+                latest_host: Some("two.test".into()),
+                latest_path: Some("/api/login".into()),
+                active_probes: 2,
+                active_hosts: 2,
+            }
+        );
+
+        drop(second);
+        assert_eq!(tracker.snapshot().latest_host.as_deref(), Some("one.test"));
+        drop(first);
+        assert_eq!(tracker.snapshot(), ActiveProbeSnapshot::default());
+    }
+
+    #[test]
+    fn active_probe_progress_is_bounded_and_terminal_safe() {
+        let rendered = format_active_probe(&ActiveProbeSnapshot {
+            latest_host: Some("host\x1b.test".into()),
+            latest_path: Some(format!("/{}\nend", "a".repeat(40))),
+            active_probes: 150,
+            active_hosts: 3,
+        });
+
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\n'));
+        assert!(rendered.contains("host=host?.test"));
+        assert!(rendered.contains("word=/aaaaaaaaaaaaaaaaaaaaaaaa..."));
+        assert!(rendered.contains("active=150 hosts=3"));
+    }
+
+    #[tokio::test]
+    async fn spawned_probe_registers_activity_until_its_future_finishes() {
+        let progress = Arc::new(Progress::new(1));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = progress.spawn_probe(
+            "live.test".into(),
+            "/current-word".into(),
+            async move {
+                let _ = release_rx.await;
+            },
+        );
+
+        for _ in 0..100 {
+            if progress.active_snapshot().active_probes == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            progress.active_snapshot(),
+            ActiveProbeSnapshot {
+                latest_host: Some("live.test".into()),
+                latest_path: Some("/current-word".into()),
+                active_probes: 1,
+                active_hosts: 1,
+            }
+        );
+
+        release_tx.send(()).unwrap();
+        task.await.unwrap();
+        assert_eq!(progress.active_snapshot(), ActiveProbeSnapshot::default());
+        assert_eq!(
+            progress.snapshot(),
+            ProgressSnapshot { completed: 1, total: 1 }
+        );
+    }
 
     #[test]
     fn round0_probes_read_against_the_announced_denominator() {
