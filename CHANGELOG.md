@@ -2,6 +2,15 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.6.12] — 2026-08-03
+
+### Changed
+- Live fuzz progress now combines the target and dictionary path into the exact active request URL instead of displaying separate `host` and `word` fields.
+- Long active URLs use middle truncation so both the target prefix and appended path tail remain visible across initial, recursive, and crawl probes.
+
+### Verified
+- A loopback pseudo-terminal scan displayed changing combined request URLs through final completion; the locked test suite and optimized release build passed before release.
+
 ## [0.6.11] — 2026-08-03
 
 ### Added

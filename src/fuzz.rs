@@ -1417,8 +1417,7 @@ pub(crate) fn bare_host(s: &str) -> String {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ActiveProbeSnapshot {
-    latest_host: Option<String>,
-    latest_path: Option<String>,
+    latest_url: Option<String>,
     active_probes: usize,
     active_hosts: usize,
 }
@@ -1426,7 +1425,7 @@ struct ActiveProbeSnapshot {
 #[derive(Debug)]
 struct ActiveProbe {
     host: String,
-    path: String,
+    url: String,
 }
 
 #[derive(Default)]
@@ -1436,12 +1435,12 @@ struct ActiveProbeTracker {
 }
 
 impl ActiveProbeTracker {
-    fn enter(self: &Arc<Self>, host: String, path: String) -> ActiveProbeGuard {
+    fn enter(self: &Arc<Self>, host: String, url: String) -> ActiveProbeGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.probes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(id, ActiveProbe { host, path });
+            .insert(id, ActiveProbe { host, url });
         ActiveProbeGuard {
             tracker: Arc::clone(self),
             id,
@@ -1460,8 +1459,7 @@ impl ActiveProbeTracker {
             .collect::<HashSet<_>>()
             .len();
         ActiveProbeSnapshot {
-            latest_host: latest.map(|probe| probe.host.clone()),
-            latest_path: latest.map(|probe| probe.path.clone()),
+            latest_url: latest.map(|probe| probe.url.clone()),
             active_probes: probes.len(),
             active_hosts,
         }
@@ -1483,31 +1481,33 @@ impl Drop for ActiveProbeGuard {
     }
 }
 
-fn sanitize_progress_field(value: &str, max_chars: usize) -> String {
+fn sanitize_progress_url(value: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
     }
     let clean = value
         .chars()
         .map(|ch| if ch.is_control() { '?' } else { ch })
-        .collect::<String>();
-    let char_count = clean.chars().count();
-    if char_count <= max_chars {
-        return clean;
+        .collect::<Vec<_>>();
+    if clean.len() <= max_chars {
+        return clean.into_iter().collect();
     }
     if max_chars <= 3 {
         return ".".repeat(max_chars);
     }
-    let keep = max_chars.saturating_sub(3);
-    format!("{}...", clean.chars().take(keep).collect::<String>())
+    let available = max_chars - 3;
+    let head_len = available * 3 / 5;
+    let tail_len = available - head_len;
+    let head = clean[..head_len].iter().collect::<String>();
+    let tail = clean[clean.len() - tail_len..].iter().collect::<String>();
+    format!("{}...{}", head, tail)
 }
 
 fn format_active_probe(snapshot: &ActiveProbeSnapshot) -> String {
-    match (&snapshot.latest_host, &snapshot.latest_path) {
-        (Some(host), Some(path)) => format!(
-            " | host={} word={} | active={} hosts={}",
-            sanitize_progress_field(host, 28),
-            sanitize_progress_field(path, 28),
+    match &snapshot.latest_url {
+        Some(url) => format!(
+            " | url={} | active={} hosts={}",
+            sanitize_progress_url(url, 64),
             snapshot.active_probes,
             snapshot.active_hosts,
         ),
@@ -1538,7 +1538,7 @@ struct Progress {
     /// `total` dropping below `completed`.
     prepaid: AtomicUsize,
     /// Concurrent probes currently holding a worker slot. The newest active
-    /// host/path is rendered beside the aggregate progress counters.
+    /// request URL is rendered beside the aggregate progress counters.
     active: Arc<ActiveProbeTracker>,
 }
 
@@ -1620,7 +1620,7 @@ impl Progress {
     fn spawn_probe<F>(
         self: &Arc<Self>,
         host: String,
-        path: String,
+        url: String,
         fut: F,
     ) -> tokio::task::JoinHandle<()>
     where
@@ -1629,7 +1629,7 @@ impl Progress {
         let ticket = self.reserve();
         let active = Arc::clone(&self.active);
         tokio::spawn(async move {
-            let activity = active.enter(host, path);
+            let activity = active.enter(host, url);
             fut.await;
             drop(activity);
             ticket.complete();
@@ -2070,7 +2070,7 @@ pub async fn run(
             let policy = wildcard_policy_arc.clone();
             let disc = disc_tx.clone();
             let progress_host = item.host.clone();
-            let progress_path = item.path.clone();
+            let progress_url = format!("{}{}", item.host_input, item.path);
 
             // Acquire BEFORE spawn — keeps the FuturesUnordered set bounded
             // to the semaphore size + the number of pending awaits, instead
@@ -2083,7 +2083,7 @@ pub async fn run(
             // total stays at the announced figure.
             tasks.push(progress.spawn_probe(
                 progress_host,
-                progress_path,
+                progress_url,
                 async move {
                     let _p = permit;
                     run_probe_resilient(
@@ -2249,14 +2249,14 @@ pub async fn run(
                     let policy_c = wildcard_policy_arc.clone();
                     let disc_c = disc_tx.clone();
                     let progress_host = item.host.clone();
-                    let progress_path = item.path.clone();
+                    let progress_url = format!("{}{}", item.host_input, item.path);
                     let permit = sem_c.acquire_owned().await.ok();
                     // Recursion probe: past the prepaid round-0 pool, so this
                     // reservation grows the live denominator — at the spawn,
                     // inseparably from the completion it authorises.
                     tasks.push(progress.spawn_probe(
                         progress_host,
-                        progress_path,
+                        progress_url,
                         async move {
                             let _p = permit;
                             run_probe_resilient(
@@ -2311,12 +2311,12 @@ pub async fn run(
                 let policy_c = wildcard_policy_arc.clone();
                 let disc_c = disc_tx.clone();
                 let progress_host = item.host.clone();
-                let progress_path = item.path.clone();
+                let progress_url = format!("{}{}", item.host_input, item.path);
                 let permit = sem_c.acquire_owned().await.ok();
                 // Crawl probe: same deal — reservation and spawn are one call.
                 tasks.push(progress.spawn_probe(
                     progress_host,
-                    progress_path,
+                    progress_url,
                     async move {
                         let _p = permit;
                         run_probe_resilient(
@@ -3764,32 +3764,33 @@ mod tests {
     // numerator that outran a denominator frozen at the round-0 estimate.
 
     #[test]
-    fn active_probe_tracker_reports_latest_live_host_and_path() {
+    fn active_probe_tracker_reports_latest_live_request_url() {
         let tracker = Arc::new(ActiveProbeTracker::default());
-        let first = tracker.enter("one.test".into(), "/admin".into());
+        let first = tracker.enter("one.test".into(), "https://one.test/admin".into());
         assert_eq!(
             tracker.snapshot(),
             ActiveProbeSnapshot {
-                latest_host: Some("one.test".into()),
-                latest_path: Some("/admin".into()),
+                latest_url: Some("https://one.test/admin".into()),
                 active_probes: 1,
                 active_hosts: 1,
             }
         );
 
-        let second = tracker.enter("two.test".into(), "/api/login".into());
+        let second = tracker.enter("two.test".into(), "https://two.test/api/login".into());
         assert_eq!(
             tracker.snapshot(),
             ActiveProbeSnapshot {
-                latest_host: Some("two.test".into()),
-                latest_path: Some("/api/login".into()),
+                latest_url: Some("https://two.test/api/login".into()),
                 active_probes: 2,
                 active_hosts: 2,
             }
         );
 
         drop(second);
-        assert_eq!(tracker.snapshot().latest_host.as_deref(), Some("one.test"));
+        assert_eq!(
+            tracker.snapshot().latest_url.as_deref(),
+            Some("https://one.test/admin")
+        );
         drop(first);
         assert_eq!(tracker.snapshot(), ActiveProbeSnapshot::default());
     }
@@ -3797,17 +3798,27 @@ mod tests {
     #[test]
     fn active_probe_progress_is_bounded_and_terminal_safe() {
         let rendered = format_active_probe(&ActiveProbeSnapshot {
-            latest_host: Some("host\x1b.test".into()),
-            latest_path: Some(format!("/{}\nend", "a".repeat(40))),
+            latest_url: Some(format!(
+                "https://host\x1b.test/{}\n/end",
+                "a".repeat(80)
+            )),
             active_probes: 150,
             active_hosts: 3,
         });
 
         assert!(!rendered.contains('\x1b'));
         assert!(!rendered.contains('\n'));
-        assert!(rendered.contains("host=host?.test"));
-        assert!(rendered.contains("word=/aaaaaaaaaaaaaaaaaaaaaaaa..."));
+        assert!(rendered.contains("url=https://host?.test/"));
+        assert!(rendered.contains("..."));
+        assert!(rendered.contains("?/end | active="));
         assert!(rendered.contains("active=150 hosts=3"));
+        let shown_url = rendered
+            .strip_prefix(" | url=")
+            .unwrap()
+            .split(" | active=")
+            .next()
+            .unwrap();
+        assert_eq!(shown_url.chars().count(), 64);
     }
 
     #[tokio::test]
@@ -3816,7 +3827,7 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let task = progress.spawn_probe(
             "live.test".into(),
-            "/current-word".into(),
+            "https://live.test/current-word".into(),
             async move {
                 let _ = release_rx.await;
             },
@@ -3831,8 +3842,7 @@ mod tests {
         assert_eq!(
             progress.active_snapshot(),
             ActiveProbeSnapshot {
-                latest_host: Some("live.test".into()),
-                latest_path: Some("/current-word".into()),
+                latest_url: Some("https://live.test/current-word".into()),
                 active_probes: 1,
                 active_hosts: 1,
             }
