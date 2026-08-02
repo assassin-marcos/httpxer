@@ -4021,15 +4021,22 @@ mod tests {
         // a tight loop and asserts the invariant on every read.
         let p = Arc::new(Progress::new(1_000));
         let stop = Arc::new(AtomicBool::new(false));
+        let work_started = Arc::new(AtomicBool::new(false));
+        let reader_observed_work = Arc::new(AtomicBool::new(false));
 
         let reader = {
             let p = Arc::clone(&p);
             let stop = Arc::clone(&stop);
+            let work_started = Arc::clone(&work_started);
+            let reader_observed_work = Arc::clone(&reader_observed_work);
             std::thread::spawn(move || {
                 let mut worst_pct = 0u32;
                 let mut reads = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     let s = p.snapshot();
+                    if work_started.load(Ordering::Acquire) {
+                        reader_observed_work.store(true, Ordering::Release);
+                    }
                     assert!(
                         s.completed <= s.total,
                         "completed {} > total {}",
@@ -4045,11 +4052,19 @@ mod tests {
         };
 
         let workers: Vec<_> = (0..8)
-            .map(|_| {
+            .map(|worker_index| {
                 let p = Arc::clone(&p);
+                let work_started = Arc::clone(&work_started);
+                let reader_observed_work = Arc::clone(&reader_observed_work);
                 std::thread::spawn(move || {
-                    for _ in 0..2_000 {
+                    for probe_index in 0..2_000 {
                         p.reserve().complete();
+                        if worker_index == 0 && probe_index == 0 {
+                            work_started.store(true, Ordering::Release);
+                            while !reader_observed_work.load(Ordering::Acquire) {
+                                std::thread::yield_now();
+                            }
+                        }
                     }
                 })
             })
@@ -4061,7 +4076,11 @@ mod tests {
 
         let (worst_pct, reads) = reader.join().unwrap();
         assert!(worst_pct <= 100, "progress bar rendered {}%", worst_pct);
-        assert!(reads > 0, "reader thread never observed the run");
+        assert!(reads > 0, "reader thread never sampled progress");
+        assert!(
+            reader_observed_work.load(Ordering::Acquire),
+            "reader thread never observed active work"
+        );
         assert_eq!(
             p.snapshot(),
             ProgressSnapshot { completed: 16_000, total: 16_000 },
