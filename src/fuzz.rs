@@ -1144,6 +1144,25 @@ fn decoy_preflight_paths() -> Vec<PreflightPath> {
 /// yield a usable body (status outside 200-399 / empty body / network error).
 /// What one pre-flight probe yielded. A random path tells us one of two useful
 /// things, and they need different treatment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlashRedirectFingerprint {
+    status: u16,
+    content_length: i64,
+    content_type: String,
+    snippet_md5: String,
+}
+
+impl SlashRedirectFingerprint {
+    fn from_response(parsed: &ParsedResp) -> Self {
+        Self {
+            status: parsed.status,
+            content_length: parsed.content_length,
+            content_type: parsed.content_type.clone(),
+            snippet_md5: parsed.snippet_md5.clone(),
+        }
+    }
+}
+
 enum PreflightOutcome {
     /// Usable for wildcard content fingerprinting.
     Sample(crate::wildcard::ProbeSample),
@@ -1152,6 +1171,10 @@ enum PreflightOutcome {
     /// so a later `401` on a dir-shaped word marks no real directory. See
     /// [`crate::wildcard::AuthCatchall`].
     Auth(crate::wildcard::AuthCatchall),
+    /// The random path redirected to its own trailing-slash form. Two such
+    /// random siblings under one parent prove a path-normalization catchall,
+    /// not two real directories.
+    SlashRedirect(SlashRedirectFingerprint),
 }
 
 async fn wildcard_preflight_probe(
@@ -1190,6 +1213,13 @@ async fn wildcard_preflight_probe(
             content_type: parsed.content_type,
             snippet_md5: parsed.snippet_md5,
         }));
+    }
+    if crate::recurse::trailing_slash_directory_url(&url, parsed.status, &parsed.location)
+        .is_some()
+    {
+        return Some(PreflightOutcome::SlashRedirect(
+            SlashRedirectFingerprint::from_response(&parsed),
+        ));
     }
     // Match donor: only 200-399 with body counts.
     if !matches!(parsed.status, 200..=399) {
@@ -1706,6 +1736,7 @@ pub async fn run(
                         sample_groups.entry(key).or_default().push(s);
                     }
                     PreflightOutcome::Auth(a) => auth_probes.push(a),
+                    PreflightOutcome::SlashRedirect(_) => {}
                 }
             }
 
@@ -2364,6 +2395,19 @@ struct CatchallCache {
     /// Sibling-probe count per origin. One noisy host cannot consume the
     /// entire multi-host run's detection budget.
     parents_used: std::collections::HashMap<String, usize>,
+    /// Parents where two random siblings both redirected to their own
+    /// trailing-slash form. Matching exact-parity redirects under these parents
+    /// are a normalization catchall and must not become recursion roots.
+    slash_redirect_learned:
+        std::collections::HashMap<String, SlashRedirectFingerprint>,
+    /// Redirect parents already sampled to completion.
+    slash_redirect_probed: std::collections::HashSet<String>,
+    /// Redirect sibling checks currently in flight. Concurrent candidates wait
+    /// for one shared result instead of each generating two control requests.
+    slash_redirect_inflight: std::collections::HashSet<String>,
+    /// Redirect sibling-probe count per origin, bounded independently from the
+    /// 2xx content-catchall detector.
+    slash_redirect_parents_used: std::collections::HashMap<String, usize>,
 }
 
 /// Auth response learned from a random child of a confirmed protected
@@ -2427,6 +2471,127 @@ fn any_learned_matches(
                 )
         })
     })
+}
+
+fn learn_slash_redirect_catchall(
+    outcomes: &[Option<PreflightOutcome>],
+) -> Option<SlashRedirectFingerprint> {
+    if outcomes.len() < 2 {
+        return None;
+    }
+    let first = match outcomes.first()? {
+        Some(PreflightOutcome::SlashRedirect(sig)) => sig,
+        _ => return None,
+    };
+    outcomes
+        .iter()
+        .all(|outcome| {
+            matches!(outcome, Some(PreflightOutcome::SlashRedirect(sig)) if sig == first)
+        })
+        .then(|| first.clone())
+}
+
+/// Detect a parent-wide `unknown -> unknown/` normalization rule. The first
+/// candidate under a parent sends two concurrent random-sibling controls;
+/// every concurrent candidate waits for that single result. This adds at most
+/// two requests per sampled parent and prevents one false directory from
+/// multiplying into a complete wordlist round.
+async fn slash_redirect_catchall_suppresses(
+    full_url: &str,
+    parsed: &ParsedResp,
+    cfg: &FuzzCfg,
+    cache: &Arc<Mutex<CatchallCache>>,
+) -> bool {
+    let parent = parent_prefix(full_url);
+    let origin = origin_key(full_url);
+    let candidate_fingerprint = SlashRedirectFingerprint::from_response(parsed);
+
+    enum Role {
+        Probe,
+        Wait,
+        Skip,
+    }
+
+    let role = {
+        let mut c = cache.lock().await;
+        if let Some(learned) = c.slash_redirect_learned.get(&parent) {
+            return learned == &candidate_fingerprint;
+        }
+        if c.slash_redirect_inflight.contains(&parent) {
+            Role::Wait
+        } else if !c.slash_redirect_probed.contains(&parent)
+            && c.slash_redirect_parents_used
+                .get(&origin)
+                .copied()
+                .unwrap_or(0)
+                < MAX_CATCHALL_PARENTS_PER_HOST
+        {
+            c.slash_redirect_probed.insert(parent.clone());
+            c.slash_redirect_inflight.insert(parent.clone());
+            *c.slash_redirect_parents_used
+                .entry(origin.clone())
+                .or_default() += 1;
+            Role::Probe
+        } else {
+            Role::Skip
+        }
+    };
+
+    match role {
+        Role::Probe => {
+            let sibling_paths = [random_hex_path(16), random_hex_path(32)];
+            let futures = sibling_paths.iter().map(|path| {
+                wildcard_preflight_probe(
+                    &parent,
+                    &cfg.request_limiter,
+                    cfg.body_preview_bytes,
+                    &cfg.extra_headers,
+                    cfg.initial_cookie_header.as_deref(),
+                    path,
+                )
+            });
+            let outcomes = futures::future::join_all(futures).await;
+            let learned = learn_slash_redirect_catchall(&outcomes);
+            {
+                let mut c = cache.lock().await;
+                c.slash_redirect_inflight.remove(&parent);
+                if let Some(fingerprint) = &learned {
+                    c.slash_redirect_learned
+                        .insert(parent.clone(), fingerprint.clone());
+                } else if outcomes.iter().any(Option::is_none) {
+                    // A transport failure is inconclusive, not a permanent
+                    // negative. Let a later candidate retry the bounded check.
+                    c.slash_redirect_probed.remove(&parent);
+                }
+            }
+            if let Some(fingerprint) = &learned {
+                eprintln!(
+                    "  [redirect-catchall] {} status={} (2 random siblings also append /); matching redirects suppressed",
+                    parent, fingerprint.status
+                );
+            }
+            learned
+                .as_ref()
+                .is_some_and(|fingerprint| fingerprint == &candidate_fingerprint)
+        }
+        Role::Wait => {
+            let max_polls = (cfg.timeout_ms / 10).max(50) as usize + 50;
+            for _ in 0..max_polls {
+                {
+                    let c = cache.lock().await;
+                    if let Some(learned) = c.slash_redirect_learned.get(&parent) {
+                        return learned == &candidate_fingerprint;
+                    }
+                    if !c.slash_redirect_inflight.contains(&parent) {
+                        return false;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        }
+        Role::Skip => false,
+    }
 }
 
 impl CatchallCache {
@@ -2586,8 +2751,9 @@ fn scoped_path_len(scope: &str, full_url: &str) -> usize {
     decoded_path_len(path)
 }
 
-/// Hybrid per-directory catchall test. Returns `true` if this 2xx response is a
-/// per-prefix catchall shell that should be SUPPRESSED (and not recursed).
+/// Hybrid per-directory catchall test. Returns `true` if this response is a
+/// per-prefix content shell or trailing-slash redirect catchall that should be
+/// SUPPRESSED (and not recursed).
 /// Never holds the cache lock across the network probe.
 async fn catchall_suppresses(
     item: &ProbeItem,
@@ -2595,7 +2761,18 @@ async fn catchall_suppresses(
     cfg: &FuzzCfg,
     cache: &Arc<Mutex<CatchallCache>>,
 ) -> bool {
-    // Only 2xx shells; redirects are out of scope.
+    let full_url = format!("{}{}", item.host_input, item.path);
+    if crate::recurse::trailing_slash_directory_url(
+        &full_url,
+        parsed.status,
+        &parsed.location,
+    )
+    .is_some()
+    {
+        return slash_redirect_catchall_suppresses(&full_url, parsed, cfg, cache).await;
+    }
+
+    // Content-shell detection remains limited to 2xx.
     if !matches!(parsed.status, 200..=299) {
         return false;
     }
@@ -2605,7 +2782,6 @@ async fn catchall_suppresses(
     //     let hosts answering `200` + no body for EVERY path flood the output
     //     (v0.6.0 bug). Handled here on its own frequency rule, then out —
     //     content matching has nothing to work with.
-    let full_url = format!("{}{}", item.host_input, item.path);
     let origin = origin_key(&full_url);
     let parent = parent_prefix(&full_url);
 
@@ -2700,7 +2876,7 @@ async fn catchall_suppresses(
                     .flatten()
                     .filter_map(|o| match o {
                         PreflightOutcome::Sample(s) => Some(s),
-                        PreflightOutcome::Auth(_) => None,
+                        PreflightOutcome::Auth(_) | PreflightOutcome::SlashRedirect(_) => None,
                     })
                     .collect();
             // Require ≥2 agreeing samples so a single random 200 (a real page)
@@ -3846,6 +4022,40 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         }
+    }
+
+    #[test]
+    fn slash_redirect_catchall_learns_only_two_matching_response_controls() {
+        let candidate = ParsedResp {
+            effective_url: "https://x.test/admin".into(),
+            status: 308,
+            content_length: 0,
+            content_type: "text/plain".into(),
+            title: String::new(),
+            location: "/admin/".into(),
+            server: String::new(),
+            body_preview_for_output: String::new(),
+            snippet_md5: "empty".into(),
+            raw_body: String::new(),
+            headers: Vec::new(),
+        };
+        let matching = SlashRedirectFingerprint::from_response(&candidate);
+        let confirmed = vec![
+            Some(PreflightOutcome::SlashRedirect(matching.clone())),
+            Some(PreflightOutcome::SlashRedirect(matching.clone())),
+        ];
+        assert_eq!(learn_slash_redirect_catchall(&confirmed), Some(matching.clone()));
+
+        let mut distinct = matching.clone();
+        distinct.content_type = "text/html".into();
+        let mixed_fingerprint = vec![
+            Some(PreflightOutcome::SlashRedirect(matching.clone())),
+            Some(PreflightOutcome::SlashRedirect(distinct)),
+        ];
+        assert_eq!(learn_slash_redirect_catchall(&mixed_fingerprint), None);
+
+        let incomplete = vec![Some(PreflightOutcome::SlashRedirect(matching)), None];
+        assert_eq!(learn_slash_redirect_catchall(&incomplete), None);
     }
 
     #[test]

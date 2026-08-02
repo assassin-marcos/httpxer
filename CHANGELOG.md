@@ -2,6 +2,18 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.6.10] — 2026-08-02
+
+### Fixed
+- Prefix-wide `path -> path/` redirect normalization no longer fills the recursion directory cap or multiplies full-wordlist rounds.
+- Exact trailing-slash redirects are confirmed with two bounded random-sibling controls, while redirects with a distinct response fingerprint remain eligible.
+
+### Changed
+- Redirect catchall controls are single-flight per parent, fingerprint-aware, and reuse the existing wildcard policy without adding CLI flags.
+
+### Verified
+- The locked test suite, optimized release build, and concurrent local recursion fixtures passed before release.
+
 ## [0.6.9] — 2026-08-01
 
 ### Fixed

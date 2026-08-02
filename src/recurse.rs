@@ -504,6 +504,23 @@ fn directory_url(req_url: &str) -> String {
     format!("{}/", base.trim_end_matches('/'))
 }
 
+/// Return the canonical trailing-slash destination when a redirect has exact
+/// request-path parity (`/admin -> /admin/`). This is structural evidence only:
+/// callers still need to distinguish a real directory from a server-wide or
+/// prefix-wide rule that appends `/` to every unknown path.
+pub fn trailing_slash_directory_url(
+    req_url: &str,
+    status: u16,
+    location: &str,
+) -> Option<String> {
+    if !matches!(status, 301 | 302 | 307 | 308) || location.is_empty() {
+        return None;
+    }
+    let candidate = directory_url(req_url);
+    let resolved = crate::probe::resolve_redirect_url(req_url, location);
+    (canonical_url_key(&resolved) == canonical_url_key(&candidate)).then_some(candidate)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DirectoryResponse<'a> {
     pub status: u16,
@@ -554,9 +571,10 @@ pub fn detect_directory(
 
     // Pattern 1: redirect-to-trailing-slash.
     if matches!(response.status, 301 | 302 | 307 | 308) && !response.location.is_empty() {
-        let resolved = crate::probe::resolve_redirect_url(req_url, response.location);
-        if canonical_url_key(&resolved) == canonical_url_key(&directory_url) {
-            return Some(directory_url);
+        if let Some(candidate) =
+            trailing_slash_directory_url(req_url, response.status, response.location)
+        {
+            return Some(candidate);
         }
         // Constant-Location catchall — Location is the same regardless
         // of the request path. NOT a directory; drop.
@@ -914,6 +932,31 @@ mod tests {
             .as_deref(),
             Some("https://x.com/admin/")
         );
+    }
+
+    #[test]
+    fn trailing_slash_redirect_helper_requires_exact_parity() {
+        assert_eq!(
+            trailing_slash_directory_url(
+                "https://x.com/api/admin?view=compact#top",
+                308,
+                "/api/admin/",
+            )
+            .as_deref(),
+            Some("https://x.com/api/admin/")
+        );
+        assert!(trailing_slash_directory_url(
+            "https://x.com/api/admin",
+            302,
+            "/login",
+        )
+        .is_none());
+        assert!(trailing_slash_directory_url(
+            "https://x.com/api/admin",
+            200,
+            "/api/admin/",
+        )
+        .is_none());
     }
 
     #[test]

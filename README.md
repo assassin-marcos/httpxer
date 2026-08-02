@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey.svg)]()
 
-**Current release:** [v0.6.9](https://github.com/assassin-marcos/httpxer/releases/tag/v0.6.9)
+**Current release:** [v0.6.10](https://github.com/assassin-marcos/httpxer/releases/tag/v0.6.10)
 
 ```
  _     _   _
@@ -131,7 +131,7 @@ This closes the case where a constant-size catchall with a per-request token use
 
 Use `--recurse N`, `--crawl N`, or `--deep N` to turn the host × wordlist single pass into a multi-round orchestrator:
 
-- **Recursion** — response-aware directory classification accepts exact trailing-slash redirects and, with `--recurse-on-200`, autoindex content, directory MIME, matching `Content-Location`, or an explicit trailing-slash route. File-like paths, common `/.well-known/` leaf resources, attachments, and terminal/static MIME types remain reportable findings but never become full-wordlist recursion roots.
+- **Recursion** — response-aware directory classification accepts exact trailing-slash redirects after two bounded random-sibling controls reject prefix-wide slash-normalization catchalls. Redirects with a distinct status and response fingerprint remain eligible. With `--recurse-on-200`, autoindex content, directory MIME, matching `Content-Location`, or an explicit trailing-slash route can also prove a directory. File-like paths, common `/.well-known/` leaf resources, attachments, and terminal/static MIME types remain reportable findings but never become full-wordlist recursion roots.
 - **Auth-dir recursion** — a `401` on a plausible directory path (e.g. `/api`, `/.well-known`, or `/v1.2`, not `/x.php`) is descended into so accessible children behind a protected parent are found (the classic `/api` = 401 → `/api/actuator` = 200). Random-sibling and random-child checks reject nested prefix auth walls before they multiply the wordlist. `403` recursion is off by default because WAF path rules produce noisy false directories; use `--recurse-on-403` when exhaustive 403 expansion is intentional. Omitting `401`/`403` from `--status` hides parents without disabling discovery. Bounded by `--max-dirs-per-host`.
 - **Crawl** — response bodies are parsed for HTML `<a/link/script/img/form/iframe>`, robots.txt `Disallow/Allow/Sitemap`, and sitemap.xml `<loc>`. Discovery happens before output status/size filters. A `3xx` stays attached to its requested path while its `Location` is queued as a separate crawl URL, so crawling cannot change wildcard identity.
 
