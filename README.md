@@ -21,7 +21,7 @@
 
 One tool, two jobs:
 
-- **Enrich mode** — reads a hostname list, probes each over HTTP(S), and emits one JSONL record per host with DNS, CDN, Wappalyzer-style technology detection, and HTTP metadata. `--httpx-compat` provides the common httpx JSON field shape; exact byte-for-byte parity is not promised.
+- **Enrich mode** — reads a hostname list, probes each over HTTP(S), and emits DNS, CDN, Wappalyzer-style technology detection, and HTTP metadata. By default JSONL keeps one diagnostic record per input; `--live-only` removes DNS failures and hosts with no HTTP/HTTPS response. `--httpx-compat` provides the common httpx JSON field shape; exact byte-for-byte parity is not promised.
 - **Fuzz mode** — host × wordlist Cartesian probe with **recursive** dir bruteforce (incl. smart auto-recursion into protected `401` dirs and opt-in `403` recursion), **crawl** (HTML/robots/sitemap link extraction), **content-aware wildcard detection** (static catchall + per-request-nonce catchall + path-echo), a **native, content-confirmed `401`/`403` bypass engine**, and a live findings/progress stream showing the newest active request URL.
 
 Both modes share a 16-slot **BoringSSL** browser-emulation pool. Enrich mode samples the pool per probe; fuzz mode pins one profile per host so wildcard pre-flight and wordlist probes see the same UA-dependent response. Distinct hosts are still distributed across the pool.
@@ -52,6 +52,15 @@ Released binaries: Linux `x86_64` (glibc 2.35+), macOS `x86_64` and `arm64`, and
 httpxer -u https://example.com
 httpxer -l hosts.txt -o enriched.jsonl
 subfinder -d example.com -silent | httpxer -l - -o enriched.jsonl
+
+# Only HTTP/HTTPS-responsive hosts; show status/title live and save plain text
+httpxer -l hosts.txt --live-only --tech off --no-cdn -o live.txt
+
+# Save only one responsive URL per line (terminal remains detailed)
+httpxer -l hosts.txt --urls-only --tech off --no-cdn -o live-urls.txt
+
+# Same responsive-host file without terminal findings or progress
+httpxer -l hosts.txt --urls-only --tech off --no-cdn -q -o live-urls.txt
 
 # Common httpx-compatible JSON fields
 httpxer -l hosts.txt --httpx-compat -o enriched.jsonl
@@ -242,7 +251,9 @@ httpxer -l urls.txt -o out.jsonl --with-body --tech off -t 8
 500    5.4KB  https://example.com/buggy.aspx
 ```
 
-Color-coded by status class when stderr is a TTY: green 2xx, yellow 3xx, cyan 401/403, magenta other 4xx, red 5xx.
+Enrich-mode lines append the page title when present. With `--live-only`, records without an HTTP status are omitted; bare hostnames try HTTPS first and fall back to HTTP. `--urls-only` implies that filter and writes each responsive input origin (`scheme://host[:port]`), one per line, regardless of the output filename extension. Cross-host redirects do not replace the input subdomain; paths, query strings, status, title, and JSON metadata stay out of that file. Without either flag, unresolved plain records use `ERR`, while JSONL retains the full `error` field.
+
+When `-o` is used, emitted enrich results are also shown live on stderr. `--no-live` hides result lines but retains progress; `-q` hides both result lines and progress. Fuzz status lines remain color-coded by status class when stderr is a TTY.
 
 ### JSONL (default / `.jsonl` extension / `--format json`)
 
@@ -310,6 +321,9 @@ httpxer ... --cookie "sid=abc123" --cookie "csrf=token"
 | `--backup auto\|off\|dry-run` | `auto` | Host-derived backups, disable, or request-free preview |
 | `--safe` | off | Disable the native 401/403 bypass engine |
 | `--tech default\|off\|FILE` | `default` | Embedded, disabled, or custom enrich fingerprints |
+| `--live-only` | off | Enrich: emit only HTTP/HTTPS-responsive hosts |
+| `--urls-only` | off | Enrich: write each responsive input as `scheme://host[:port]`; implies `--live-only` |
+| `--no-live` | off | Hide live terminal findings but retain progress |
 | `-H "K: V"` | — | Custom header (repeatable) |
 | `--bearer <TOK>` | — | `Authorization: Bearer TOK` |
 | `--cookie "K=V"` | — | Static Cookie header value (repeatable) |

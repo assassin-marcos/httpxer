@@ -53,6 +53,8 @@ MODE
   With -w  Fuzz paths: wildcard filtering, backup checks, recursion, and crawl"#,
     after_help = r#"QUICK EXAMPLES
   [PROBE]    httpxer -u https://example.com
+  [LIVE]     httpxer -l hosts.txt --live-only -o live.txt
+  [URLS]     httpxer -l hosts.txt --urls-only -o live-urls.txt
   [TECH]     httpxer -u https://example.com --tech default
   [HEADERS]  httpxer -u https://example.com --rh
   [FUZZ]     httpxer -u https://example.com -w common.txt -o hits.txt
@@ -68,6 +70,8 @@ Use `httpxer --help` for advanced options and more examples."#,
     httpxer -u https://example.com
     httpxer -l hosts.txt --tech default -o hosts.jsonl
     httpxer -l hosts.txt --tech off -o hosts.jsonl
+    httpxer -l hosts.txt --live-only -o live.txt
+    httpxer -l hosts.txt --urls-only --tech off --no-cdn -o live-urls.txt
 
   HEADERS AND BODY
     httpxer -u https://example.com --rh
@@ -100,7 +104,7 @@ Use `httpxer --help` for advanced options and more examples."#,
     cat hosts.txt | httpxer -l - --httpx-compat -o hosts.jsonl
     httpxer -u https://example.com -w common.txt -o hits.txt
 
-`.txt` output is plain `STATUS SIZE URL`; other extensions use JSONL.
+`.txt` output is plain `STATUS SIZE URL` (plus title in probe mode); other extensions use JSONL.
 Full recipes: https://github.com/assassin-marcos/httpxer"#
 )]
 struct Args {
@@ -153,6 +157,14 @@ struct Args {
     /// Disable CDN detection in probe mode
     #[arg(long, help_heading = "Probe mode")]
     no_cdn: bool,
+
+    /// Emit only hosts that returned an HTTP or HTTPS response
+    #[arg(long, help_heading = "Probe mode")]
+    live_only: bool,
+
+    /// Write each responsive input origin, one per line; implies --live-only
+    #[arg(long, help_heading = "Probe mode")]
+    urls_only: bool,
 
     /// Skip tech detection (legacy spelling; prefer `--tech off`)
     #[arg(long, hide_short_help = true, help_heading = "Probe mode")]
@@ -382,19 +394,15 @@ struct Args {
     #[arg(long = "exclude-root-size", visible_alias = "ers", hide_short_help = true, help_heading = "Fuzz mode")]
     exclude_root_size: bool,
 
-    /// Output file format. `json` (default) writes one full FuzzRecord
-    /// JSONL line per finding. `plain` writes dirsearch-style
-    /// `STATUS  SIZE  URL` per finding — much smaller files, human-
-    /// readable, no body_preview. Auto-detected from `-o` extension when
-    /// this flag isn't passed (`.txt` → `plain`, anything else → `json`).
+    /// Output file format. `json` writes one full JSONL record. `plain`
+    /// writes a compact status/size/URL line (plus title in probe mode).
+    /// Auto-detected from `-o` (`.txt` → `plain`, otherwise `json`).
     #[arg(long = "format", hide_short_help = true, help_heading = "Output")]
     format: Option<String>,
 
-    /// Suppress the live findings display on stderr (v0.3.13). By
-    /// default, every emitted finding prints to the terminal in
-    /// dirsearch-style format (`STATUS SIZE URL`, color-coded by status
-    /// class) above the progress bar. Pass this to silence and rely on
-    /// the output file only — useful for log scrapers / tee invocations.
+    /// Suppress the live findings display on stderr. By default, every
+    /// emitted finding prints to the terminal when `-o` is used. Pass this
+    /// to rely on the output file only; `-q` also hides progress summaries.
     #[arg(long = "no-live", hide_short_help = true, help_heading = "Output")]
     no_live: bool,
 
@@ -691,6 +699,8 @@ struct EnrichRecord {
     #[serde(skip)]
     raw_input: String,
     #[serde(skip)]
+    successful_input_url: Option<String>,
+    #[serde(skip)]
     raw_scheme: String,
     #[serde(skip)]
     raw_port: String,
@@ -920,6 +930,19 @@ fn parse_url_parts(url: &str) -> (String, String, String) {
     ("https".to_string(), "443".to_string(), "/".to_string())
 }
 
+fn observed_probe_url(input: &str, final_url: Option<&str>, via_https: bool) -> String {
+    if let Some(final_url) = final_url {
+        return final_url.to_string();
+    }
+    let scheme = if via_https { "https" } else { "http" };
+    if let Ok(mut parsed) = url::Url::parse(input) {
+        if parsed.set_scheme(scheme).is_ok() {
+            return parsed.to_string();
+        }
+    }
+    format!("{}://{}", scheme, input.trim_end_matches('/'))
+}
+
 fn read_hosts(path: &str) -> Result<Vec<String>> {
     let mut lines: Vec<String> = Vec::new();
     let push = |lines: &mut Vec<String>, l: String| {
@@ -971,6 +994,20 @@ fn read_existing_subdomains(path: &str) -> HashSet<String> {
                         break;
                     }
                 }
+            }
+            continue;
+        }
+        // Enrich plain output is `STATUS SIZE URL [TITLE]`; `--urls-only`
+        // writes just URL. Accept both so text outputs remain resume-aware.
+        let mut fields = line.split_whitespace();
+        let first = fields.next();
+        let second = fields.next();
+        let third = fields.next();
+        let candidate = third.or_else(|| if second.is_none() { first } else { None });
+        if let Some(url) = candidate {
+            let host = extract_host(url);
+            if !host.is_empty() {
+                out.insert(host);
             }
         }
     }
@@ -1217,37 +1254,140 @@ fn write_realtime_line<W: Write>(output: &mut W, line: &str) -> std::io::Result<
     output.flush()
 }
 
-fn write_enrich_result(
+fn format_enrich_size(bytes: Option<u64>) -> String {
+    let Some(bytes) = bytes else {
+        return "--".to_string();
+    };
+    let value = bytes as f64;
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    if value < KB {
+        format!("{}B", bytes)
+    } else if value < MB {
+        format!("{:.0}KB", value / KB)
+    } else if value < GB {
+        format!("{:.1}MB", value / MB)
+    } else {
+        format!("{:.1}GB", value / GB)
+    }
+}
+
+fn sanitize_plain_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn format_enrich_plain(record: &EnrichRecord) -> String {
+    let status = record
+        .status_code
+        .map(|status| status.to_string())
+        .unwrap_or_else(|| "ERR".to_string());
+    let size = format_enrich_size(record.content_length);
+    let url = sanitize_plain_field(
+        record
+            .final_url
+            .as_deref()
+            .unwrap_or(record.raw_input.as_str()),
+    );
+    let detail = record
+        .title
+        .as_deref()
+        .or(record.error.as_deref())
+        .map(sanitize_plain_field)
+        .filter(|value| !value.is_empty());
+    match detail {
+        Some(detail) => format!("{:>3} {:>7}  {}  {}", status, size, url, detail),
+        None => format!("{:>3} {:>7}  {}", status, size, url),
+    }
+}
+
+fn format_enrich_url_origin(record: &EnrichRecord) -> String {
+    let candidate = record
+        .successful_input_url
+        .as_deref()
+        .unwrap_or(record.raw_input.as_str());
+    let Ok(parsed) = url::Url::parse(candidate) else {
+        return sanitize_plain_field(candidate);
+    };
+    let Some(host) = parsed.host_str() else {
+        return sanitize_plain_field(candidate);
+    };
+    let host = if host.starts_with('[') && host.ends_with(']') {
+        host.to_string()
+    } else if host.contains(':') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    };
+    match parsed.port() {
+        Some(port) => format!("{}://{}:{}", parsed.scheme(), host, port),
+        None => format!("{}://{}", parsed.scheme(), host),
+    }
+}
+
+fn write_enrich_result<W: Write>(
     joined: std::result::Result<EnrichRecord, tokio::task::JoinError>,
-    output: &mut std::fs::File,
+    output: &mut W,
+    output_format: fuzz::OutputFormat,
     httpx_compat: bool,
-    completed: &mut usize,
+    live_only: bool,
+    urls_only: bool,
+    live_findings: bool,
+    processed: &mut usize,
+    emitted: &mut usize,
     total: usize,
     quiet: bool,
 ) -> Result<()> {
     match joined {
         Ok(record) => {
-            let line = if httpx_compat {
-                serde_json::to_string(&HttpxCompatRecord::from_enrich(record))?
-            } else {
-                serde_json::to_string(&record)?
-            };
-            write_realtime_line(output, &line)?;
-            *completed += 1;
-            if !quiet && (*completed % 50 == 0 || *completed == total) {
-                eprintln!("  [{}/{}]", *completed, total);
+            *processed += 1;
+            if !(live_only || urls_only) || record.status_code.is_some() {
+                let display_line = format_enrich_plain(&record);
+                let output_line = if urls_only {
+                    format_enrich_url_origin(&record)
+                } else {
+                    match output_format {
+                        fuzz::OutputFormat::Plain => display_line.clone(),
+                        fuzz::OutputFormat::Json if httpx_compat => {
+                            serde_json::to_string(&HttpxCompatRecord::from_enrich(record))?
+                        }
+                        fuzz::OutputFormat::Json => serde_json::to_string(&record)?,
+                    }
+                };
+                write_realtime_line(output, &output_line)?;
+                *emitted += 1;
+                if live_findings {
+                    eprintln!("{}", display_line);
+                }
             }
         }
         Err(error) => {
+            *processed += 1;
             eprintln!("[!] probe task did not complete: {}", error);
         }
+    }
+    if !quiet && (*processed % 50 == 0 || *processed == total) {
+        eprintln!("  [{}/{}]", *processed, total);
     }
     Ok(())
 }
 
 fn validate_mode_specific_args(args: &Args) -> Result<()> {
     if args.paths.is_some() {
+        if args.live_only || args.urls_only {
+            anyhow::bail!(
+                "--live-only and --urls-only are probe-only and cannot be used with `-w WORDLIST`"
+            );
+        }
         return Ok(());
+    }
+    if args.urls_only && (args.format.is_some() || args.httpx_compat) {
+        anyhow::bail!("--urls-only cannot be combined with --format or --httpx-compat");
     }
     let mut fuzz_only = Vec::new();
     if args.status.is_some() { fuzz_only.push("--status"); }
@@ -1274,7 +1414,6 @@ fn validate_mode_specific_args(args: &Args) -> Result<()> {
     if !args.exclude_sizes.is_empty() || args.exclude_root_size {
         fuzz_only.push("--exclude-sizes/--exclude-root-size");
     }
-    if args.format.is_some() || args.no_live { fuzz_only.push("--format/--no-live"); }
     if args.scope.is_some() || args.max_links_per_page != 200 { fuzz_only.push("--scope/--max-links-per-page"); }
     if args.fuzz_follow_redirects { fuzz_only.push("--fuzz-follow-redirects"); }
     if args.no_wildcard || args.wildcard_policy != "strict" { fuzz_only.push("--wildcard"); }
@@ -1856,6 +1995,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let output_format = match args.format.as_deref() {
+        Some(value) => fuzz::OutputFormat::from_cli(value)?,
+        None => fuzz::OutputFormat::from_path(output_path),
+    };
+
     // 2. Resume: skip already-processed entries from the existing output file.
     if !args.no_resume {
         let done = read_existing_subdomains(output_path);
@@ -1950,8 +2094,12 @@ async fn main() -> Result<()> {
     let mut set: FuturesUnordered<tokio::task::JoinHandle<EnrichRecord>> = FuturesUnordered::new();
     let total = hosts.len();
     let max_inflight = args.threads.max(1);
-    let mut completed = 0usize;
+    let mut processed = 0usize;
+    let mut emitted = 0usize;
     let httpx_compat = args.httpx_compat;
+    let live_only = args.live_only;
+    let urls_only = args.urls_only;
+    let live_findings = user_named_output && !args.no_live && !args.quiet;
 
     for input in hosts {
         let host = extract_host(&input);
@@ -2038,6 +2186,7 @@ async fn main() -> Result<()> {
                 raw_ipv4,
                 raw_ipv6,
                 raw_input,
+                successful_input_url: None,
                 raw_scheme,
                 raw_port,
                 raw_path,
@@ -2061,6 +2210,7 @@ async fn main() -> Result<()> {
                 None => rec.error = Some("http: no response".into()),
                 Some(r) => {
                     rec.status_code = Some(r.status_code);
+                    rec.successful_input_url = Some(r.probe_url.clone());
                     rec.content_length = r.content_length;
                     rec.content_type = r.content_type;
                     rec.word_count = Some(r.word_count);
@@ -2068,7 +2218,11 @@ async fn main() -> Result<()> {
                     rec.server = r.server;
                     rec.location = r.location;
                     rec.title = r.title;
-                    rec.final_url = r.final_url;
+                    rec.final_url = Some(observed_probe_url(
+                        &url_or_host,
+                        r.final_url.as_deref(),
+                        r.via_https,
+                    ));
                     rec.redirect_chain = r.chain;
                     rec.time = Some(probe::format_elapsed_go(r.elapsed));
                     // If the final URL we settled on differs in scheme /
@@ -2123,8 +2277,13 @@ async fn main() -> Result<()> {
                 write_enrich_result(
                     joined,
                     &mut out_file,
+                    output_format,
                     httpx_compat,
-                    &mut completed,
+                    live_only,
+                    urls_only,
+                    live_findings,
+                    &mut processed,
+                    &mut emitted,
                     total,
                     args.quiet,
                 )?;
@@ -2132,21 +2291,29 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 9. Drain — write NDJSON as each completes (crash-safe, no buffered tail).
-    //    When `--httpx-compat` is set, every record is reshaped from the
-    //    default EnrichRecord into HttpxCompatRecord just before serialise.
+    // 9. Drain — write each record as it completes (crash-safe, no buffered
+    //    tail). JSON output is reshaped just before serialisation when
+    //    `--httpx-compat` is set; plain output uses the compact live line.
     while let Some(joined) = set.next().await {
         write_enrich_result(
             joined,
             &mut out_file,
+            output_format,
             httpx_compat,
-            &mut completed,
+            live_only,
+            urls_only,
+            live_findings,
+            &mut processed,
+            &mut emitted,
             total,
             args.quiet,
         )?;
     }
     out_file.flush()?;
-    eprintln!("[+] done: wrote {} records to {}", completed, output_path);
+    eprintln!(
+        "[+] done: processed {} hosts; wrote {} records to {}",
+        processed, emitted, output_path
+    );
     let (pool_retries, pool_failures) = probe::wreq_pool_panic_stats();
     if pool_retries > 0 {
         eprintln!(
@@ -2192,6 +2359,7 @@ mod tests {
             raw_ipv4: vec!["1.2.3.4".into(), "1.2.3.5".into()],
             raw_ipv6: vec!["2001:db8::1".into()],
             raw_input: "https://target.com".into(),
+            successful_input_url: Some("https://target.com".into()),
             raw_scheme: "https".into(),
             raw_port: "443".into(),
             raw_path: "/".into(),
@@ -2333,6 +2501,30 @@ mod tests {
     }
 
     #[test]
+    fn observed_probe_url_tracks_https_to_http_fallback() {
+        assert_eq!(
+            observed_probe_url("target.test:8080", None, false),
+            "http://target.test:8080"
+        );
+        assert_eq!(
+            observed_probe_url("target.test", None, true),
+            "https://target.test"
+        );
+        assert_eq!(
+            observed_probe_url("https://target.test:8443/path", None, false),
+            "http://target.test:8443/path"
+        );
+        assert_eq!(
+            observed_probe_url(
+                "https://target.test",
+                Some("http://redirect.test/final"),
+                true,
+            ),
+            "http://redirect.test/final"
+        );
+    }
+
+    #[test]
     fn dns_host_strips_ports_without_collapsing_endpoint_identity() {
         assert_eq!(extract_dns_host("https://foo.com:8080/bar"), "foo.com");
         assert_eq!(extract_dns_host("foo.com:8443/path"), "foo.com");
@@ -2354,7 +2546,9 @@ mod tests {
             concat!(
                 "{\"subdomain\":\"native.test\"}\n",
                 "{\"host\":\"compat.test\",\"input\":\"compat.test\"}\n",
-                "{\"input\":\"https://input.test:8443/a\"}\n"
+                "{\"input\":\"https://input.test:8443/a\"}\n",
+                "200     1KB  https://plain.test/  Plain title\n",
+                "https://url-only.test/\n"
             ),
         )
         .unwrap();
@@ -2362,6 +2556,8 @@ mod tests {
         assert!(hosts.contains("native.test"));
         assert!(hosts.contains("compat.test"));
         assert!(hosts.contains("input.test:8443"));
+        assert!(hosts.contains("plain.test"));
+        assert!(hosts.contains("url-only.test"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -2527,6 +2723,48 @@ mod tests {
     }
 
     #[test]
+    fn live_only_is_probe_only_and_plain_format_works_in_probe_mode() {
+        let args = Args::try_parse_from(normalize_args(cli(&[
+            "-u", "x.test", "--live-only", "--format", "plain",
+        ])))
+        .unwrap();
+        assert!(args.live_only);
+        assert!(validate_mode_specific_args(&args).is_ok());
+        assert_eq!(
+            fuzz::OutputFormat::from_cli(args.format.as_deref().unwrap()).unwrap(),
+            fuzz::OutputFormat::Plain
+        );
+
+        let fuzz_args = Args::try_parse_from(normalize_args(cli(&[
+            "-u", "x.test", "-w", "words.txt", "--live-only",
+        ])))
+        .unwrap();
+        assert!(validate_mode_specific_args(&fuzz_args).is_err());
+    }
+
+    #[test]
+    fn urls_only_is_probe_only_and_rejects_structured_output_flags() {
+        let args = Args::try_parse_from(normalize_args(cli(&[
+            "-u", "x.test", "--urls-only",
+        ])))
+        .unwrap();
+        assert!(args.urls_only);
+        assert!(validate_mode_specific_args(&args).is_ok());
+
+        let fuzz_args = Args::try_parse_from(normalize_args(cli(&[
+            "-u", "x.test", "-w", "words.txt", "--urls-only",
+        ])))
+        .unwrap();
+        assert!(validate_mode_specific_args(&fuzz_args).is_err());
+
+        let format_args = Args::try_parse_from(normalize_args(cli(&[
+            "-u", "x.test", "--urls-only", "--format", "json",
+        ])))
+        .unwrap();
+        assert!(validate_mode_specific_args(&format_args).is_err());
+    }
+
+    #[test]
     fn legacy_dirsearch_style_command_still_parses() {
         let args = Args::try_parse_from(normalize_args(cli(&[
             "-u", "https://x.test", "-w", "a.txt,b.txt", "-t150", "-r", "-R3",
@@ -2559,6 +2797,8 @@ mod tests {
 
         for tag in [
             "[PROBE]",
+            "[LIVE]",
+            "[URLS]",
             "[TECH]",
             "[HEADERS]",
             "[FUZZ]",
@@ -2592,6 +2832,150 @@ mod tests {
         assert!(help.contains("--dns-concurrency"));
         assert!(help.contains("--exclude-root-size"));
         assert!(help.contains("--with-body"));
+    }
+
+    #[test]
+    fn enrich_plain_output_contains_status_url_and_safe_title() {
+        let mut rec = sample_enrich();
+        rec.title = Some("Example\nInjected".into());
+        let line = format_enrich_plain(&rec);
+        assert_eq!(line, "200     1KB  https://target.com/  Example Injected");
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn enrich_live_only_skips_failed_records_and_advances_progress() {
+        let mut rec = sample_enrich();
+        rec.status_code = None;
+        rec.content_length = None;
+        rec.final_url = None;
+        rec.title = None;
+        rec.error = Some("dns: no records".into());
+
+        let mut output = Vec::new();
+        let mut processed = 0;
+        let mut emitted = 0;
+        write_enrich_result(
+            Ok(rec),
+            &mut output,
+            fuzz::OutputFormat::Plain,
+            false,
+            true,
+            false,
+            false,
+            &mut processed,
+            &mut emitted,
+            1,
+            true,
+        )
+        .unwrap();
+
+        assert!(output.is_empty());
+        assert_eq!(processed, 1);
+        assert_eq!(emitted, 0);
+    }
+
+    #[test]
+    fn enrich_plain_output_keeps_failures_without_live_only() {
+        let mut rec = sample_enrich();
+        rec.status_code = None;
+        rec.content_length = None;
+        rec.final_url = None;
+        rec.title = None;
+        rec.error = Some("dns: no records".into());
+
+        let mut output = Vec::new();
+        let mut processed = 0;
+        let mut emitted = 0;
+        write_enrich_result(
+            Ok(rec),
+            &mut output,
+            fuzz::OutputFormat::Plain,
+            false,
+            false,
+            false,
+            false,
+            &mut processed,
+            &mut emitted,
+            1,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "ERR      --  https://target.com  dns: no records\n"
+        );
+        assert_eq!(processed, 1);
+        assert_eq!(emitted, 1);
+    }
+
+    #[test]
+    fn enrich_urls_only_writes_one_responsive_url_per_line() {
+        let mut rec = sample_enrich();
+        rec.final_url = Some("https://login.example.net/login?next=%2Fadmin".into());
+        let mut output = Vec::new();
+        let mut processed = 0;
+        let mut emitted = 0;
+
+        write_enrich_result(
+            Ok(rec),
+            &mut output,
+            fuzz::OutputFormat::Json,
+            false,
+            false,
+            true,
+            false,
+            &mut processed,
+            &mut emitted,
+            1,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(String::from_utf8(output).unwrap(), "https://target.com\n");
+        assert_eq!(processed, 1);
+        assert_eq!(emitted, 1);
+    }
+
+    #[test]
+    fn enrich_urls_only_preserves_non_default_ports_and_ipv6() {
+        let mut rec = sample_enrich();
+        rec.successful_input_url = Some("http://target.com:8080/path".into());
+        assert_eq!(format_enrich_url_origin(&rec), "http://target.com:8080");
+
+        rec.successful_input_url = Some("https://[2001:db8::1]:8443/a".into());
+        assert_eq!(format_enrich_url_origin(&rec), "https://[2001:db8::1]:8443");
+    }
+
+    #[test]
+    fn enrich_urls_only_omits_unresponsive_hosts() {
+        let mut rec = sample_enrich();
+        rec.status_code = None;
+        rec.final_url = None;
+        rec.error = Some("dns: no records".into());
+        let mut output = Vec::new();
+        let mut processed = 0;
+        let mut emitted = 0;
+
+        write_enrich_result(
+            Ok(rec),
+            &mut output,
+            fuzz::OutputFormat::Plain,
+            false,
+            false,
+            true,
+            false,
+            &mut processed,
+            &mut emitted,
+            1,
+            true,
+        )
+        .unwrap();
+
+        assert!(output.is_empty());
+        assert_eq!(processed, 1);
+        assert_eq!(emitted, 0);
     }
 
     #[derive(Default)]

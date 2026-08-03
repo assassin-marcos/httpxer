@@ -2,6 +2,18 @@
 
 All notable changes to **httpxer** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+## [0.6.13] — 2026-08-03
+
+### Added
+- Enrich mode can emit only HTTP/HTTPS-responsive hosts with `--live-only` and show compact status, URL, size, and title lines while writing an output file.
+- Enrich mode can write each responsive input origin per line with `--urls-only`, preserving the input host across redirects.
+
+### Fixed
+- Enrich-mode `.txt` outputs now use the documented plain format and remain resume-aware instead of containing JSONL records.
+- Bare-host probes that fall back from HTTPS to HTTP now report the successful HTTP URL instead of retaining the attempted HTTPS scheme.
+
 ## [0.6.12] — 2026-08-03
 
 ### Changed

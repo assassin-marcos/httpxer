@@ -47,6 +47,8 @@ pub struct HttpProbeResult {
     pub status_code: u16,
     pub status_line: String,
     pub title: Option<String>,
+    /// Initial URL that produced this response, before following redirects.
+    pub probe_url: String,
     pub final_url: Option<String>,
     pub chain: Vec<String>,
     pub via_https: bool,
@@ -821,6 +823,7 @@ pub async fn http_probe_once(
         status_code: h.status,
         status_line: format!("HTTP/1.1 {} {}", h.status, h.status_text),
         title: h.title,
+        probe_url: url.to_string(),
         final_url,
         chain,
         via_https: started_https || last_hop_url.starts_with("https://"),
