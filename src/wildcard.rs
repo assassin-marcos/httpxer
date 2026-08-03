@@ -512,9 +512,10 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
 /// is *distinguishable from what a random path returns*. Pre-flight already
 /// probes random hex paths, which are directory-shaped by construction; if
 /// they come back `401`/`403` with a constant fingerprint, that fingerprint is
-/// recorded here and a discovered "auth dir" matching it is not descended.
-/// A `401` that differs from it (different body, length, or realm) is real
-/// signal and still recurses.
+/// recorded here and a response matching it is classified under the selected
+/// wildcard policy. A `401` that differs from it (different body, length,
+/// content type, or realm) is real signal and remains eligible for output and
+/// recursion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthCatchall {
     pub status: u16,
@@ -525,9 +526,9 @@ pub struct AuthCatchall {
 
 impl AuthCatchall {
     /// True if a probe response is indistinguishable from this host's
-    /// blanket auth response. Exact body fingerprint + content type; content
-    /// length within `tolerance` so a per-request nonce doesn't defeat it.
-    /// Never size-only — a different body is a different response.
+    /// blanket auth response. Exact body fingerprint + content type, with a
+    /// small content-length tolerance for transport/header inconsistencies.
+    /// Never size-only: a nonce or any other body change remains distinct.
     pub fn matches(&self, status: u16, cl: i64, ct: &str, md5: &str) -> bool {
         const CL_TOL: i64 = 24;
         self.status == status
@@ -542,10 +543,9 @@ impl AuthCatchall {
 #[derive(Debug, Default)]
 pub struct WildcardMap {
     inner: HashMap<String, Vec<WildcardSig>>,
-    /// host → blanket `401`/`403` fingerprint. Separate from `inner` because
-    /// it suppresses *recursion targets*, not findings: an auth-catchall host
-    /// still emits and probes normally, it just stops manufacturing phantom
-    /// directories. See [`AuthCatchall`].
+    /// host → blanket `401`/`403` fingerprint. Kept separate because auth
+    /// catchalls use exact status/body/content-type parity rather than the
+    /// 2xx/3xx Layer 1/Layer 2 models in `inner`. See [`AuthCatchall`].
     auth: HashMap<String, Vec<AuthCatchall>>,
 }
 
@@ -660,7 +660,7 @@ impl WildcardMap {
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.inner.is_empty() && self.auth.is_empty()
     }
 
     fn lookup<'a, T>(
@@ -1166,6 +1166,27 @@ mod tests {
         // Recursion passes a DISCOVERED DIR URL as the host; the fingerprint
         // is stored under the base input, so the base-key fallback must hit.
         assert!(m.is_auth_catchall("https://api.example/internal", 401, 0, "", &md5_hex("")));
+    }
+
+    #[test]
+    fn auth_catchall_counts_as_a_recorded_wildcard_fingerprint() {
+        let mut m = WildcardMap::new();
+        assert!(m.is_empty());
+        m.insert_auth(
+            "https://api.example".into(),
+            AuthCatchall {
+                status: 403,
+                content_length: 9,
+                content_type: "text/plain".into(),
+                snippet_md5: md5_hex("forbidden"),
+            },
+        );
+        assert!(!m.is_empty());
+        assert_eq!(
+            m.len(),
+            0,
+            "normal wildcard signature count stays unchanged"
+        );
     }
 
     /// Content-aware L1b tolerates small CL drift while bodies normalize equal.

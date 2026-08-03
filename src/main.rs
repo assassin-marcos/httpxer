@@ -240,7 +240,7 @@ struct Args {
     )]
     body_preview: usize,
 
-    /// Catchall handling: `strict`, `mark`, or `off`
+    /// Catchall handling for 2xx/3xx and blanket 401/403: strict, mark, or off
     #[arg(
         long = "wildcard", visible_alias = "wildcard-policy", alias = "wp",
         default_value = "strict",

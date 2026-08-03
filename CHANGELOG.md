@@ -4,6 +4,16 @@ All notable changes to **httpxer** are recorded here. Format loosely follows [Ke
 
 ## [Unreleased]
 
+## [0.6.14] — 2026-08-03
+
+### Fixed
+- Blanket `401`/`403` responses are now classified by the selected wildcard policy instead of only blocking recursion, preventing strict-mode auth floods and redundant bypass traffic.
+- Auth wildcard learning now requires every generic and extension-shaped random control to agree on status and response fingerprint; mixed or incomplete controls remain unsuppressed.
+- Auth-only wildcard pre-flight results now count as recorded fingerprints instead of printing a contradictory no-fingerprints message.
+
+### Verified
+- Regression tests cover matching `401` and `403` controls, bounded length drift, mixed statuses, distinct bodies, incomplete controls, minimum sample count, and distinguishable protected responses.
+
 ## [0.6.13] — 2026-08-03
 
 ### Added

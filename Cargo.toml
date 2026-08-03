@@ -1,6 +1,6 @@
 [package]
 name = "httpxer"
-version = "0.6.13"
+version = "0.6.14"
 edition = "2021"
 description = "Native HTTP enrichment and path fuzzing with browser-grade TLS impersonation, wildcard suppression, and Wappalyzer tech detection."
 license = "MIT"

@@ -127,6 +127,7 @@ Most directory bruteforcers drown in false positives on CDN-fronted / SPA / soft
 - **Layer 2 — path-echo / dynamic-CL**: with at least three samples, `content_length = k × path_length + base` must fit within residual bounds. The slope `k` then predicts the wildcard length for each probe path.
 - **Layer 1b — content-aware catchall**: when no path-echo model fits, the catchall body may still vary per request (for example, a request ID or timestamp). UUIDs, long hex/digit runs and timestamps are normalized before hashing. Bounded drift uses normalized-content and token-similarity guards; wide length drift additionally requires the normalized first 2 KiB to agree exactly. Matching is content-aware, never size-only.
 - **Bodyless catchall**: the host answers **`2xx` with zero bytes** for *every* path. There is no body to fingerprint, so every layer above is blind to it by construction. `200` + no body across **3 distinct paths** is itself the signature — httpxer learns it per `(host, status, content_type)` and suppresses from then on. A *lone* legitimate empty `200` (a `/ping`-style endpoint) stays below the threshold and is still emitted.
+- **Auth wildcard**: a blanket `401`/`403` is learned only when every generic and extension-shaped random control completes with the same status, content type, body hash, and bounded content length. Mixed responses or failed controls are inconclusive. `strict` suppresses matches before recursion, crawl, or bypass traffic; a distinguishable protected endpoint remains eligible for normal output, recursion, and bypass checks.
 
 This closes the case where a constant-size catchall with a per-request token used to emit *every* wordlist hit as a fake `200`. The host fingerprint also applies under **recursed directories** (so catchall noise doesn't reappear one level down).
 
@@ -203,7 +204,7 @@ Findings go to `<output>.backup.jsonl` (15 fields including `base_type`, `magic_
 
 ## 401/403 bypass (native, auto, content-confirmed)
 
-When a probe hits `401`/`403`, httpxer automatically retries it with a small, conservative battery of access-control bypass techniques — **on the forbidden resource only, never on every request**:
+When a non-wildcard probe hits `401`/`403`, httpxer automatically retries it with a small, conservative battery of access-control bypass techniques — **on the forbidden resource only, never on every request**:
 
 - **Header overrides** — `X-Original-URL`, `X-Rewrite-URL`, `X-Forwarded-For: 127.0.0.1`
 - **Path mutations** — e.g. `…/..;/`

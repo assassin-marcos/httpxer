@@ -1177,6 +1177,37 @@ enum PreflightOutcome {
     SlashRedirect(SlashRedirectFingerprint),
 }
 
+/// Learn a blanket auth response only when every planned random control
+/// completed as 401/403 and every fingerprint agrees. Mixed statuses, mixed
+/// bodies, and transport failures are inconclusive: suppressing a legitimate
+/// protected endpoint is worse than leaving auth noise visible.
+fn learn_auth_catchall(
+    outcomes: &[(&'static str, Option<PreflightOutcome>)],
+) -> Option<crate::wildcard::AuthCatchall> {
+    if outcomes.len() < 3 {
+        return None;
+    }
+    let first = match outcomes.first()?.1.as_ref()? {
+        PreflightOutcome::Auth(sig) => sig,
+        _ => return None,
+    };
+    outcomes
+        .iter()
+        .all(|(_, outcome)| {
+            matches!(
+                outcome,
+                Some(PreflightOutcome::Auth(sig))
+                    if first.matches(
+                        sig.status,
+                        sig.content_length,
+                        &sig.content_type,
+                        &sig.snippet_md5,
+                    )
+            )
+        })
+        .then(|| first.clone())
+}
+
 async fn wildcard_preflight_probe(
     host_input: &str,
     limiter: &ratelimit::HostRateLimiter,
@@ -1840,10 +1871,11 @@ pub async fn run(
                     .unwrap_or(None),
                 )
             });
+            let outcomes = futures::future::join_all(futs).await;
+            let learned_auth = learn_auth_catchall(&outcomes);
             let mut sample_groups = PreflightSampleGroups::new();
-            let mut auth_probes: Vec<crate::wildcard::AuthCatchall> = Vec::new();
             let mut usable = 0usize;
-            for (family, outcome) in futures::future::join_all(futs).await {
+            for (family, outcome) in outcomes {
                 let Some(outcome) = outcome else { continue };
                 usable += 1;
                 match outcome {
@@ -1851,49 +1883,25 @@ pub async fn run(
                         let key = (family.to_string(), s.status, s.content_type.clone());
                         sample_groups.entry(key).or_default().push(s);
                     }
-                    PreflightOutcome::Auth(a) => auth_probes.push(a),
+                    PreflightOutcome::Auth(_) => {}
                     PreflightOutcome::SlashRedirect(_) => {}
                 }
             }
 
-            // Auth-catchall (v0.6.3): random paths are directory-shaped by
-            // construction, so a CONSTANT 401/403 across ≥2 of them proves the
-            // status marks nothing on this host. Recursion consults this before
-            // treating a 401/403 word as a protected directory — otherwise the
-            // first N dir-shaped words each expand to a full wordlist pass for
-            // the coverage of one. Two agreeing probes required so a single
-            // random 401 can't disable auth-recursion on a normal host.
-            let mut learned_auth: Vec<crate::wildcard::AuthCatchall> = Vec::new();
-            for candidate in &auth_probes {
-                let agree = auth_probes.iter().filter(|a| {
-                    candidate.matches(
-                        a.status,
-                        a.content_length,
-                        &a.content_type,
-                        &a.snippet_md5,
-                    )
-                });
-                if agree.count() >= 2
-                    && !learned_auth.iter().any(|a| {
-                        a.matches(
-                            candidate.status,
-                            candidate.content_length,
-                            &candidate.content_type,
-                            &candidate.snippet_md5,
-                        )
-                    })
-                {
-                    eprintln!(
-                        "  [auth-catchall] {} status={} cl={} — every random path is {}; \
-                         auth-dir recursion disabled for this host",
-                        host,
-                        candidate.status,
-                        candidate.content_length,
-                        candidate.status
-                    );
-                    wildcard_map.insert_auth(input.clone(), candidate.clone());
-                    learned_auth.push(candidate.clone());
-                }
+            // Auth wildcard: all generic and extension-shaped random controls
+            // must return the same 401/403 fingerprint. The worker applies the
+            // selected wildcard policy to matching responses before discovery
+            // or bypass logic runs.
+            if let Some(candidate) = learned_auth {
+                eprintln!(
+                    "  [auth-wildcard] {} status={} cl={} ({}/{} random controls matched)",
+                    host,
+                    candidate.status,
+                    candidate.content_length,
+                    total_preflight,
+                    total_preflight
+                );
+                wildcard_map.insert_auth(input.clone(), candidate);
             }
 
             let (eligible_groups, detected_groups) = detect_preflight_groups(sample_groups, 10);
@@ -3196,7 +3204,15 @@ async fn run_probe(
             // The host-level matcher derives Layer 2's decoded path length
             // from the complete URL relative to the pre-flight scope that
             // produced the signature. This stays correct in recursive rounds.
-            let mut is_wildcard = false;
+            let auth_wildcard = !matches!(wildcard_policy, WildcardPolicy::Off)
+                && wildcards.is_auth_catchall(
+                    &item.host_input,
+                    parsed.status,
+                    parsed.content_length,
+                    &parsed.content_type,
+                    &parsed.snippet_md5,
+                );
+            let mut is_wildcard = auth_wildcard;
             if !matches!(wildcard_policy, WildcardPolicy::Off)
                 && wildcards.matches_url_body(
                     &item.host_input,
@@ -3238,7 +3254,10 @@ async fn run_probe(
             // normal 200/3xx directory detection follow the same path. Bounded
             // by --max-dirs-per-host in the orchestrator.
             let next_depth = item.depth.saturating_add(1);
-            if cfg.recursion_depth > 0 && next_depth <= cfg.recursion_depth {
+            if !auth_wildcard
+                && cfg.recursion_depth > 0
+                && next_depth <= cfg.recursion_depth
+            {
                 // v0.6.3 — a 401/403 indistinguishable from what this host
                 // returns for a RANDOM path marks no directory. Descending it
                 // multiplies the wordlist by a directory that doesn't exist,
@@ -3386,7 +3405,8 @@ async fn run_probe(
             // Confirmed wins are emitted as their own record tagged `bypass`;
             // normal 401/403 output still follows the user's status filters.
             // Per-host budget bounds traffic.
-            if cfg.bypass_enabled
+            if !auth_wildcard
+                && cfg.bypass_enabled
                 && matches!(parsed.status, 401 | 403)
                 && crate::bypass::charge_host(&item.host)
             {
@@ -3448,7 +3468,7 @@ async fn run_probe(
             // original 3xx response for wildcard/status identity and enqueue
             // Location as a separate URL instead of silently classifying the
             // terminal page under the requested path.
-            if cfg.crawl_enabled && next_depth <= cfg.crawl_depth {
+            if !auth_wildcard && cfg.crawl_enabled && next_depth <= cfg.crawl_depth {
                 let crawl_cfg = crate::crawl::CrawlCfg {
                     crawl_robots: cfg.crawl_robots,
                     crawl_sitemap: cfg.crawl_sitemap,
@@ -4309,6 +4329,99 @@ mod tests {
 
         let incomplete = vec![Some(PreflightOutcome::SlashRedirect(matching)), None];
         assert_eq!(learn_slash_redirect_catchall(&incomplete), None);
+    }
+
+    #[test]
+    fn auth_catchall_requires_every_random_control_to_match() {
+        let auth = |status, cl, md5: &str| crate::wildcard::AuthCatchall {
+            status,
+            content_length: cl,
+            content_type: "application/json".into(),
+            snippet_md5: md5.into(),
+        };
+
+        for status in [401, 403] {
+            let confirmed = vec![
+                (
+                    "generic",
+                    Some(PreflightOutcome::Auth(auth(status, 159, "same"))),
+                ),
+                (
+                    "conf",
+                    Some(PreflightOutcome::Auth(auth(status, 165, "same"))),
+                ),
+                (
+                    "git-head",
+                    Some(PreflightOutcome::Auth(auth(status, 148, "same"))),
+                ),
+            ];
+            assert_eq!(
+                learn_auth_catchall(&confirmed),
+                Some(auth(status, 159, "same")),
+                "a blanket {status} with bounded length drift should be learned"
+            );
+
+            let mixed_status = vec![
+                (
+                    "generic",
+                    Some(PreflightOutcome::Auth(auth(status, 159, "same"))),
+                ),
+                (
+                    "conf",
+                    Some(PreflightOutcome::Auth(auth(status, 159, "same"))),
+                ),
+                (
+                    "git-head",
+                    Some(PreflightOutcome::Auth(auth(
+                        if status == 401 { 403 } else { 401 },
+                        159,
+                        "same",
+                    ))),
+                ),
+            ];
+            assert_eq!(learn_auth_catchall(&mixed_status), None);
+
+            let mixed_body = vec![
+                (
+                    "generic",
+                    Some(PreflightOutcome::Auth(auth(status, 159, "same"))),
+                ),
+                (
+                    "conf",
+                    Some(PreflightOutcome::Auth(auth(status, 159, "same"))),
+                ),
+                (
+                    "git-head",
+                    Some(PreflightOutcome::Auth(auth(status, 159, "different"))),
+                ),
+            ];
+            assert_eq!(learn_auth_catchall(&mixed_body), None);
+
+            let incomplete = vec![
+                (
+                    "generic",
+                    Some(PreflightOutcome::Auth(auth(status, 159, "same"))),
+                ),
+                (
+                    "conf",
+                    Some(PreflightOutcome::Auth(auth(status, 159, "same"))),
+                ),
+                ("git-head", None),
+            ];
+            assert_eq!(learn_auth_catchall(&incomplete), None);
+        }
+
+        let too_few = vec![
+            (
+                "generic",
+                Some(PreflightOutcome::Auth(auth(401, 159, "same"))),
+            ),
+            (
+                "conf",
+                Some(PreflightOutcome::Auth(auth(401, 159, "same"))),
+            ),
+        ];
+        assert_eq!(learn_auth_catchall(&too_few), None);
     }
 
     #[test]
