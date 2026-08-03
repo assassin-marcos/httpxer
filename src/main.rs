@@ -58,6 +58,7 @@ MODE
   [TECH]     httpxer -u https://example.com --tech default
   [HEADERS]  httpxer -u https://example.com --rh
   [FUZZ]     httpxer -u https://example.com -w common.txt -o hits.txt
+  [TIMEBOX]  httpxer -l hosts.txt -w common.txt --host-timeout 100
   [DEEP]     httpxer -u https://example.com -w common.txt --deep 3
   [AUTH]     httpxer -u https://example.com --bearer "$TOKEN"
   [PROXY]    httpxer -u https://example.com --proxy proxies.txt
@@ -81,6 +82,7 @@ Use `httpxer --help` for advanced options and more examples."#,
     httpxer -u https://example.com -w common.txt -o hits.txt
     httpxer -u https://example.com -w admin.txt,api.txt --status '2xx,3xx,!429,!503'
     httpxer -l hosts.txt -w common.txt -t 50 --rate-limit 10 -o hits.jsonl
+    httpxer -l hosts.txt -w common.txt --host-timeout 100 -o hits.jsonl
 
   RECURSION AND CRAWL
     httpxer -u https://example.com -w common.txt --recurse 3
@@ -125,6 +127,10 @@ struct Args {
     /// Request timeout in milliseconds
     #[arg(visible_alias = "to", long, default_value_t = 5000, help_heading = "Network")]
     timeout_ms: u64,
+
+    /// (fuzz) Maximum active scan time per input target in seconds; 0 disables
+    #[arg(long, visible_alias = "target-timeout", default_value_t = 0, help_heading = "Fuzz mode")]
+    host_timeout: u64,
 
     /// Don't follow redirects (default: follow up to --max-redirects hops, matches httpx -fr)
     #[arg(visible_alias = "nfr", long, hide_short_help = true, help_heading = "Network")]
@@ -504,7 +510,7 @@ struct Args {
     #[arg(short = 'y', long, hide_short_help = true, help_heading = "Self-management")]
     yes: bool,
 
-    /// Suppress the "update available" startup banner
+    /// Disable the startup update check and automatic install
     #[arg(visible_alias = "nuc", long, hide_short_help = true, help_heading = "Self-management")]
     no_update_check: bool,
 
@@ -1405,6 +1411,7 @@ fn validate_mode_specific_args(args: &Args) -> Result<()> {
     if args.backup_tokens.is_some() { fuzz_only.push("--backup-tokens"); }
     if args.safe { fuzz_only.push("--safe"); }
     if args.rate_limit != 0.0 { fuzz_only.push("--rate-limit"); }
+    if args.host_timeout != 0 { fuzz_only.push("--host-timeout"); }
     if args.retries != 1 { fuzz_only.push("--retries"); }
     if args.include_errors { fuzz_only.push("--include-errors"); }
     if args.recurse_on_200 || args.recurse_on_403 { fuzz_only.push("--recurse-on-*"); }
@@ -1437,9 +1444,8 @@ fn validate_mode_specific_args(args: &Args) -> Result<()> {
 ///   - stderr is not a TTY (piped output stays clean)
 ///   - any of `-q`, `--quiet`, `--no-art` literally appears in argv
 ///
-/// Note: `--no-update-check` does NOT suppress the banner — it only
-/// suppresses the "[!] update available" follow-up line. The ASCII art
-/// is the program's signature; we want it on every TTY invocation.
+/// Note: `--no-update-check` disables update network/install work but does not
+/// suppress the ASCII banner. Use `--no-art` or `--quiet` for that.
 fn banner_should_show_early(argv: &[String]) -> bool {
     if !update::stderr_is_tty() {
         return false;
@@ -1452,13 +1458,11 @@ fn banner_should_show_early(argv: &[String]) -> bool {
     true
 }
 
-/// v0.4.1 — pre-scan argv for flags that suppress the network update
-/// check (mirror of `banner_should_show_early`, but for the GitHub
-/// API hit that refreshes the cache). Same constraint: we can't read
-/// parsed `args.no_update_check` yet because clap hasn't run.
+/// Pre-scan argv for modes that must not perform update network/install work.
+/// Same constraint: clap has not parsed `args.no_update_check` yet.
 fn update_check_allowed_early(argv: &[String]) -> bool {
     for (index, a) in argv.iter().enumerate() {
-        if a == "-q" || a == "--quiet" || a == "--no-update-check" {
+        if a == "--no-update-check" {
             return false;
         }
         if a == "--backup-dry-run"
@@ -1515,6 +1519,7 @@ async fn main() -> Result<()> {
     //
     // Suppression is opt-in via a raw-argv pre-scan (we can't read parsed
     // `args.quiet` yet — clap hasn't run). Cheap O(argv-len) scan; sub-µs.
+    let original_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let raw_argv: Vec<String> = std::env::args().collect();
     let normalized_argv = normalize_args(raw_argv);
     let want_banner = banner_should_show_early(&normalized_argv);
@@ -1525,8 +1530,9 @@ async fn main() -> Result<()> {
     // (not just the second one). `refresh_update_cache_best_effort` has
     // an internal 120 s skip-window so back-to-back calls are
     // network-free, and a 2.5 s hard cap so this never blocks startup
-    // for long. Skipped when `-q` / `--quiet` / `--no-update-check`.
-    if want_banner && allow_update_check {
+    // for long. Quiet mode still checks because it only controls display;
+    // `--no-update-check` is the explicit opt-out.
+    if allow_update_check {
         update::refresh_update_cache_best_effort().await;
     }
     if want_banner {
@@ -1561,6 +1567,28 @@ async fn main() -> Result<()> {
     }
     if args.uninstall {
         return update::run_uninstall(args.yes);
+    }
+
+    // Normal commands never pause for update confirmation. Install only a
+    // fully published release, then replace this process with the updated
+    // executable and the exact original arguments. The environment guard
+    // prevents a re-exec loop if a stale cache survives replacement.
+    let cached_latest = update::cached_latest_version();
+    if update::auto_update_needed(
+        cached_latest.as_deref(),
+        env!("CARGO_PKG_VERSION"),
+        args.no_update_check || !allow_update_check,
+        std::env::var_os(update::AUTO_UPDATE_REEXEC_GUARD).is_some(),
+    ) {
+        if !args.quiet {
+            eprintln!("[+] update available; installing automatically before continuing");
+        }
+        if let Err(error) = update::run_auto_update(&original_args, args.quiet).await {
+            eprintln!(
+                "[!] automatic update failed: {}; continuing with current version",
+                error
+            );
+        }
     }
     validate_mode_specific_args(&args)?;
 
@@ -1735,6 +1763,7 @@ async fn main() -> Result<()> {
         }
 
         let request_limiter = Arc::new(fuzz::ratelimit::HostRateLimiter::new(args.rate_limit));
+        let host_time_budget = fuzz::HostTimeBudget::new(args.host_timeout);
         let backup_cfg = backup_fuzz::BackupCfg {
             token_extra: args
                 .backup_tokens
@@ -1770,6 +1799,7 @@ async fn main() -> Result<()> {
                     limiter: request_limiter,
                     extra_headers,
                     cookie_header: initial_cookie_header,
+                    host_time_budget: None,
                 },
             };
             backup_fuzz::run_phase(&hosts, &opts, |_| Ok(())).await?;
@@ -1800,6 +1830,7 @@ async fn main() -> Result<()> {
                     limiter: request_limiter.clone(),
                     extra_headers: extra_headers.clone(),
                     cookie_header: initial_cookie_header.clone(),
+                    host_time_budget: host_time_budget.clone(),
                 },
             };
             eprintln!("[+] backup discovery: host-derived candidates, auto-tuned per host");
@@ -1850,10 +1881,17 @@ async fn main() -> Result<()> {
                 } else {
                     format!("https://{}", h)
                 };
-                let Some(slot) = probe::pick_pool_slot_for(&fuzz::bare_host(&url)) else {
+                let budget_key = fuzz::origin_key(&url);
+                if let Some(budget) = host_time_budget.as_ref() {
+                    if budget.is_exhausted(&budget_key) {
+                        budget.report_once(&budget_key);
+                        continue;
+                    }
+                }
+                let Some(slot) = probe::pick_pool_slot_for(&budget_key) else {
                     continue;
                 };
-                let response = probe::retry_wreq_pool_once(|| async {
+                let response_future = probe::retry_wreq_pool_once(|| async {
                     let mut req = slot
                         .get(&url)
                         .redirect(wreq::redirect::Policy::none())
@@ -1870,8 +1908,15 @@ async fn main() -> Result<()> {
                     }
                     request_limiter.acquire(&fuzz::bare_host(&url)).await;
                     req.send().await
-                })
-                .await;
+                });
+                let response = if let Some(budget) = host_time_budget.as_ref() {
+                    match budget.run(&budget_key, response_future).await {
+                        fuzz::BudgetOutcome::Completed(response) => response,
+                        fuzz::BudgetOutcome::Expired => continue,
+                    }
+                } else {
+                    response_future.await
+                };
                 match response {
                     Ok(Ok(resp)) => {
                         if !matches!(resp.status().as_u16(), 200..=399) {
@@ -1943,6 +1988,7 @@ async fn main() -> Result<()> {
             via_proxy: proxy_enabled,
             threads: args.threads,
             timeout_ms: args.timeout_ms,
+            host_time_budget: host_time_budget.clone(),
             request_limiter: request_limiter.clone(),
             recursion_depth,
             recurse_on_200: args.recurse_on_200,
@@ -2705,6 +2751,29 @@ mod tests {
         assert!(!update_check_allowed_early(&cli(&["--backup", "dry-run"])));
         assert!(!update_check_allowed_early(&cli(&["--backup=dry-run"])));
         assert!(!update_check_allowed_early(&cli(&["--backup-dry-run"])));
+    }
+
+    #[test]
+    fn quiet_does_not_disable_automatic_update_check() {
+        assert!(update_check_allowed_early(&cli(&["--quiet"])));
+        assert!(update_check_allowed_early(&cli(&["-q"])));
+        assert!(!update_check_allowed_early(&cli(&["--no-update-check"])));
+    }
+
+    #[test]
+    fn host_timeout_is_fuzz_only_and_accepts_target_timeout_alias() {
+        let enrich = Args::try_parse_from(normalize_args(cli(&[
+            "-u", "x.test", "--host-timeout", "100",
+        ])))
+        .unwrap();
+        assert!(validate_mode_specific_args(&enrich).is_err());
+
+        let fuzz = Args::try_parse_from(normalize_args(cli(&[
+            "-u", "x.test", "-w", "words.txt", "--target-timeout", "100",
+        ])))
+        .unwrap();
+        assert_eq!(fuzz.host_timeout, 100);
+        assert!(validate_mode_specific_args(&fuzz).is_ok());
     }
 
     #[test]

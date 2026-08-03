@@ -946,6 +946,20 @@ pub struct RequestCtx {
     pub limiter: Arc<crate::fuzz::ratelimit::HostRateLimiter>,
     pub extra_headers: Vec<(String, String)>,
     pub cookie_header: Option<String>,
+    pub host_time_budget: Option<Arc<crate::fuzz::HostTimeBudget>>,
+}
+
+async fn run_with_host_budget<T, F>(ctx: &RequestCtx, key: &str, future: F) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    match ctx.host_time_budget.as_ref() {
+        Some(budget) => match budget.run(key, future).await {
+            crate::fuzz::BudgetOutcome::Completed(value) => Some(value),
+            crate::fuzz::BudgetOutcome::Expired => None,
+        },
+        None => Some(future.await),
+    }
 }
 
 fn request_host_key(url: &str) -> String {
@@ -1135,6 +1149,7 @@ where
             }
         };
         let authority = bases.root.split("://").nth(1).unwrap_or("").to_string();
+        let target_key = crate::fuzz::origin_key(&bases.root);
         // Strip the port before deriving tokens. A backup is named after the
         // site (`www.example.com.zip`), never after the socket
         // (`www.example.com:8443.zip`). The ported authority is still what we
@@ -1152,10 +1167,15 @@ where
         // a dry run so previewing candidates never touches the network.
         let mut cfg = opts.cfg.clone();
         if !opts.dry_run {
-            let (stack, cap) = probe::retry_wreq_pool_once(|| {
-                profile_host(&bases.root, &host_only, &opts.request)
-            })
+            let (stack, cap) = run_with_host_budget(
+                &opts.request,
+                &target_key,
+                probe::retry_wreq_pool_once(|| {
+                    profile_host(&bases.root, &host_only, &opts.request)
+                }),
+            )
             .await
+            .and_then(Result::ok)
             .unwrap_or((Stack::Unknown, 60));
             cfg.stack = stack;
             cfg.max_perms = cap.min(MAX_PERMS_CEILING);
@@ -1178,11 +1198,16 @@ where
                 "zzz-nonexistent-g7h8i9.tar.gz",
             ] {
                 if let Ok(u) = join_url(&bases.root, probe_name) {
-                    if let Some(value) = probe::retry_wreq_pool_once(|| {
-                        response_sample(&u, &host_only, &opts.request)
-                    })
+                    if let Some(value) = run_with_host_budget(
+                        &opts.request,
+                        &target_key,
+                        probe::retry_wreq_pool_once(|| {
+                            response_sample(&u, &host_only, &opts.request)
+                        }),
+                    )
                     .await
-                    .unwrap_or(None)
+                    .and_then(Result::ok)
+                    .flatten()
                     {
                         baselines.push(value);
                     }
@@ -1198,10 +1223,15 @@ where
             targets.push(("dir".to_string(), bases.dir.clone()));
         }
         if !opts.dry_run {
-            let verified_dirs = probe::retry_wreq_pool_once(|| {
-                verified_backup_dirs(&bases.root, &host_only, &opts.request, &baselines)
-            })
+            let verified_dirs = run_with_host_budget(
+                &opts.request,
+                &target_key,
+                probe::retry_wreq_pool_once(|| {
+                    verified_backup_dirs(&bases.root, &host_only, &opts.request, &baselines)
+                }),
+            )
             .await
+            .and_then(Result::ok)
             .unwrap_or_default();
             if !verified_dirs.is_empty() {
                 eprintln!(
@@ -1237,6 +1267,13 @@ where
             targets.len()
         );
 
+        if let Some(budget) = opts.request.host_time_budget.as_ref() {
+            if budget.is_exhausted(&target_key) {
+                budget.report_once(&target_key);
+                continue;
+            }
+        }
+
         // Bounded fan-out so the phase honours the caller's concurrency.
         let mut inflight = FuturesUnordered::new();
         let baselines = Arc::new(baselines);
@@ -1246,6 +1283,7 @@ where
         let spawn = |idx: usize, queue: &[(String, String, String)]| -> Task {
             let (u, bt, c) = queue[idx].clone();
             let hk = host_only.clone();
+            let bk = target_key.clone();
             let ho = host_only.clone();
             let bl = baselines.clone();
             let request = opts.request.clone();
@@ -1253,20 +1291,25 @@ where
                 // Magic-byte verification is unconditional: it is the single
                 // check that separates a real archive from an HTML soft-404
                 // served with 200, so it is not something to make optional.
-                probe::retry_wreq_pool_once(|| {
-                    probe_candidate(
-                        &u,
-                        &hk,
-                        &bt,
-                        &ho,
-                        &c,
-                        bl.as_slice(),
-                        true,
-                        &request,
-                    )
-                })
+                run_with_host_budget(
+                    &request,
+                    &bk,
+                    probe::retry_wreq_pool_once(|| {
+                        probe_candidate(
+                            &u,
+                            &hk,
+                            &bt,
+                            &ho,
+                            &c,
+                            bl.as_slice(),
+                            true,
+                            &request,
+                        )
+                    }),
+                )
                 .await
-                .unwrap_or(None)
+                .and_then(Result::ok)
+                .flatten()
             })
         };
 
@@ -1285,7 +1328,13 @@ where
                     finding_count += 1;
                 }
             }
-            if next < queue.len() {
+            if next < queue.len()
+                && !opts
+                    .request
+                    .host_time_budget
+                    .as_ref()
+                    .is_some_and(|budget| budget.is_exhausted(&target_key))
+            {
                 inflight.push(spawn(next, &queue));
                 next += 1;
             }

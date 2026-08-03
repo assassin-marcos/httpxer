@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey.svg)]()
 
-**Current release:** [v0.6.12](https://github.com/assassin-marcos/httpxer/releases/tag/v0.6.12)
+**Current release:** [v0.6.14](https://github.com/assassin-marcos/httpxer/releases/tag/v0.6.14)
 
 ```
  _     _   _
@@ -40,6 +40,8 @@ httpxer -U   # install latest release
 httpxer -c   # check for updates
 httpxer -X   # uninstall
 ```
+
+Normal commands check for a newer published release, install it without a confirmation prompt, and then resume the original command. Use `--no-update-check` when a pinned binary or offline run is required. A non-writable installation fails open and continues the command; run `httpxer -U` once to relocate it to a user-writable directory.
 
 Released binaries: Linux `x86_64` (glibc 2.35+), macOS `x86_64` and `arm64`, and Windows `x86_64`. Linux ARM is not currently published; build it from source if your toolchain supports the dependency stack.
 
@@ -99,6 +101,9 @@ httpxer -u https://example.com/ -w wordlist.txt --deep 3 -o deep.txt
 # Polite multi-host scan
 httpxer -l hosts.txt -w wordlist.txt -t 50 --rate-limit 10 -o findings.jsonl
 
+# Give each input target at most 100 seconds of active scan time
+httpxer -l hosts.txt -w wordlist.txt --host-timeout 100 -o findings.jsonl
+
 # Authenticated scan; auth controls work in both modes
 httpxer -u https://example.com/ -w wordlist.txt --bearer "$TOKEN" -H 'X-Tenant: 42'
 
@@ -115,7 +120,9 @@ httpxer -u https://example.com/ -w wordlist.txt --backup dry-run
 httpxer -u https://example.com/ -w wordlist.txt --backup off -o findings.txt
 ```
 
-`.txt` selects plain `STATUS SIZE URL`; other output extensions select JSONL. With no `-o`, records stream to stdout. With `-o`, each record is written and flushed as soon as it is found; enrich tasks are bounded by `-t`, and backup findings stream to their sidecar instead of accumulating until phase completion. `-q` hides the banner, update check, live findings and progress while retaining phase summaries.
+`.txt` selects plain `STATUS SIZE URL`; other output extensions select JSONL. With no `-o`, records stream to stdout. With `-o`, each record is written and flushed as soon as it is found; enrich tasks are bounded by `-t`, and backup findings stream to their sidecar instead of accumulating until phase completion. `-q` hides the banner, live findings and progress while retaining phase summaries; it does not disable automatic updates.
+
+`--host-timeout N` is a total active-time budget per input target across backup discovery, root-size calibration, wildcard pre-flight, dictionary probes, recursion, crawl, and bypass requests. Concurrent requests share one wall-clock budget, idle time while other targets run is not charged, completed findings remain flushed, and only the exhausted target is skipped. The default `0` disables this cap. `--target-timeout` is an alias.
 
 `--status`, `--tech`, `--backup`, and `--deep` are the preferred consolidated controls. Legacy spellings such as `-i`, `-r -R`, `--wildcard-policy`, `--no-backup-fuzz`, and `--backup-dry-run` remain accepted. Run `httpxer -h` for task-tagged examples or `httpxer --help` for the advanced option reference and practical recipes.
 
@@ -313,6 +320,7 @@ httpxer ... --cookie "sid=abc123" --cookie "csrf=token"
 | `-o <FILE>` | — | Output (`.jsonl` → JSON, `.txt` → plain) |
 | `-t <N>` | 250 | Concurrent probes |
 | `--timeout-ms` | 5000 | Per-probe timeout (ms) |
+| `--host-timeout <SEC>` | 0 | Fuzz: total active scan budget per input target; `0` disables |
 | `--proxy <URL\|FILE>` | — | One proxy or mixed per-request proxy rotation file |
 | `--status '2xx,3xx,!429'` | common finding codes | Include exact codes/classes and exclude with `!` |
 | `--recurse [N]` | off / 3 | Recursive wordlist expansion |
@@ -330,7 +338,8 @@ httpxer ... --cookie "sid=abc123" --cookie "csrf=token"
 | `--cookie "K=V"` | — | Static Cookie header value (repeatable) |
 | `--httpx-compat` | off | Enrich output in httpx JSON shape |
 | `--with-body` | off | Include response body (≤2 MiB) |
-| `-q` | off | Hide banner, update check, live findings and progress |
+| `--no-update-check` | off | Disable startup update checks and automatic installs |
+| `-q` | off | Hide banner, live findings and progress; updates remain enabled |
 | `-U` / `-c` / `-X` | — | Update / check / uninstall |
 
 Full reference: `httpxer --help`. Advanced exact-size filters are intentionally lossy: `--exclude-root-size` can hide a real page that happens to equal the root body size. `--fuzz-follow-redirects` classifies a terminal response under the requested path and should be used only when that behavior is explicitly required.

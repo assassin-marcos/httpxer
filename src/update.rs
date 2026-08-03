@@ -1,10 +1,10 @@
 //! Self-update + version-check banner — direct port of portwave's update flow.
 //!
 //! Three user-visible features:
-//!   1. `httpxer -u` / `--update`        — install the latest release in place
+//!   1. `httpxer -U` / `--update`        — install the latest release in place
 //!   2. `httpxer -c` / `--check-update`  — print version status and exit
-//!   3. Startup banner (stderr only)     — auto-detects outdated installs and
-//!      shows "What's new" notes since the user's current version
+//!   3. Startup auto-update              — installs a newer published release
+//!      without prompting, then resumes the original command
 //!
 //! The banner uses a 24 h on-disk cache (`$XDG_CACHE_HOME/httpxer/last_check`
 //! or `%LOCALAPPDATA%\httpxer\last_check`) so the common case is zero network
@@ -16,6 +16,7 @@
 //! Releases-API-only path would tell users "you're up to date" for ~5
 //! minutes after every tag.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ use std::time::Duration;
 
 pub const REPO_OWNER: &str = "assassin-marcos";
 pub const REPO_NAME: &str = "httpxer";
+pub const AUTO_UPDATE_REEXEC_GUARD: &str = "HTTPXER_AUTO_UPDATE_REEXEC";
 
 /// True when stderr is attached to a real terminal — gates the ASCII-art
 /// banner so piped invocations (`httpxer ... | jq ...`) don't get noise.
@@ -228,6 +230,19 @@ pub fn version_is_newer(latest: &str, current: &str) -> bool {
     false
 }
 
+/// Pure startup decision used by `main` and unit tests. Automatic updates are
+/// opt-out and run at most once across the update re-exec boundary.
+pub fn auto_update_needed(
+    latest: Option<&str>,
+    current: &str,
+    disabled: bool,
+    already_reexeced: bool,
+) -> bool {
+    !disabled
+        && !already_reexeced
+        && latest.is_some_and(|version| version_is_newer(version, current))
+}
+
 /// Startup banner — yellow "[!] update available" line on stderr, plus a
 /// "What's new" block listing release notes for every version between the
 /// user's install and the latest. Truncated to keep enrichment output
@@ -268,7 +283,7 @@ pub fn print_update_banner(latest: &str, notes: &[(String, String)]) {
     }
     eprintln!();
     eprintln!(
-        "\x1b[2m  install latest with: httpxer -u   (or --no-update-check to silence this)\x1b[0m"
+        "\x1b[2m  automatic update will retry next run; use httpxer -U to retry now\x1b[0m"
     );
     eprintln!();
 }
@@ -496,16 +511,15 @@ async fn relocate_and_update() -> anyhow::Result<()> {
         let _ = fs::write(&p, env!("CARGO_PKG_VERSION"));
     }
 
-    // 6. Re-exec the COPY with `-u`. The copy's `install_dir_writable()`
-    //    will return true (its parent is owned by the current user), so
-    //    the normal `self_update` flow runs against a writable path and
-    //    the binary gets replaced atomically with the latest release.
+    // 6. Re-exec the COPY with `-U`. The copy's `install_dir_writable()`
+    //    returns true, so it can replace itself without a privilege prompt.
     //
     //    `--no-update-check` suppresses the banner on the inner invocation
     //    since the outer one already showed it.
+    let handoff_args = ["-U", "--no-update-check"];
     eprintln!();
     eprintln!(
-        "\x1b[2m    handing off to {} -u (will fetch latest release into {})...\x1b[0m",
+        "\x1b[2m    handing off to {} (writable install: {})...\x1b[0m",
         new_install_path.display(),
         new_parent.display()
     );
@@ -515,11 +529,11 @@ async fn relocate_and_update() -> anyhow::Result<()> {
     {
         use std::os::unix::process::CommandExt;
         let err = std::process::Command::new(&new_install_path)
-            .args(["-u", "--no-update-check"])
+            .args(handoff_args)
             .exec();
         // exec only returns on error
         Err(anyhow::anyhow!(
-            "exec {} -u failed: {}",
+            "exec {} failed: {}",
             new_install_path.display(),
             err
         ))
@@ -527,67 +541,56 @@ async fn relocate_and_update() -> anyhow::Result<()> {
     #[cfg(not(unix))]
     {
         let status = std::process::Command::new(&new_install_path)
-            .args(["-u", "--no-update-check"])
+            .args(handoff_args)
             .status()?;
         std::process::exit(status.code().unwrap_or(0));
     }
 }
 
-/// `httpxer -u` — replace the running binary with the latest release.
-/// When the install path is root-owned and the running user can't write
-/// to it, AUTO-RELOCATE the binary to a user-writable path
-/// (`~/.local/bin/` / `~/bin/` / `$XDG_BIN_HOME`) instead of failing with
-/// a "use sudo" message. Falls back to sudo re-exec only when no
-/// user-writable destination exists.
-pub async fn run_update() -> anyhow::Result<()> {
-    // Up-front writability check. When false, switch to auto-relocate
-    // (which calls self_update with bin_install_path set to a
-    // user-writable destination) so the user never has to think about
-    // sudo or PATH after their first install.
-    if !install_dir_writable() {
-        return relocate_and_update().await;
-    }
-
+/// Replace a writable running binary. Returns true only when bytes were
+/// actually replaced. Confirmation is always disabled: explicit and automatic
+/// updates use the same unattended installer.
+async fn update_writable(verbose: bool) -> anyhow::Result<bool> {
     let current = env!("CARGO_PKG_VERSION").to_string();
-    println!(
-        "httpxer: checking GitHub releases for {}/{}…",
-        REPO_OWNER, REPO_NAME
-    );
-    let join = tokio::task::spawn_blocking(|| {
+    if verbose {
+        println!(
+            "httpxer: checking GitHub releases for {}/{}…",
+            REPO_OWNER, REPO_NAME
+        );
+    }
+    let join = tokio::task::spawn_blocking(move || {
         self_update::backends::github::Update::configure()
             .repo_owner(REPO_OWNER)
             .repo_name(REPO_NAME)
             .bin_name("httpxer")
-            .show_download_progress(true)
-            .show_output(true)
+            .show_download_progress(verbose)
+            .show_output(verbose)
+            .no_confirm(true)
             .current_version(env!("CARGO_PKG_VERSION"))
             .build()?
             .update()
     })
     .await?;
 
-    let result = match join {
-        Ok(s) => s,
-        Err(e) => {
-            // Post-download fallback — defends against the race where the
-            // dir was writable at the up-front check but a directory ACL /
-            // mount option changed in between. Auto-relocate kicks in here
-            // too so the user still gets a working install without sudo.
-            let msg = e.to_string();
-            if msg.contains("Permission denied")
-                || msg.contains("os error 13")
-                || msg.to_ascii_lowercase().contains("access is denied")
-            {
-                return relocate_and_update().await;
-            }
-            return Err(e.into());
-        }
-    };
+    let result = join.map_err(anyhow::Error::from)?;
 
     match result {
-        self_update::Status::UpToDate(v) => println!("Already up to date: {}", v),
+        self_update::Status::UpToDate(v) => {
+            if verbose {
+                println!("Already up to date: {}", v);
+            }
+            if let Some(p) = update_cache_path() {
+                if let Some(parent) = p.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(&p, &v);
+            }
+            Ok(false)
+        }
         self_update::Status::Updated(v) => {
-            println!("Updated to: {}", v);
+            if verbose {
+                println!("Updated to: {}", v);
+            }
             // Refresh the version-check cache so the next startup banner
             // doesn't re-prompt about the version we just installed.
             if let Some(p) = update_cache_path() {
@@ -596,57 +599,121 @@ pub async fn run_update() -> anyhow::Result<()> {
                 }
                 let _ = fs::write(&p, &v);
             }
-            // Best-effort changelog dump so users see what they got.
-            let notes_res = tokio::time::timeout(
-                Duration::from_secs(4),
-                tokio::task::spawn_blocking({
-                    let cur = current.clone();
-                    move || fetch_release_notes_since(&cur)
-                }),
-            )
-            .await;
-            if let Ok(Ok(Ok(notes))) = notes_res {
-                if !notes.is_empty() {
-                    println!();
-                    println!(
-                        "\x1b[1m─────── What's new in httpxer v{}  (was v{}) ───────\x1b[0m",
-                        v, current
-                    );
-                    for (ver, body) in notes.iter().take(5) {
+            if verbose {
+                // Explicit updates show release notes; automatic startup updates
+                // skip this extra network request and resume immediately.
+                let notes_res = tokio::time::timeout(
+                    Duration::from_secs(4),
+                    tokio::task::spawn_blocking({
+                        let cur = current.clone();
+                        move || fetch_release_notes_since(&cur)
+                    }),
+                )
+                .await;
+                if let Ok(Ok(Ok(notes))) = notes_res {
+                    if !notes.is_empty() {
                         println!();
-                        println!("  \x1b[1;36mv{}\x1b[0m", ver);
-                        let mut printed = 0;
-                        for line in body.lines() {
-                            let line = line.trim();
-                            if line.is_empty()
-                                || line.starts_with("## ")
-                                || line.starts_with("**Full Changelog**")
-                            {
-                                continue;
+                        println!(
+                            "\x1b[1m─────── What's new in httpxer v{}  (was v{}) ───────\x1b[0m",
+                            v, current
+                        );
+                        for (ver, body) in notes.iter().take(5) {
+                            println!();
+                            println!("  \x1b[1;36mv{}\x1b[0m", ver);
+                            let mut printed = 0;
+                            for line in body.lines() {
+                                let line = line.trim();
+                                if line.is_empty()
+                                    || line.starts_with("## ")
+                                    || line.starts_with("**Full Changelog**")
+                                {
+                                    continue;
+                                }
+                                if printed >= 10 {
+                                    println!("    …");
+                                    break;
+                                }
+                                let trimmed: String = line.chars().take(120).collect();
+                                println!("    {}", trimmed);
+                                printed += 1;
                             }
-                            if printed >= 10 {
-                                println!("    …");
-                                break;
+                            if printed == 0 {
+                                println!("    (no release notes attached)");
                             }
-                            let trimmed: String = line.chars().take(120).collect();
-                            println!("    {}", trimmed);
-                            printed += 1;
                         }
-                        if printed == 0 {
-                            println!("    (no release notes attached)");
-                        }
+                        println!();
+                        println!(
+                            "\x1b[2m    Full history: https://github.com/{}/{}/releases\x1b[0m",
+                            REPO_OWNER, REPO_NAME
+                        );
+                        println!();
                     }
-                    println!();
-                    println!(
-                        "\x1b[2m    Full history: https://github.com/{}/{}/releases\x1b[0m",
-                        REPO_OWNER, REPO_NAME
-                    );
-                    println!();
                 }
             }
+            Ok(true)
         }
     }
-    Ok(())
+}
+
+fn permission_denied(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("permission denied")
+        || message.contains("os error 13")
+        || message.contains("access is denied")
+}
+
+/// `httpxer -U` — replace the running binary with the latest release without
+/// asking for confirmation.
+pub async fn run_update() -> anyhow::Result<()> {
+    if !install_dir_writable() {
+        return relocate_and_update().await;
+    }
+    match update_writable(true).await {
+        Ok(_) => Ok(()),
+        Err(error) if permission_denied(&error) => relocate_and_update().await,
+        Err(error) => Err(error),
+    }
+}
+
+fn reexec_updated(args: &[OsString]) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = std::process::Command::new(&exe)
+            .args(args)
+            .env(AUTO_UPDATE_REEXEC_GUARD, "1")
+            .exec();
+        Err(anyhow::anyhow!("exec {} failed: {}", exe.display(), error))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = std::process::Command::new(&exe)
+            .args(args)
+            .env(AUTO_UPDATE_REEXEC_GUARD, "1")
+            .status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+/// Install a newer published release without prompting, then continue by
+/// replacing this process with the updated executable and original arguments.
+pub async fn run_auto_update(args: &[OsString], quiet: bool) -> anyhow::Result<()> {
+    if !install_dir_writable() {
+        anyhow::bail!(
+            "the installed binary is not writable; run `httpxer -U` once to relocate it"
+        );
+    }
+    match update_writable(false).await {
+        Ok(true) => {
+            if !quiet {
+                eprintln!("[+] auto-update installed; restarting the original command");
+            }
+            reexec_updated(args)
+        }
+        Ok(false) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// `httpxer -c` — print version status (current / latest release / latest tag)
@@ -848,4 +915,18 @@ pub fn run_uninstall(skip_prompt: bool) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_update_is_default_for_newer_published_version() {
+        assert!(auto_update_needed(Some("0.6.15"), "0.6.14", false, false));
+        assert!(!auto_update_needed(Some("0.6.14"), "0.6.14", false, false));
+        assert!(!auto_update_needed(Some("0.6.15"), "0.6.14", true, false));
+        assert!(!auto_update_needed(Some("0.6.15"), "0.6.14", false, true));
+        assert!(!auto_update_needed(None, "0.6.14", false, false));
+    }
 }

@@ -27,7 +27,7 @@ use chrono::SecondsFormat;
 use futures::stream::{FuturesUnordered, StreamExt};
 use md5::{Digest, Md5};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -238,6 +238,8 @@ struct ProbeItem {
     source: String,
     /// Parent URL this probe was derived from. Empty at depth 0.
     parent_url: String,
+    /// Stable input-origin key used by the per-target active-time budget.
+    budget_key: String,
 }
 
 /// Discovery emitted from a worker after a successful probe. Picked up
@@ -253,6 +255,7 @@ enum Discovery {
         host: String,
         depth: u8,
         parent: String,
+        budget_key: String,
     },
     /// Link extracted from the response body by `crawl::extract_urls`
     /// (HTML / robots.txt / sitemap.xml). Already absolute + in-scope.
@@ -261,6 +264,7 @@ enum Discovery {
         source: String,
         depth: u8,
         parent: String,
+        budget_key: String,
     },
 }
 
@@ -292,6 +296,9 @@ pub struct FuzzCfg {
     pub via_proxy: bool, // true iff --proxy was set
     pub threads: usize,
     pub timeout_ms: u64,
+    /// Shared active-time budget across backup, calibration, fuzz, recursion,
+    /// crawl and bypass requests. None disables the per-target timeout.
+    pub host_time_budget: Option<Arc<HostTimeBudget>>,
     /// Shared request gate for every fuzz-phase HTTP request, including
     /// backup discovery, pre-flight, retries, siblings, canaries and bypasses.
     pub request_limiter: Arc<ratelimit::HostRateLimiter>,
@@ -1413,6 +1420,186 @@ pub(crate) fn bare_host(s: &str) -> String {
     hostport.to_string()
 }
 
+#[derive(Debug)]
+struct HostTimeState {
+    remaining: Duration,
+    active_since: Option<Instant>,
+    active: usize,
+    reported: bool,
+}
+
+/// Per-input active-time budget. Concurrent probes for one target share one
+/// clock interval, so 150 workers consume one second of budget per wall-clock
+/// second rather than 150 seconds. Time spent idle while another target runs
+/// is not charged.
+#[derive(Debug)]
+pub(crate) struct HostTimeBudget {
+    limit: Duration,
+    states: std::sync::Mutex<HashMap<String, HostTimeState>>,
+}
+
+pub(crate) enum BudgetOutcome<T> {
+    Completed(T),
+    Expired,
+}
+
+struct HostTimeGuard {
+    budget: Arc<HostTimeBudget>,
+    key: String,
+}
+
+impl HostTimeBudget {
+    pub(crate) fn new(seconds: u64) -> Option<Arc<Self>> {
+        (seconds > 0).then(|| {
+            Arc::new(Self {
+                limit: Duration::from_secs(seconds),
+                states: std::sync::Mutex::new(HashMap::new()),
+            })
+        })
+    }
+
+    fn enter(self: &Arc<Self>, key: &str) -> Option<(HostTimeGuard, Duration)> {
+        let now = Instant::now();
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = states.entry(key.to_string()).or_insert(HostTimeState {
+            remaining: self.limit,
+            active_since: None,
+            active: 0,
+            reported: false,
+        });
+        let available = state.remaining.saturating_sub(
+            state
+                .active_since
+                .map(|started| now.saturating_duration_since(started))
+                .unwrap_or_default(),
+        );
+        if available.is_zero() {
+            state.remaining = Duration::ZERO;
+            return None;
+        }
+        if state.active == 0 {
+            state.active_since = Some(now);
+        }
+        state.active += 1;
+        Some((
+            HostTimeGuard {
+                budget: Arc::clone(self),
+                key: key.to_string(),
+            },
+            available,
+        ))
+    }
+
+    pub(crate) async fn run<T, F>(self: &Arc<Self>, key: &str, future: F) -> BudgetOutcome<T>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let Some((guard, remaining)) = self.enter(key) else {
+            self.report_once(key);
+            return BudgetOutcome::Expired;
+        };
+        let outcome = tokio::time::timeout(remaining, future).await;
+        if outcome.is_err() {
+            self.expire(key);
+        }
+        drop(guard);
+        match outcome {
+            Ok(value) => BudgetOutcome::Completed(value),
+            Err(_) => {
+                self.report_once(key);
+                BudgetOutcome::Expired
+            }
+        }
+    }
+
+    pub(crate) fn is_exhausted(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(state) = states.get_mut(key) else {
+            return false;
+        };
+        let available = state.remaining.saturating_sub(
+            state
+                .active_since
+                .map(|started| now.saturating_duration_since(started))
+                .unwrap_or_default(),
+        );
+        if available.is_zero() {
+            state.remaining = Duration::ZERO;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expire(&self, key: &str) {
+        if let Some(state) = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(key)
+        {
+            state.remaining = Duration::ZERO;
+        }
+    }
+
+    pub(crate) fn report_once(&self, key: &str) {
+        let should_report = {
+            let mut states = self
+                .states
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = states.entry(key.to_string()).or_insert(HostTimeState {
+                remaining: Duration::ZERO,
+                active_since: None,
+                active: 0,
+                reported: false,
+            });
+            if state.reported {
+                false
+            } else {
+                state.reported = true;
+                true
+            }
+        };
+        if should_report {
+            eprintln!(
+                "[!] host-timeout: {} exhausted {}s active fuzz budget; skipping remaining work",
+                key,
+                self.limit.as_secs()
+            );
+        }
+    }
+}
+
+impl Drop for HostTimeGuard {
+    fn drop(&mut self) {
+        let now = Instant::now();
+        let mut states = self
+            .budget
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(state) = states.get_mut(&self.key) else {
+            return;
+        };
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 {
+            if let Some(started) = state.active_since.take() {
+                state.remaining = state
+                    .remaining
+                    .saturating_sub(now.saturating_duration_since(started));
+            }
+        }
+    }
+}
+
 // ─── Progress accounting ────────────────────────────────────────────────
 //
 // Post-v0.5.3 hardening. Why this is a type and not two loose atomics:
@@ -1807,6 +1994,7 @@ pub async fn run(
     // The pairing is no longer a convention a new spawn site can forget.
     let initial_total = hosts.len().saturating_mul(words.len());
     let progress = Arc::new(Progress::new(initial_total));
+    let host_time_budget = cfg.host_time_budget.clone();
     eprintln!(
         "[+] fuzz: {} hosts × {} paths = {} probes (threads={}, retries={}, wildcard={})",
         hosts.len(),
@@ -1841,6 +2029,7 @@ pub async fn run(
         for h in hosts.iter() {
             let input = host_to_input(h);
             let host = bare_host(&input);
+            let budget_key = origin_key(&input);
             // v0.4.5 — build hex + realistic-decoy pre-flight paths and probe
             // them CONCURRENTLY (was sequential): wall-clock = slowest single
             // probe, not the sum. Decoys make detection see the same catchall
@@ -1871,7 +2060,17 @@ pub async fn run(
                     .unwrap_or(None),
                 )
             });
-            let outcomes = futures::future::join_all(futs).await;
+            let outcomes = if let Some(budget) = host_time_budget.as_ref() {
+                match budget
+                    .run(&budget_key, futures::future::join_all(futs))
+                    .await
+                {
+                    BudgetOutcome::Completed(outcomes) => outcomes,
+                    BudgetOutcome::Expired => continue,
+                }
+            } else {
+                futures::future::join_all(futs).await
+            };
             let learned_auth = learn_auth_catchall(&outcomes);
             let mut sample_groups = PreflightSampleGroups::new();
             let mut usable = 0usize;
@@ -2060,7 +2259,17 @@ pub async fn run(
     for h in hosts.iter() {
         let input = host_to_input(h);
         let host = bare_host(&input);
+        let budget_key = origin_key(&input);
         for path in words.iter() {
+            if host_time_budget
+                .as_ref()
+                .is_some_and(|budget| budget.is_exhausted(&budget_key))
+            {
+                if let Some(budget) = host_time_budget.as_ref() {
+                    budget.report_once(&budget_key);
+                }
+                break;
+            }
             let item = ProbeItem {
                 host_input: input.clone(),
                 host: host.clone(),
@@ -2068,6 +2277,7 @@ pub async fn run(
                 depth: 0,
                 source: String::new(),
                 parent_url: String::new(),
+                budget_key: budget_key.clone(),
             };
             let sem = sem.clone();
             let cfg = cfg.clone();
@@ -2077,6 +2287,7 @@ pub async fn run(
             let out_file = out_file.clone();
             let policy = wildcard_policy_arc.clone();
             let disc = disc_tx.clone();
+            let time_budget = host_time_budget.clone();
             let progress_host = item.host.clone();
             let progress_url = format!("{}{}", item.host_input, item.path);
 
@@ -2094,7 +2305,7 @@ pub async fn run(
                 progress_url,
                 async move {
                     let _p = permit;
-                    run_probe_resilient(
+                    run_probe_budgeted(
                         item,
                         &cfg,
                         &wildcards,
@@ -2103,6 +2314,7 @@ pub async fn run(
                         &out_file,
                         *policy,
                         &disc,
+                        &time_budget,
                     )
                     .await;
                 },
@@ -2137,30 +2349,36 @@ pub async fn run(
             // Drain everything that's currently in the channel.
             // (try_recv until empty — non-blocking; workers already
             // finished so no more messages are coming for this round.)
-            let mut new_dirs: Vec<(String, String, u8, String)> = Vec::new(); // (url, host, depth, parent)
-            let mut new_urls: Vec<(String, String, u8, String)> = Vec::new(); // (url, source, depth, parent)
+            let mut new_dirs: Vec<(String, String, u8, String, String)> = Vec::new(); // (url, host, depth, parent, budget_key)
+            let mut new_urls: Vec<(String, String, u8, String, String)> = Vec::new(); // (url, source, depth, parent, budget_key)
             while let Ok(d) = disc_rx.try_recv() {
                 match d {
-                    Discovery::Directory { canonical_url, host, depth, parent } => {
+                    Discovery::Directory { canonical_url, host, depth, parent, budget_key } => {
                         if (depth as usize) <= round {
-                            new_dirs.push((canonical_url, host, depth, parent));
+                            new_dirs.push((canonical_url, host, depth, parent, budget_key));
                         }
                     }
-                    Discovery::Link { canonical_url, source, depth, parent } => {
+                    Discovery::Link { canonical_url, source, depth, parent, budget_key } => {
                         if (depth as usize) <= round {
-                            new_urls.push((canonical_url, source, depth, parent));
+                            new_urls.push((canonical_url, source, depth, parent, budget_key));
                         }
                     }
                 }
             }
             // Dedupe via visited set + apply per-host budgets.
-            let mut frontier_dirs: Vec<(String, String, u8, String)> = Vec::new();
-            let mut frontier_urls: Vec<(String, String, u8, String)> = Vec::new();
+            let mut frontier_dirs: Vec<(String, String, u8, String, String)> = Vec::new();
+            let mut frontier_urls: Vec<(String, String, u8, String, String)> = Vec::new();
             let mut excluded_dirs = 0usize;
             {
                 let mut v = visited.lock().await;
                 let mut budgets = host_budgets.lock().await;
-                for (canon, host, depth, parent) in new_dirs {
+                for (canon, host, depth, parent, budget_key) in new_dirs {
+                    if host_time_budget
+                        .as_ref()
+                        .is_some_and(|budget| budget.is_exhausted(&budget_key))
+                    {
+                        continue;
+                    }
                     if recursion_candidate_excluded(
                         &canon,
                         &cfg.recursion_excludes,
@@ -2174,13 +2392,19 @@ pub async fn run(
                         Arc::new(crate::recurse::HostBudget::new(cfg.max_dirs_per_host))
                     });
                     if !budget.try_inc_dir() { continue; }
-                    frontier_dirs.push((canon, host, depth, parent));
+                    frontier_dirs.push((canon, host, depth, parent, budget_key));
                 }
-                for (canon, source, depth, parent) in new_urls {
+                for (canon, source, depth, parent, budget_key) in new_urls {
+                    if host_time_budget
+                        .as_ref()
+                        .is_some_and(|budget| budget.is_exhausted(&budget_key))
+                    {
+                        continue;
+                    }
                     if !v.insert(canon.clone()) { continue; }
                     // Crawl URLs don't consume the dir budget; they're
                     // single-shot probes, not new fuzz-prefixes.
-                    frontier_urls.push((canon, source, depth, parent));
+                    frontier_urls.push((canon, source, depth, parent, budget_key));
                 }
             }
             if excluded_dirs > 0 {
@@ -2202,7 +2426,7 @@ pub async fn run(
             // bare count told the user a round had expanded into N unnamed
             // directories with no way to see which, or to judge whether the
             // expansion (dirs × wordlist) was worth the hours it costs.
-            for (dir_url, _, depth, _) in frontier_dirs.iter().take(RECURSE_DIR_LOG_CAP) {
+            for (dir_url, _, depth, _, _) in frontier_dirs.iter().take(RECURSE_DIR_LOG_CAP) {
                 eprintln!("  [recurse] d{} {}", depth, dir_url);
             }
             if frontier_dirs.len() > RECURSE_DIR_LOG_CAP {
@@ -2229,8 +2453,14 @@ pub async fn run(
             // depend on the round-0 host map alone. No per-round pre-flight here.
 
             // Spawn probes for new dirs × wordlist + new URLs.
-            for (dir_url, host, depth, parent) in &frontier_dirs {
+            for (dir_url, host, depth, parent, budget_key) in &frontier_dirs {
                 for path in words.iter() {
+                    if host_time_budget
+                        .as_ref()
+                        .is_some_and(|budget| budget.is_exhausted(budget_key))
+                    {
+                        break;
+                    }
                     let full_url = format!("{}{}", dir_url.trim_end_matches('/'), path);
                     // Visited check on the full probe URL — skip if some
                     // other dir's expansion already covers it.
@@ -2247,6 +2477,7 @@ pub async fn run(
                         depth: *depth,
                         source: "recursion".to_string(),
                         parent_url: parent.clone(),
+                        budget_key: budget_key.clone(),
                     };
                     let sem_c = sem.clone();
                     let cfg_c = cfg.clone();
@@ -2256,6 +2487,7 @@ pub async fn run(
                     let out_file_c = out_file.clone();
                     let policy_c = wildcard_policy_arc.clone();
                     let disc_c = disc_tx.clone();
+                    let time_budget = host_time_budget.clone();
                     let progress_host = item.host.clone();
                     let progress_url = format!("{}{}", item.host_input, item.path);
                     let permit = sem_c.acquire_owned().await.ok();
@@ -2267,7 +2499,7 @@ pub async fn run(
                         progress_url,
                         async move {
                             let _p = permit;
-                            run_probe_resilient(
+                            run_probe_budgeted(
                                 item,
                                 &cfg_c,
                                 &wildcards_c,
@@ -2276,6 +2508,7 @@ pub async fn run(
                                 &out_file_c,
                                 *policy_c,
                                 &disc_c,
+                                &time_budget,
                             )
                             .await;
                         },
@@ -2288,7 +2521,13 @@ pub async fn run(
             // Crawl-extracted URLs: each is a single-shot probe at the
             // resolved URL (no wordlist expansion — these are concrete
             // endpoints discovered from a response body).
-            for (link_url, source, depth, parent) in &frontier_urls {
+            for (link_url, source, depth, parent, budget_key) in &frontier_urls {
+                if host_time_budget
+                    .as_ref()
+                    .is_some_and(|budget| budget.is_exhausted(budget_key))
+                {
+                    continue;
+                }
                 // Split into (host_input, path) for the worker.
                 let (host_input, path, host) = match url::Url::parse(link_url) {
                     Ok(u) => {
@@ -2309,6 +2548,7 @@ pub async fn run(
                     depth: *depth,
                     source: source.clone(),
                     parent_url: parent.clone(),
+                    budget_key: budget_key.clone(),
                 };
                 let sem_c = sem.clone();
                 let cfg_c = cfg.clone();
@@ -2318,6 +2558,7 @@ pub async fn run(
                 let out_file_c = out_file.clone();
                 let policy_c = wildcard_policy_arc.clone();
                 let disc_c = disc_tx.clone();
+                let time_budget = host_time_budget.clone();
                 let progress_host = item.host.clone();
                 let progress_url = format!("{}{}", item.host_input, item.path);
                 let permit = sem_c.acquire_owned().await.ok();
@@ -2327,7 +2568,7 @@ pub async fn run(
                     progress_url,
                     async move {
                         let _p = permit;
-                        run_probe_resilient(
+                        run_probe_budgeted(
                             item,
                             &cfg_c,
                             &wildcards_c,
@@ -2336,6 +2577,7 @@ pub async fn run(
                             &out_file_c,
                             *policy_c,
                             &disc_c,
+                            &time_budget,
                         )
                         .await;
                     },
@@ -3115,6 +3357,50 @@ async fn catchall_suppresses(
 /// counters feed an honest end-of-run summary. The panic happens during the
 /// request (before any output lock), so a retry is clean.
 #[allow(clippy::too_many_arguments)]
+async fn run_probe_budgeted(
+    item: ProbeItem,
+    cfg: &FuzzCfg,
+    wildcards: &Arc<WildcardMap>,
+    catchall: &Arc<Mutex<CatchallCache>>,
+    scoped_auth: &Arc<Mutex<ScopedAuthCache>>,
+    out_file: &Arc<OutputSink>,
+    wildcard_policy: WildcardPolicy,
+    disc_tx: &tokio::sync::mpsc::UnboundedSender<Discovery>,
+    budget: &Option<Arc<HostTimeBudget>>,
+) {
+    if let Some(budget) = budget {
+        let key = item.budget_key.clone();
+        let _ = budget
+            .run(
+                &key,
+                run_probe_resilient(
+                    item,
+                    cfg,
+                    wildcards,
+                    catchall,
+                    scoped_auth,
+                    out_file,
+                    wildcard_policy,
+                    disc_tx,
+                ),
+            )
+            .await;
+    } else {
+        run_probe_resilient(
+            item,
+            cfg,
+            wildcards,
+            catchall,
+            scoped_auth,
+            out_file,
+            wildcard_policy,
+            disc_tx,
+        )
+        .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_probe_resilient(
     item: ProbeItem,
     cfg: &FuzzCfg,
@@ -3395,6 +3681,7 @@ async fn run_probe(
                             host: item.host.clone(),
                             depth: next_depth,
                             parent: url.clone(),
+                            budget_key: item.budget_key.clone(),
                         });
                     }
                 }
@@ -3488,6 +3775,7 @@ async fn run_probe(
                             source: "crawl-redirect".to_string(),
                             depth: next_depth,
                             parent: url.clone(),
+                            budget_key: item.budget_key.clone(),
                         });
                     }
                 }
@@ -3510,6 +3798,7 @@ async fn run_probe(
                         source: source_tag.to_string(),
                         depth: next_depth,
                         parent: crawl_base.clone(),
+                        budget_key: item.budget_key.clone(),
                     });
                 }
             }
@@ -3813,6 +4102,52 @@ mod tests {
         );
         drop(first);
         assert_eq!(tracker.snapshot(), ActiveProbeSnapshot::default());
+    }
+
+    #[tokio::test]
+    async fn host_time_budget_does_not_charge_idle_time() {
+        let budget = Arc::new(HostTimeBudget {
+            limit: Duration::from_millis(300),
+            states: std::sync::Mutex::new(HashMap::new()),
+        });
+        assert!(matches!(
+            budget
+                .run("one.test", tokio::time::sleep(Duration::from_millis(60)))
+                .await,
+            BudgetOutcome::Completed(())
+        ));
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        assert!(matches!(
+            budget
+                .run("one.test", tokio::time::sleep(Duration::from_millis(60)))
+                .await,
+            BudgetOutcome::Completed(())
+        ));
+        assert!(!budget.is_exhausted("one.test"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_probes_share_one_host_clock() {
+        let budget = Arc::new(HostTimeBudget {
+            limit: Duration::from_millis(220),
+            states: std::sync::Mutex::new(HashMap::new()),
+        });
+        let (first, second) = tokio::join!(
+            budget.run("one.test", tokio::time::sleep(Duration::from_millis(90))),
+            budget.run("one.test", tokio::time::sleep(Duration::from_millis(90))),
+        );
+        assert!(matches!(first, BudgetOutcome::Completed(())));
+        assert!(matches!(second, BudgetOutcome::Completed(())));
+
+        assert!(matches!(
+            budget
+                .run("one.test", tokio::time::sleep(Duration::from_millis(180)))
+                .await,
+            BudgetOutcome::Expired
+        ));
+        assert!(budget.is_exhausted("one.test"));
     }
 
     #[test]

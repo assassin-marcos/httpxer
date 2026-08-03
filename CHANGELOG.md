@@ -4,6 +4,19 @@ All notable changes to **httpxer** are recorded here. Format loosely follows [Ke
 
 ## [Unreleased]
 
+## [0.6.15] — 2026-08-04
+
+### Added
+- Normal commands now install newer published releases without confirmation and resume the original arguments; `--no-update-check` remains the explicit opt-out.
+- Fuzz mode adds `--host-timeout` (`--target-timeout`) to cap active scan time independently for each input target while preserving streamed findings and continuing other targets.
+
+### Fixed
+- Explicit updates no longer ask for confirmation, and relocation now re-enters the updater with the correct `-U` short flag.
+
+### Verified
+- Regression tests cover update eligibility, opt-out and re-exec guards, shared concurrent host timing, idle-time exclusion, and fuzz-only CLI validation.
+- A two-origin loopback scan canceled a deliberately slow target at its budget while preserving a responsive target's finding.
+
 ## [0.6.14] — 2026-08-03
 
 ### Fixed
