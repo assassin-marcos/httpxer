@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey.svg)]()
 
-**Current release:** [v0.6.15](https://github.com/assassin-marcos/httpxer/releases/tag/v0.6.15)
+**Current release:** [v0.6.16](https://github.com/assassin-marcos/httpxer/releases/tag/v0.6.16)
 
 ```
  _     _   _
@@ -151,7 +151,7 @@ Most directory bruteforcers drown in false positives on CDN-fronted / SPA / soft
 
 - **Layer 1 — static catchall**: at least two same-status samples agree on `(content_type, content_length, snippet_md5)` within the configured length tolerance. Separate status and extension-family signatures are retained instead of overwriting one another.
 - **Layer 2 — path-echo / dynamic-CL**: with at least three samples, `content_length = k × path_length + base` must fit within residual bounds. The slope `k` then predicts the wildcard length for each probe path.
-- **Layer 1b — content-aware catchall**: when no path-echo model fits, the catchall body may still vary per request (for example, a request ID or timestamp). UUIDs, long hex/digit runs and timestamps are normalized before hashing. Bounded drift uses normalized-content and token-similarity guards; wide length drift additionally requires the normalized first 2 KiB to agree exactly. Matching is content-aware, never size-only.
+- **Layer 1b — content-aware catchall**: when no path-echo model fits, the catchall body may still vary per request (for example, a request ID, timestamp, or Nginx status counter). UUIDs, long hex/digit runs and timestamps are normalized before hashing; the dynamic Nginx status body is canonicalized only when its complete native grammar matches. Bounded drift uses normalized-content and token-similarity guards; wide length drift additionally requires the normalized first 2 KiB to agree exactly. Matching is content-aware, never size-only.
 - **Bodyless catchall**: the host answers **`2xx` with zero bytes** for *every* path. There is no body to fingerprint, so every layer above is blind to it by construction. `200` + no body across **3 distinct paths** is itself the signature — httpxer learns it per `(host, status, content_type)` and suppresses from then on. A *lone* legitimate empty `200` (a `/ping`-style endpoint) stays below the threshold and is still emitted.
 - **Auth wildcard**: a blanket `401`/`403` is learned only when every generic and extension-shaped random control completes with the same status, content type, body hash, and bounded content length. Mixed responses or failed controls are inconclusive. `strict` suppresses matches before recursion, crawl, or bypass traffic; a distinguishable protected endpoint remains eligible for normal output, recursion, and bypass checks.
 

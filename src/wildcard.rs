@@ -183,7 +183,26 @@ pub struct ProbeSample {
 /// string; two genuinely different pages do not. Conservative by design —
 /// these patterns are essentially absent from real HTML/JSON body prefixes
 /// except as the volatile tokens we intend to erase.
+fn is_nginx_stub_status(body: &str) -> bool {
+    // nginx's stub_status handler is a small, fixed text template whose short
+    // connection/request counters change on every response. Generic short-
+    // number removal would collapse unrelated pages, so recognize only the
+    // complete native grammar.
+    static NGINX_STUB_STATUS: OnceLock<regex::Regex> = OnceLock::new();
+    let nginx_stub_status = NGINX_STUB_STATUS.get_or_init(|| {
+        regex::Regex::new(
+            r"\A[ \t]*Active connections:[ \t]*\d+[ \t]*\r?\n[ \t]*server accepts handled requests[ \t]*\r?\n[ \t]*\d+[ \t]+\d+[ \t]+\d+[ \t]*\r?\n[ \t]*Reading:[ \t]*\d+[ \t]+Writing:[ \t]*\d+[ \t]+Waiting:[ \t]*\d+[ \t]*(?:\r?\n)?\z",
+        )
+        .unwrap()
+    });
+    body.len() <= 1024 && nginx_stub_status.is_match(body)
+}
+
 pub(crate) fn normalize_snippet(body: &str) -> String {
+    if is_nginx_stub_status(body) {
+        return "Active connections: <n> server accepts handled requests <n> <n> <n> Reading: <n> Writing: <n> Waiting: <n>".to_string();
+    }
+
     static NORM_RES: OnceLock<[regex::Regex; 4]> = OnceLock::new();
     let res = NORM_RES.get_or_init(|| {
         [
@@ -417,7 +436,10 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
                 .map(|sample| md5_hex(&normalize_snippet(&sample.raw_body)))
                 .collect();
             if normalized.iter().all(|hash| *hash == normalized[0])
-                && min_pairwise_token_ratio(samples) >= L1B_TOKEN_RATIO_MIN
+                && (samples
+                    .iter()
+                    .all(|sample| is_nginx_stub_status(&sample.raw_body))
+                    || min_pairwise_token_ratio(samples) >= L1B_TOKEN_RATIO_MIN)
             {
                 return Some(WildcardSig {
                     status: first.status,
@@ -472,7 +494,13 @@ pub fn detect(samples: &[ProbeSample], tolerance: i64) -> Option<WildcardSig> {
                 .map(|s| md5_hex(&normalize_snippet(&s.raw_body)))
                 .collect();
             let normalized_agree = norm.iter().all(|h| *h == norm[0]);
-            if normalized_agree && min_pairwise_token_ratio(samples) >= L1B_TOKEN_RATIO_MIN {
+            let strict_dynamic_template = samples
+                .iter()
+                .all(|sample| is_nginx_stub_status(&sample.raw_body));
+            if normalized_agree
+                && (strict_dynamic_template
+                    || min_pairwise_token_ratio(samples) >= L1B_TOKEN_RATIO_MIN)
+            {
                 // Tolerance: cover the observed spread for the (secondary) CL
                 // sanity check; primary match is the normalized-content hash.
                 let learned_tolerance = if spread <= tolerance {
@@ -1244,6 +1272,53 @@ mod tests {
             "x.com", 200, 393, "application/json", "z", 7,
             &body("1111222233334444aaaabbbbccccdddd"),
         ));
+    }
+
+    #[test]
+    fn detect_layer1b_nginx_stub_status_with_short_dynamic_counters() {
+        let bodies = [
+            "Active connections: 86\nserver accepts handled requests\n 12874 12874 21638\nReading: 0 Writing: 13 Waiting: 73\n",
+            "Active connections: 89\nserver accepts handled requests\n 4819504 4819504 9748360\nReading: 0 Writing: 14 Waiting: 75\n",
+            "Active connections: 103\r\nserver accepts handled requests\r\n 4820041 4820041 9749218\r\nReading: 1 Writing: 9 Waiting: 93\r\n",
+        ];
+        let samples: Vec<_> = bodies
+            .iter()
+            .enumerate()
+            .map(|(index, body)| {
+                sb(
+                    body.len() as i64,
+                    "text/plain",
+                    &md5_hex(body),
+                    17 + index * 16,
+                    body,
+                )
+            })
+            .collect();
+
+        let sig = detect(&samples, 10).expect("dynamic nginx stub_status should be detected");
+        assert!(sig.snippet_md5.is_empty());
+        assert!(!sig.normalized_snippet_md5.is_empty());
+
+        let runtime = "Active connections: 7\nserver accepts handled requests\n 52 52 91\nReading: 0 Writing: 2 Waiting: 5\n";
+        assert!(sig.matches_probe(
+            runtime.len() as i64,
+            "text/plain",
+            &md5_hex(runtime),
+            91,
+            runtime,
+        ));
+    }
+
+    #[test]
+    fn nginx_stub_status_normalizer_rejects_partial_or_similar_text() {
+        let valid = "Active connections: 8\nserver accepts handled requests\n 10 10 20\nReading: 0 Writing: 1 Waiting: 7\n";
+        let missing_line =
+            "Active connections: 9\nserver accepts handled requests\nReading: 0 Writing: 1 Waiting: 8\n";
+        let ordinary_a = "Active connections: 8; requests: 10; waiting: 7";
+        let ordinary_b = "Active connections: 9; requests: 11; waiting: 8";
+
+        assert_ne!(normalize_snippet(valid), normalize_snippet(missing_line));
+        assert_ne!(normalize_snippet(ordinary_a), normalize_snippet(ordinary_b));
     }
 
     /// Layer 1b must NOT fire when content types differ across samples.

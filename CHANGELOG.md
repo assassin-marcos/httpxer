@@ -4,6 +4,16 @@ All notable changes to **httpxer** are recorded here. Format loosely follows [Ke
 
 ## [Unreleased]
 
+## [0.6.16] — 2026-08-04
+
+### Fixed
+- Dynamic Nginx status catchalls with changing short counters now produce a stable content-aware wildcard signature without globally normalizing ordinary short numbers.
+- The shared HTTP client pool now bounds and expires idle connections so multi-host backup discovery does not exhaust normal process file-descriptor limits.
+
+### Verified
+- Regression coverage proves Nginx status detection, runtime suppression, and rejection of malformed or merely similar bodies.
+- A multi-host backup scan completed under a deliberately constrained file-descriptor limit and the full locked test suite passed.
+
 ## [0.6.15] — 2026-08-04
 
 ### Added

@@ -190,6 +190,8 @@ static WREQ_POOL_RETRIES: AtomicUsize = AtomicUsize::new(0);
 static WREQ_POOL_FAILURES: AtomicUsize = AtomicUsize::new(0);
 const WREQ_POOL_ASSERTION: &str =
     "assertion failed: Pin::new(&mut rx).poll(cx).is_pending()";
+const HTTP_POOL_MAX_IDLE_PER_HOST: usize = 2;
+const HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// v0.5.0 — user auth for the ENRICH probe path (`-H`, `--bearer`, `--cookie`).
 ///
@@ -589,7 +591,12 @@ pub fn init_pool(
             let mut b = Client::builder()
                 .timeout(timeout)
                 .connect_timeout(timeout)
-                .cert_verification(false);
+                .cert_verification(false)
+                // wreq defaults to unlimited idle sockets per host. A
+                // multi-host backup pass can otherwise retain hundreds of
+                // completed connections and hit a normal 1024-FD shell limit.
+                .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                .pool_idle_timeout(HTTP_POOL_IDLE_TIMEOUT);
             if !no_impersonate {
                 b = b.emulation(*emul);
             }
@@ -604,7 +611,10 @@ pub fn init_pool(
         if pool.is_empty() {
             // Final safety net — at minimum one plain client so probes don't
             // all silently no-op if every profile build fails.
-            let b = Client::builder().timeout(timeout);
+            let b = Client::builder()
+                .timeout(timeout)
+                .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                .pool_idle_timeout(HTTP_POOL_IDLE_TIMEOUT);
             if let Ok(c) = b.build() {
                 pool.push(PoolSlot {
                     client: c,
