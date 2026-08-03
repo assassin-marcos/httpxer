@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey.svg)]()
 
-**Current release:** [v0.6.14](https://github.com/assassin-marcos/httpxer/releases/tag/v0.6.14)
+**Current release:** [v0.6.15](https://github.com/assassin-marcos/httpxer/releases/tag/v0.6.15)
 
 ```
  _     _   _
@@ -103,6 +103,25 @@ httpxer -l hosts.txt -w wordlist.txt -t 50 --rate-limit 10 -o findings.jsonl
 
 # Give each input target at most 100 seconds of active scan time
 httpxer -l hosts.txt -w wordlist.txt --host-timeout 100 -o findings.jsonl
+
+# Bash-safe deep scan with proxy rotation and a 400-second budget per target
+target='https://example.com'
+wordlist='./wordlist.txt'
+proxy='./proxies.txt'
+output='./findings.txt'
+httpxer -u "$target" \
+  -w "$wordlist" \
+  -t 150 \
+  --deep 2 \
+  --recurse-on-200 \
+  --max-dirs-per-host 20 \
+  --status 2xx \
+  --host-timeout 400 \
+  --timeout-ms 10000 \
+  --retries 2 \
+  --proxy "$proxy" \
+  --no-art \
+  -o "$output"
 
 # Authenticated scan; auth controls work in both modes
 httpxer -u https://example.com/ -w wordlist.txt --bearer "$TOKEN" -H 'X-Tenant: 42'
