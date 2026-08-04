@@ -550,20 +550,157 @@ pub struct AuthCatchall {
     pub content_length: i64,
     pub content_type: String,
     pub snippet_md5: String,
+    /// Canonical JSON-body fingerprint with only recognized request metadata
+    /// replaced. Empty for non-JSON/static responses, which retain exact-md5
+    /// matching. This keeps dynamic request IDs from manufacturing recursion
+    /// roots without collapsing distinct login realms or error messages.
+    pub body_shape_md5: String,
 }
 
 impl AuthCatchall {
+    pub fn from_response(
+        status: u16,
+        content_length: i64,
+        content_type: String,
+        snippet_md5: String,
+        raw_body: &str,
+    ) -> Self {
+        let body_shape_md5 = auth_json_shape_md5(&content_type, raw_body);
+        Self {
+            status,
+            content_length,
+            content_type,
+            snippet_md5,
+            body_shape_md5,
+        }
+    }
+
     /// True if a probe response is indistinguishable from this host's
-    /// blanket auth response. Exact body fingerprint + content type, with a
-    /// small content-length tolerance for transport/header inconsistencies.
-    /// Never size-only: a nonce or any other body change remains distinct.
-    pub fn matches(&self, status: u16, cl: i64, ct: &str, md5: &str) -> bool {
+    /// blanket auth response. Static bodies require exact body parity. Dynamic
+    /// JSON bodies may instead match a conservative structural fingerprint
+    /// that normalizes recognized request metadata but preserves messages and
+    /// other semantic values. Matching is never size-only.
+    pub fn matches(
+        &self,
+        status: u16,
+        cl: i64,
+        ct: &str,
+        md5: &str,
+        raw_body: &str,
+    ) -> bool {
         const CL_TOL: i64 = 24;
         self.status == status
             && self.content_type == ct
-            && self.snippet_md5 == md5
             && (self.content_length - cl).abs() <= CL_TOL
+            && (self.snippet_md5 == md5
+                || (!self.body_shape_md5.is_empty()
+                    && self.body_shape_md5 == auth_json_shape_md5(ct, raw_body)))
     }
+
+    pub fn matches_signature(&self, other: &Self) -> bool {
+        const CL_TOL: i64 = 24;
+        self.status == other.status
+            && self.content_type == other.content_type
+            && (self.content_length - other.content_length).abs() <= CL_TOL
+            && (self.snippet_md5 == other.snippet_md5
+                || (!self.body_shape_md5.is_empty()
+                    && self.body_shape_md5 == other.body_shape_md5))
+    }
+}
+
+const AUTH_JSON_SHAPE_MAX_BYTES: usize = 64 * 1024;
+
+fn auth_json_content_type(content_type: &str) -> bool {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    mime == "application/json" || mime.ends_with("+json")
+}
+
+fn auth_metadata_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn auth_value_is_high_entropy_id(value: &serde_json::Value) -> bool {
+    let Some(value) = value.as_str() else {
+        return false;
+    };
+    value.len() >= 16
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+        })
+}
+
+fn normalize_auth_json(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let mut changed = false;
+            for (key, value) in fields.iter_mut() {
+                let key = auth_metadata_key(key);
+                let known_metadata = matches!(
+                    key.as_str(),
+                    "requestid"
+                        | "correlationid"
+                        | "traceid"
+                        | "spanid"
+                        | "transactionid"
+                        | "eventid"
+                        | "nonce"
+                        | "timestamp"
+                        | "requesttimestamp"
+                        | "generatedat"
+                        | "date"
+                        | "time"
+                );
+                let generic_dynamic_id = key == "id" && auth_value_is_high_entropy_id(value);
+                if (known_metadata || generic_dynamic_id)
+                    && !matches!(value, serde_json::Value::Object(_) | serde_json::Value::Array(_))
+                {
+                    if !value.is_null() {
+                        *value = serde_json::Value::String("<request-metadata>".into());
+                        changed = true;
+                    }
+                } else {
+                    changed |= normalize_auth_json(value);
+                }
+            }
+            changed
+        }
+        serde_json::Value::Array(values) => {
+            let mut changed = false;
+            for value in values {
+                changed |= normalize_auth_json(value);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn auth_json_shape_md5(content_type: &str, raw_body: &str) -> String {
+    if raw_body.is_empty()
+        || raw_body.len() > AUTH_JSON_SHAPE_MAX_BYTES
+        || !auth_json_content_type(content_type)
+    {
+        return String::new();
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw_body) else {
+        return String::new();
+    };
+    // Do not enable structural matching unless a recognized volatile value was
+    // actually removed. Ordinary JSON remains exact-body matched.
+    if !normalize_auth_json(&mut value) {
+        return String::new();
+    }
+    serde_json::to_vec(&value)
+        .map(|body| md5_hex(&String::from_utf8_lossy(&body)))
+        .unwrap_or_default()
 }
 
 /// In-memory map of host → wildcard signature. Constructed once at fuzz
@@ -572,8 +709,8 @@ impl AuthCatchall {
 pub struct WildcardMap {
     inner: HashMap<String, Vec<WildcardSig>>,
     /// host → blanket `401`/`403` fingerprint. Kept separate because auth
-    /// catchalls use exact status/body/content-type parity rather than the
-    /// 2xx/3xx Layer 1/Layer 2 models in `inner`. See [`AuthCatchall`].
+    /// catchalls use exact or conservative structured-body parity rather than
+    /// the 2xx/3xx Layer 1/Layer 2 models in `inner`. See [`AuthCatchall`].
     auth: HashMap<String, Vec<AuthCatchall>>,
 }
 
@@ -659,7 +796,7 @@ impl WildcardMap {
     /// Record this host's blanket `401`/`403` fingerprint (see [`AuthCatchall`]).
     pub fn insert_auth(&mut self, host: String, sig: AuthCatchall) {
         let sigs = self.auth.entry(host).or_default();
-        if !sigs.contains(&sig) {
+        if !sigs.iter().any(|existing| existing.matches_signature(&sig)) {
             sigs.push(sig);
         }
     }
@@ -671,14 +808,23 @@ impl WildcardMap {
     /// Same exact-key-then-base-key lookup as [`Self::matches_body`]: recursion
     /// passes a discovered dir URL as `host`, while the fingerprint is stored
     /// under the round-0 base input.
-    pub fn is_auth_catchall(&self, host: &str, status: u16, cl: i64, ct: &str, md5: &str) -> bool {
+    pub fn is_auth_catchall(
+        &self,
+        host: &str,
+        status: u16,
+        cl: i64,
+        ct: &str,
+        md5: &str,
+        raw_body: &str,
+    ) -> bool {
         if !matches!(status, 401 | 403) {
             return false;
         }
         let Some((_, sigs)) = self.lookup(&self.auth, host) else {
             return false;
         };
-        sigs.iter().any(|sig| sig.matches(status, cl, ct, md5))
+        sigs.iter()
+            .any(|sig| sig.matches(status, cl, ct, md5, raw_body))
     }
 
     #[allow(dead_code)]
@@ -1166,34 +1312,43 @@ mod tests {
     #[test]
     fn auth_catchall_suppresses_blanket_401_but_not_a_distinguishable_one() {
         let mut m = WildcardMap::new();
-        let blanket = AuthCatchall {
-            status: 401,
-            content_length: 0,
-            content_type: String::new(),
-            snippet_md5: md5_hex(""),
-        };
+        let blanket = AuthCatchall::from_response(401, 0, String::new(), md5_hex(""), "");
         m.insert_auth("https://api.example".into(), blanket);
 
         // The blanket response itself — recursion into this marks nothing.
-        assert!(m.is_auth_catchall("https://api.example", 401, 0, "", &md5_hex("")));
+        assert!(m.is_auth_catchall("https://api.example", 401, 0, "", &md5_hex(""), ""));
         // Same host, but a REAL protected dir answering with its own body
         // (a login realm page) — distinguishable, so it still recurses.
         let realm = "<html><title>Sign in</title><body>Authentication required</body></html>";
         assert!(
-            !m.is_auth_catchall("https://api.example", 401, 71, "text/html", &md5_hex(realm)),
+            !m.is_auth_catchall(
+                "https://api.example",
+                401,
+                71,
+                "text/html",
+                &md5_hex(realm),
+                realm,
+            ),
             "a 401 with its own body is signal, not blanket noise"
         );
         // A 403 is a different status class than the recorded 401.
-        assert!(!m.is_auth_catchall("https://api.example", 403, 0, "", &md5_hex("")));
+        assert!(!m.is_auth_catchall("https://api.example", 403, 0, "", &md5_hex(""), ""));
         // Non-auth statuses are never suppressed by this rule.
-        assert!(!m.is_auth_catchall("https://api.example", 200, 0, "", &md5_hex("")));
+        assert!(!m.is_auth_catchall("https://api.example", 200, 0, "", &md5_hex(""), ""));
         // A host with no recorded auth catchall recurses normally — this is
         // the ordinary case and must not regress.
-        assert!(!m.is_auth_catchall("https://other.example", 401, 0, "", &md5_hex("")));
+        assert!(!m.is_auth_catchall("https://other.example", 401, 0, "", &md5_hex(""), ""));
 
         // Recursion passes a DISCOVERED DIR URL as the host; the fingerprint
         // is stored under the base input, so the base-key fallback must hit.
-        assert!(m.is_auth_catchall("https://api.example/internal", 401, 0, "", &md5_hex("")));
+        assert!(m.is_auth_catchall(
+            "https://api.example/internal",
+            401,
+            0,
+            "",
+            &md5_hex(""),
+            "",
+        ));
     }
 
     #[test]
@@ -1202,12 +1357,13 @@ mod tests {
         assert!(m.is_empty());
         m.insert_auth(
             "https://api.example".into(),
-            AuthCatchall {
-                status: 403,
-                content_length: 9,
-                content_type: "text/plain".into(),
-                snippet_md5: md5_hex("forbidden"),
-            },
+            AuthCatchall::from_response(
+                403,
+                9,
+                "text/plain".into(),
+                md5_hex("forbidden"),
+                "forbidden",
+            ),
         );
         assert!(!m.is_empty());
         assert_eq!(
@@ -1215,6 +1371,93 @@ mod tests {
             0,
             "normal wildcard signature count stays unchanged"
         );
+    }
+
+    #[test]
+    fn auth_catchall_matches_dynamic_json_request_metadata() {
+        let first = r#"{"requestId":982869,"statusCode":401,"error":"Unauthorized","message":"Login required","id":"bZxXF4bheexi9doXXwW8j3"}"#;
+        let second = r#"{"requestId":1218944,"statusCode":401,"error":"Unauthorized","message":"Login required","id":"ubsVa5V51ohTGn2qXzstDJ"}"#;
+        let sig = AuthCatchall::from_response(
+            401,
+            first.len() as i64,
+            "application/json; charset=utf-8".into(),
+            md5_hex(first),
+            first,
+        );
+
+        assert_ne!(md5_hex(first), md5_hex(second));
+        assert!(!sig.body_shape_md5.is_empty());
+        assert!(sig.matches(
+            401,
+            second.len() as i64,
+            "application/json; charset=utf-8",
+            &md5_hex(second),
+            second,
+        ));
+    }
+
+    #[test]
+    fn auth_catchall_keeps_distinct_json_realms_separate() {
+        let login = r#"{"requestId":982869,"statusCode":401,"error":"Unauthorized","message":"Login required","id":"bZxXF4bheexi9doXXwW8j3"}"#;
+        let disabled = r#"{"requestId":1218944,"statusCode":401,"error":"Unauthorized","message":"Account disabled","id":"ubsVa5V51ohTGn2qXzstDJ"}"#;
+        let sig = AuthCatchall::from_response(
+            401,
+            login.len() as i64,
+            "application/json".into(),
+            md5_hex(login),
+            login,
+        );
+
+        assert!(!sig.matches(
+            401,
+            disabled.len() as i64,
+            "application/json",
+            &md5_hex(disabled),
+            disabled,
+        ));
+    }
+
+    #[test]
+    fn auth_catchall_preserves_short_semantic_json_ids() {
+        let admin = r#"{"statusCode":401,"message":"Login required","id":"admin"}"#;
+        let billing = r#"{"statusCode":401,"message":"Login required","id":"billing"}"#;
+        let sig = AuthCatchall::from_response(
+            401,
+            admin.len() as i64,
+            "application/json".into(),
+            md5_hex(admin),
+            admin,
+        );
+
+        assert!(sig.body_shape_md5.is_empty());
+        assert!(!sig.matches(
+            401,
+            billing.len() as i64,
+            "application/json",
+            &md5_hex(billing),
+            billing,
+        ));
+    }
+
+    #[test]
+    fn auth_map_deduplicates_dynamic_json_templates() {
+        let first = r#"{"requestId":982869,"statusCode":401,"message":"Login required","id":"bZxXF4bheexi9doXXwW8j3"}"#;
+        let second = r#"{"requestId":1218944,"statusCode":401,"message":"Login required","id":"ubsVa5V51ohTGn2qXzstDJ"}"#;
+        let mut map = WildcardMap::new();
+        for body in [first, second] {
+            map.insert_auth(
+                "https://api.example".into(),
+                AuthCatchall::from_response(
+                    401,
+                    body.len() as i64,
+                    "application/json".into(),
+                    md5_hex(body),
+                    body,
+                ),
+            );
+        }
+
+        assert_eq!(map.auth["https://api.example"].len(), 1);
     }
 
     /// Content-aware L1b tolerates small CL drift while bodies normalize equal.

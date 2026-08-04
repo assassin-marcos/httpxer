@@ -1203,13 +1203,8 @@ fn learn_auth_catchall(
         .all(|(_, outcome)| {
             matches!(
                 outcome,
-                Some(PreflightOutcome::Auth(sig))
-                    if first.matches(
-                        sig.status,
-                        sig.content_length,
-                        &sig.content_type,
-                        &sig.snippet_md5,
-                    )
+                    Some(PreflightOutcome::Auth(sig))
+                    if first.matches_signature(sig)
             )
         })
         .then(|| first.clone())
@@ -1245,12 +1240,15 @@ async fn wildcard_preflight_probe(
     // auth response — the signal that tells recursion this status marks
     // nothing. Captured before the 200-399 gate that drops everything else.
     if matches!(parsed.status, 401 | 403) {
-        return Some(PreflightOutcome::Auth(crate::wildcard::AuthCatchall {
-            status: parsed.status,
-            content_length: parsed.content_length,
-            content_type: parsed.content_type,
-            snippet_md5: parsed.snippet_md5,
-        }));
+        return Some(PreflightOutcome::Auth(
+            crate::wildcard::AuthCatchall::from_response(
+                parsed.status,
+                parsed.content_length,
+                parsed.content_type,
+                parsed.snippet_md5,
+                &parsed.raw_body,
+            ),
+        ));
     }
     if crate::recurse::trailing_slash_directory_url(&url, parsed.status, &parsed.location)
         .is_some()
@@ -2813,25 +2811,37 @@ impl ScopedAuthCache {
     fn insert(&mut self, scope: &str, sig: crate::wildcard::AuthCatchall) {
         let scope = scope.trim_end_matches('/').to_string();
         let sigs = self.learned.entry(scope).or_default();
-        if !sigs.contains(&sig) {
+        if !sigs.iter().any(|existing| existing.matches_signature(&sig)) {
             sigs.push(sig);
         }
     }
 
-    fn matches(&self, url: &str, status: u16, cl: i64, ct: &str, md5: &str) -> bool {
+    fn matches(
+        &self,
+        url: &str,
+        status: u16,
+        cl: i64,
+        ct: &str,
+        md5: &str,
+        raw_body: &str,
+    ) -> bool {
         self.learned
             .iter()
             .filter(|(scope, _)| {
                 url.strip_prefix(scope.as_str()).is_some_and(|rest| {
-                    rest.is_empty()
-                        || rest.starts_with('/')
-                        || rest.starts_with('?')
-                        || rest.starts_with('#')
+                    rest.strip_prefix('/').is_some_and(|tail| {
+                        !tail
+                            .split(['?', '#'])
+                            .next()
+                            .unwrap_or(tail)
+                            .is_empty()
+                    })
                 })
             })
             .max_by_key(|(scope, _)| scope.len())
             .is_some_and(|(_, sigs)| {
-                sigs.iter().any(|sig| sig.matches(status, cl, ct, md5))
+                sigs.iter()
+                    .any(|sig| sig.matches(status, cl, ct, md5, raw_body))
             })
     }
 }
@@ -3117,6 +3127,14 @@ fn auth_sibling_scope(scan_scope: &str, candidate_url: &str) -> Option<String> {
     } else {
         Some(parent)
     }
+}
+
+fn nested_auth_child_confirms_catchall(
+    nested_candidate: bool,
+    candidate: &crate::wildcard::AuthCatchall,
+    child: &crate::wildcard::AuthCatchall,
+) -> bool {
+    nested_candidate && candidate.matches_signature(child)
 }
 
 pub(crate) fn origin_key(url: &str) -> String {
@@ -3497,6 +3515,7 @@ async fn run_probe(
                     parsed.content_length,
                     &parsed.content_type,
                     &parsed.snippet_md5,
+                    &parsed.raw_body,
                 );
             let mut is_wildcard = auth_wildcard;
             if !matches!(wildcard_policy, WildcardPolicy::Off)
@@ -3558,6 +3577,7 @@ async fn run_probe(
                     parsed.content_length,
                     &parsed.content_type,
                     &parsed.snippet_md5,
+                    &parsed.raw_body,
                 );
                 let auth_noise = scoped_auth_noise
                     || wildcards.is_auth_catchall(
@@ -3566,6 +3586,7 @@ async fn run_probe(
                         parsed.content_length,
                         &parsed.content_type,
                         &parsed.snippet_md5,
+                        &parsed.raw_body,
                     );
                 if let Some(dir_url) = crate::recurse::detect_directory(
                     &url,
@@ -3590,17 +3611,21 @@ async fn run_probe(
                     // preserving `/api=401 -> /api/actuator=200` discovery.
                     //
                     // If the sibling differs, retain the v0.6.4 random-CHILD
-                    // check. A child matching the host wildcard proves a
-                    // one-off protected path rather than a directory.
+                    // check. A nested candidate whose random child has the same
+                    // auth template is another scoped auth wall; a child matching
+                    // the host wildcard proves a one-off protected path.
                     let skip = if matches!(parsed.status, 401 | 403) {
-                        let candidate_sig = crate::wildcard::AuthCatchall {
-                            status: parsed.status,
-                            content_length: parsed.content_length,
-                            content_type: parsed.content_type.clone(),
-                            snippet_md5: parsed.snippet_md5.clone(),
-                        };
+                        let candidate_sig = crate::wildcard::AuthCatchall::from_response(
+                            parsed.status,
+                            parsed.content_length,
+                            parsed.content_type.clone(),
+                            parsed.snippet_md5.clone(),
+                            &parsed.raw_body,
+                        );
+                        let sibling_scope = auth_sibling_scope(&item.host_input, &url);
+                        let nested_candidate = sibling_scope.is_some();
                         let mut sibling_catchall = false;
-                        if let Some(scope) = auth_sibling_scope(&item.host_input, &url) {
+                        if let Some(scope) = sibling_scope.as_ref() {
                             let sibling = format!(
                                 "{}{}",
                                 scope.trim_end_matches('/'),
@@ -3622,10 +3647,11 @@ async fn run_probe(
                                     probe.content_length,
                                     &probe.content_type,
                                     &probe.snippet_md5,
+                                    &probe.raw_body,
                                 );
                                 if sibling_catchall {
                                     scoped_auth.lock().await.insert(
-                                        &scope,
+                                        scope,
                                         candidate_sig.clone(),
                                     );
                                 }
@@ -3648,18 +3674,28 @@ async fn run_probe(
                             .await
                             {
                                 Ok((child, _, _)) => {
-                                    if matches!(child.status, 401 | 403) {
-                                        scoped_auth.lock().await.insert(
-                                            &dir_url,
-                                            crate::wildcard::AuthCatchall {
-                                                status: child.status,
-                                                content_length: child.content_length,
-                                                content_type: child.content_type.clone(),
-                                                snippet_md5: child.snippet_md5.clone(),
-                                            },
-                                        );
-                                    }
-                                    wildcards.matches_url_body(
+                                    let scoped_child_catchall =
+                                        if matches!(child.status, 401 | 403) {
+                                            let child_sig =
+                                                crate::wildcard::AuthCatchall::from_response(
+                                                    child.status,
+                                                    child.content_length,
+                                                    child.content_type.clone(),
+                                                    child.snippet_md5.clone(),
+                                                    &child.raw_body,
+                                                );
+                                            let matches_candidate =
+                                                nested_auth_child_confirms_catchall(
+                                                    nested_candidate,
+                                                    &candidate_sig,
+                                                    &child_sig,
+                                                );
+                                            scoped_auth.lock().await.insert(&dir_url, child_sig);
+                                            matches_candidate
+                                        } else {
+                                            false
+                                        };
+                                    scoped_child_catchall || wildcards.matches_url_body(
                                         &item.host_input,
                                         &canary,
                                         child.status,
@@ -4029,19 +4065,37 @@ mod tests {
         let mut cache = ScopedAuthCache::default();
         cache.insert(
             "https://x.test/protected/",
-            crate::wildcard::AuthCatchall {
-                status: 401,
-                content_length: 14,
-                content_type: "text/plain".into(),
-                snippet_md5: "auth-wall".into(),
-            },
+            crate::wildcard::AuthCatchall::from_response(
+                401,
+                14,
+                "text/plain".into(),
+                "auth-wall".into(),
+                "auth-wall",
+            ),
         );
 
+        assert!(!cache.matches(
+            "https://x.test/protected",
+            401,
+            14,
+            "text/plain",
+            "auth-wall",
+            "auth-wall",
+        ));
+        assert!(!cache.matches(
+            "https://x.test/protected/?view=root",
+            401,
+            14,
+            "text/plain",
+            "auth-wall",
+            "auth-wall",
+        ));
         assert!(cache.matches(
             "https://x.test/protected/admin",
             401,
             14,
             "text/plain",
+            "auth-wall",
             "auth-wall",
         ));
         assert!(!cache.matches(
@@ -4050,6 +4104,7 @@ mod tests {
             14,
             "text/plain",
             "auth-wall",
+            "auth-wall",
         ));
         assert!(!cache.matches(
             "https://x.test/protected/admin",
@@ -4057,7 +4112,69 @@ mod tests {
             14,
             "text/plain",
             "different-wall",
+            "different-wall",
         ));
+    }
+
+    #[test]
+    fn scoped_auth_catchall_matches_dynamic_json_metadata() {
+        let first = r#"{"requestId":982869,"statusCode":401,"error":"Unauthorized","message":"Login required","id":"bZxXF4bheexi9doXXwW8j3"}"#;
+        let second = r#"{"requestId":1218944,"statusCode":401,"error":"Unauthorized","message":"Login required","id":"ubsVa5V51ohTGn2qXzstDJ"}"#;
+        let distinct = r#"{"requestId":1218944,"statusCode":401,"error":"Unauthorized","message":"Account disabled","id":"ubsVa5V51ohTGn2qXzstDJ"}"#;
+        let mut cache = ScopedAuthCache::default();
+        cache.insert(
+            "https://x.test/users/",
+            crate::wildcard::AuthCatchall::from_response(
+                401,
+                first.len() as i64,
+                "application/json".into(),
+                crate::wildcard::md5_hex(first),
+                first,
+            ),
+        );
+
+        assert!(cache.matches(
+            "https://x.test/users/settings",
+            401,
+            second.len() as i64,
+            "application/json",
+            &crate::wildcard::md5_hex(second),
+            second,
+        ));
+        assert!(!cache.matches(
+            "https://x.test/users/settings",
+            401,
+            distinct.len() as i64,
+            "application/json",
+            &crate::wildcard::md5_hex(distinct),
+            distinct,
+        ));
+    }
+
+    #[test]
+    fn dynamic_auth_child_blocks_only_nested_candidate() {
+        let candidate_body = r#"{"requestId":982869,"statusCode":401,"message":"Login required","id":"bZxXF4bheexi9doXXwW8j3"}"#;
+        let child_body = r#"{"requestId":1218944,"statusCode":401,"message":"Login required","id":"ubsVa5V51ohTGn2qXzstDJ"}"#;
+        let candidate = crate::wildcard::AuthCatchall::from_response(
+            401,
+            candidate_body.len() as i64,
+            "application/json".into(),
+            crate::wildcard::md5_hex(candidate_body),
+            candidate_body,
+        );
+        let child = crate::wildcard::AuthCatchall::from_response(
+            401,
+            child_body.len() as i64,
+            "application/json".into(),
+            crate::wildcard::md5_hex(child_body),
+            child_body,
+        );
+
+        assert!(nested_auth_child_confirms_catchall(true, &candidate, &child));
+        assert!(
+            !nested_auth_child_confirms_catchall(false, &candidate, &child),
+            "the current protected scan root must still expand once",
+        );
     }
 
     // ── Progress accounting: the "never above 100%" invariant ────────────
@@ -4666,6 +4783,7 @@ mod tests {
             content_length: cl,
             content_type: "application/json".into(),
             snippet_md5: md5.into(),
+            body_shape_md5: String::new(),
         };
 
         for status in [401, 403] {
@@ -4750,6 +4868,35 @@ mod tests {
             ),
         ];
         assert_eq!(learn_auth_catchall(&too_few), None);
+    }
+
+    #[test]
+    fn auth_catchall_learns_dynamic_json_controls() {
+        let bodies = [
+            r#"{"requestId":982869,"statusCode":401,"message":"Login required","id":"bZxXF4bheexi9doXXwW8j3"}"#,
+            r#"{"requestId":1218944,"statusCode":401,"message":"Login required","id":"ubsVa5V51ohTGn2qXzstDJ"}"#,
+            r#"{"requestId":1026073,"statusCode":401,"message":"Login required","id":"isVXh6mVR9FTNDLAdpQpRV"}"#,
+        ];
+        let outcomes: Vec<_> = ["generic", "conf", "git-head"]
+            .into_iter()
+            .zip(bodies)
+            .map(|(family, body)| {
+                (
+                    family,
+                    Some(PreflightOutcome::Auth(
+                        crate::wildcard::AuthCatchall::from_response(
+                            401,
+                            body.len() as i64,
+                            "application/json".into(),
+                            crate::wildcard::md5_hex(body),
+                            body,
+                        ),
+                    )),
+                )
+            })
+            .collect();
+
+        assert!(learn_auth_catchall(&outcomes).is_some());
     }
 
     #[test]

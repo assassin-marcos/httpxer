@@ -155,6 +155,27 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 self._send(404, b"not found", "text/plain")
             return
 
+        if mode == "auth_dynamic":
+            if path == "/users/child":
+                self._send(200, b"REAL child behind dynamic auth prefix", "text/plain")
+            elif path == "/users" or path.startswith("/users/"):
+                with LOCK:
+                    request_id = len(REQUESTS[mode])
+                body = json.dumps(
+                    {
+                        "requestId": request_id,
+                        "statusCode": 401,
+                        "error": "Unauthorized",
+                        "message": "Login required",
+                        "id": f"request{request_id:020d}",
+                    },
+                    separators=(",", ":"),
+                ).encode()
+                self._send(401, body, "application/json; charset=utf-8")
+            else:
+                self._send(404, b"not found", "text/plain")
+            return
+
         if mode == "flow":
             if path == "/healthz":
                 self._send(200, b"REAL explicit health endpoint", "text/plain")

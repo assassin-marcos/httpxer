@@ -4,6 +4,16 @@ All notable changes to **httpxer** are recorded here. Format loosely follows [Ke
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-08-04
+
+### Fixed
+- Dynamic JSON `401`/`403` catchalls now normalize only recognized per-request metadata while preserving semantic messages, realms, and identifiers.
+- Scoped authentication fingerprints now suppress matching descendants without hiding or prematurely blocking the protected root directory.
+
+### Verified
+- Regression coverage keeps distinct authentication responses separate and preserves real endpoints behind dynamic protected prefixes.
+- Repeated optimized loopback scans terminated without recursive authentication-wall expansion while retaining the real child finding.
+
 ## [0.6.17] — 2026-08-04
 
 ### Added
