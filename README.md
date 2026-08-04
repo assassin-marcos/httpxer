@@ -22,7 +22,7 @@
 One tool, two jobs:
 
 - **Enrich mode** — reads a hostname list, probes each over HTTP(S), and emits DNS, CDN, Wappalyzer-style technology detection, and HTTP metadata. By default JSONL keeps one diagnostic record per input; `--live-only` removes DNS failures and hosts with no HTTP/HTTPS response. `--httpx-compat` provides the common httpx JSON field shape; exact byte-for-byte parity is not promised.
-- **Fuzz mode** — host × wordlist Cartesian probe with **recursive** dir bruteforce (incl. smart auto-recursion into protected `401` dirs and opt-in `403` recursion), **crawl** (HTML/robots/sitemap link extraction), **content-aware wildcard detection** (static catchall + per-request-nonce catchall + path-echo), a **native, content-confirmed `401`/`403` bypass engine**, and a live findings/progress stream showing the newest active request URL.
+- **Fuzz mode** — host × wordlist Cartesian probe with **recursive** dir bruteforce (incl. smart auto-recursion into protected `401` dirs and opt-in `403` recursion), **crawl** (HTML, JavaScript, JSON, source-map, robots, and sitemap endpoint extraction), **content-aware wildcard detection** (static catchall + per-request-nonce catchall + path-echo), a **native, content-confirmed `401`/`403` bypass engine**, and a live findings/progress stream showing the newest active request URL.
 
 Both modes share a 16-slot **BoringSSL** browser-emulation pool. Enrich mode samples the pool per probe; fuzz mode pins one profile per host so wildcard pre-flight and wordlist probes see the same UA-dependent response. Distinct hosts are still distributed across the pool.
 
@@ -169,7 +169,9 @@ Use `--recurse N`, `--crawl N`, or `--deep N` to turn the host × wordlist singl
 
 - **Recursion** — response-aware directory classification accepts exact trailing-slash redirects after two bounded random-sibling controls reject prefix-wide slash-normalization catchalls. Redirects with a distinct status and response fingerprint remain eligible. With `--recurse-on-200`, autoindex content, directory MIME, matching `Content-Location`, or an explicit trailing-slash route can also prove a directory. File-like paths, common `/.well-known/` leaf resources, attachments, and terminal/static MIME types remain reportable findings but never become full-wordlist recursion roots.
 - **Auth-dir recursion** — a `401` on a plausible directory path (e.g. `/api`, `/.well-known`, or `/v1.2`, not `/x.php`) is descended into so accessible children behind a protected parent are found (the classic `/api` = 401 → `/api/actuator` = 200). Random-sibling and random-child checks reject nested prefix auth walls before they multiply the wordlist. `403` recursion is off by default because WAF path rules produce noisy false directories; use `--recurse-on-403` when exhaustive 403 expansion is intentional. Omitting `401`/`403` from `--status` hides parents without disabling discovery. Bounded by `--max-dirs-per-host`.
-- **Crawl** — response bodies are parsed for HTML `<a/link/script/img/form/iframe>`, robots.txt `Disallow/Allow/Sitemap`, and sitemap.xml `<loc>`. Discovery happens before output status/size filters. A `3xx` stays attached to its requested path while its `Location` is queued as a separate crawl URL, so crawling cannot change wildcard identity.
+- **Crawl** — response bodies are parsed for HTML `<a/link/script/img/form/iframe>`, inline and external JavaScript route literals, JSON URL fields and OpenAPI path keys, source maps, robots.txt `Disallow/Allow/Sitemap`, and sitemap.xml `<loc>`. Every same-scope discovery is queued for the next crawl round, enabling HTML → JavaScript → JSON → endpoint chains. Query strings remain part of the request identity. Discovery happens before output status/size filters. A `3xx` stays attached to its requested path while its `Location` is queued separately, so crawling cannot change wildcard identity.
+
+JavaScript and JSON extraction is intentionally bounded by `--max-links-per-page`, crawl depth, same-host scope, deduplication, and the host time budget. Unresolved templates such as `/users/{id}` or runtime values loaded from a database are not guessed; supply known values through a wordlist when exhaustive parameter enumeration is required.
 
 Both share a visited set and a per-host **directory** budget (`--max-dirs-per-host`, default 200). Each discovered directory costs a full wordlist pass, so that cap plus depth bounds a recursive scan.
 
@@ -368,7 +370,6 @@ Full reference: `httpxer --help`. Advanced exact-size filters are intentionally 
 - **JS challenges** (Cloudflare Turnstile, Akamai sensor data) — needs a headless browser
 - **Behavioral detection** (timing, mouse events, per-IP rate scoring) — static-signature defeat ≠ behavioral defeat
 - **IP reputation** — proxy rotation distributes requests but cannot guarantee that an endpoint has good reputation
-- **JS endpoint extraction** — crawl parses HTML/robots/sitemap; endpoints embedded inside JavaScript bodies aren't parsed (planned)
 
 Browser emulation can reduce simple static-signature blocks, but it is not a bypass guarantee. Behavioral defenses still apply.
 

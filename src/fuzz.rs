@@ -155,7 +155,7 @@ struct FuzzRecord {
     #[serde(skip_serializing_if = "is_u8_zero", default)]
     depth: u8,
     /// Probe origin tag. Empty at depth 0. One of: "wordlist",
-    /// "recursion", "crawl-html", "crawl-robots", "crawl-sitemap".
+    /// "recursion", "crawl-html", "crawl-js", "crawl-json", etc.
     #[serde(skip_serializing_if = "String::is_empty", default)]
     source: String,
     /// Parent directory or response URL this probe was derived from.
@@ -233,8 +233,8 @@ struct ProbeItem {
     /// Round / recursion depth — 0 for the initial host × wordlist pass.
     depth: u8,
     /// Probe origin tag. Empty at depth 0. One of: "wordlist" (depth 0),
-    /// "recursion" (re-fuzz under discovered dir), "crawl-html",
-    /// "crawl-robots", "crawl-sitemap".
+    /// "recursion" (re-fuzz under discovered dir), "crawl-html", "crawl-js",
+    /// "crawl-inline-js", "crawl-json", "crawl-robots", or "crawl-sitemap".
     source: String,
     /// Parent URL this probe was derived from. Empty at depth 0.
     parent_url: String,
@@ -2236,7 +2236,7 @@ pub async fn run(
             let input = host_to_input(h);
             for path in words.iter() {
                 let url = format!("{}{}", input.trim_end_matches('/'), path);
-                v.insert(crate::recurse::canonical_url_key(&url));
+                v.insert(crate::recurse::canonical_crawl_url_key(&url));
             }
         }
     }
@@ -3771,7 +3771,7 @@ async fn run_probe(
                         && crate::crawl::in_scope(&target, &url, &cfg.scope_hosts)
                     {
                         let _ = disc_tx.send(Discovery::Link {
-                            canonical_url: crate::recurse::canonical_url_key(&target),
+                            canonical_url: crate::recurse::canonical_crawl_url_key(&target),
                             source: "crawl-redirect".to_string(),
                             depth: next_depth,
                             parent: url.clone(),
@@ -3779,23 +3779,16 @@ async fn run_probe(
                         });
                     }
                 }
-                let links = crate::crawl::extract_urls(
+                let links = crate::crawl::extract_links(
                     &parsed.raw_body,
                     &parsed.content_type,
                     crawl_base,
                     &crawl_cfg,
                 );
-                let source_tag = if crawl_base.ends_with("/robots.txt") {
-                    "crawl-robots"
-                } else if crawl_base.ends_with("/sitemap.xml") {
-                    "crawl-sitemap"
-                } else {
-                    "crawl-html"
-                };
                 for link in links {
                     let _ = disc_tx.send(Discovery::Link {
-                        canonical_url: crate::recurse::canonical_url_key(&link),
-                        source: source_tag.to_string(),
+                        canonical_url: crate::recurse::canonical_crawl_url_key(&link.url),
+                        source: link.source.to_string(),
                         depth: next_depth,
                         parent: crawl_base.clone(),
                         budget_key: item.budget_key.clone(),

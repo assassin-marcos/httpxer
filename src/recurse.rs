@@ -659,8 +659,8 @@ impl HostBudget {
 
 /// Canonical URL key for the visited-set. Lowercases scheme + host,
 /// includes port (when explicit or default-known), keeps raw path. Strips
-/// query + fragment (path-collision should dedupe). Used by both the
-/// recursion frontier and the crawl extractor.
+/// query + fragment (directory path collisions should dedupe). Used by the
+/// recursion frontier; crawl requests use `canonical_crawl_url_key` instead.
 pub fn canonical_url_key(url: &str) -> String {
     if let Ok(u) = url::Url::parse(url) {
         let scheme = u.scheme().to_ascii_lowercase();
@@ -673,6 +673,23 @@ pub fn canonical_url_key(url: &str) -> String {
         return format!("{}://{}{}{}", scheme, host, port, path);
     }
     url.to_string()
+}
+
+/// Canonical request URL for crawl work. Unlike directory recursion keys,
+/// query strings are part of endpoint identity and must survive into the
+/// actual probe; fragments remain client-side only and are removed.
+pub fn canonical_crawl_url_key(url: &str) -> String {
+    if let Ok(u) = url::Url::parse(url) {
+        let scheme = u.scheme().to_ascii_lowercase();
+        let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+        let port = u
+            .port_or_known_default()
+            .map(|p| format!(":{}", p))
+            .unwrap_or_default();
+        let query = u.query().map(|q| format!("?{}", q)).unwrap_or_default();
+        return format!("{}://{}{}{}{}", scheme, host, port, u.path(), query);
+    }
+    url.split('#').next().unwrap_or(url).to_string()
 }
 
 #[cfg(test)]
@@ -1296,6 +1313,14 @@ mod tests {
         assert_eq!(
             canonical_url_key("HTTPS://Example.COM/Admin?x=1#frag"),
             "https://example.com:443/Admin"
+        );
+    }
+
+    #[test]
+    fn canonical_crawl_url_preserves_query_and_drops_fragment() {
+        assert_eq!(
+            canonical_crawl_url_key("HTTPS://Example.COM/Admin?g=force-directed#graph"),
+            "https://example.com:443/Admin?g=force-directed"
         );
     }
 }

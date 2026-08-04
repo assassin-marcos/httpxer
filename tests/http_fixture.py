@@ -172,6 +172,55 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 self._send(404, b"not found", "text/plain")
             return
 
+        if mode == "crawl_chain":
+            if path == "/seed":
+                self._send(
+                    200,
+                    b'''<html><body>
+                    <script>fetch("/inline/start?from=html")</script>
+                    <script src="/assets/app.js"></script>
+                    </body></html>''',
+                )
+            elif path == "/assets/app.js":
+                self._send(
+                    200,
+                    b'''fetch("/api/bootstrap?client=web");
+                    const example = "/graph/rubygems/a_marmita/latest?g=force-directed";
+                    //# sourceMappingURL=app.js.map''',
+                    "application/javascript",
+                )
+            elif path == "/assets/app.js.map":
+                self._send(
+                    200,
+                    json.dumps(
+                        {
+                            "version": 3,
+                            "sourcesContent": ["fetch('/api/from-map?source=map')"],
+                        }
+                    ).encode(),
+                    "application/json",
+                )
+            elif path == "/api/bootstrap":
+                self._send(
+                    200,
+                    json.dumps({"next": "/api/final?from=json"}).encode(),
+                    "application/json",
+                )
+            elif path in {
+                "/inline/start",
+                "/graph/rubygems/a_marmita/latest",
+                "/api/from-map",
+                "/api/final",
+            }:
+                self._send(
+                    200,
+                    b"REAL recursively crawled endpoint " + self.path.encode(),
+                    "text/plain",
+                )
+            else:
+                self._send(404, b"not found", "text/plain")
+            return
+
         if mode == "backup":
             if path in {"/127.0.0.1.zip", "/backup.zip", "/app/backup.zip"}:
                 self._send(200, ZIP_BODY, "application/zip")
@@ -213,7 +262,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--modes",
-        default="mixed,echo,status,auth,auth_selective,flow,backup,cross_a,cross_b,redirect,capture",
+        default="mixed,echo,status,auth,auth_selective,flow,crawl_chain,backup,cross_a,cross_b,redirect,capture",
     )
     args = parser.parse_args()
 

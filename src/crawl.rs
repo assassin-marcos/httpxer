@@ -1,28 +1,38 @@
 //! Response-body link extraction for `--crawl` mode.
 //!
-//! Three extractors:
+//! Five extractors:
 //!   - **HTML** — regex-based (not a full DOM, but covers every
 //!     dirsearch-equivalent tag: `<a href>`, `<link href>`, `<script src>`,
 //!     `<form action>`, `<iframe src>`, `<img src>`, `<source src>`,
 //!     `<embed src>`, `<object data>`, plus `<meta http-equiv=refresh>`)
+//!   - **JavaScript** — quoted same-origin route literals, inline scripts,
+//!     framework request calls, and source-map references
+//!   - **JSON** — URL/path values, OpenAPI-style path keys, manifests, and
+//!     JavaScript embedded in source-map `sourcesContent`
 //!   - **robots.txt** — Disallow / Allow / Sitemap directives
 //!   - **sitemap.xml** — `<loc>` URL extraction
 //!
 //! Filtering pipeline (in order):
 //!   1. Absolutise relative URLs against the response URL
 //!   2. Same-host scope check (built-in deny list + user `--scope`)
-//!   3. Static-asset extension drop (.css/.js/.png/...)
+//!   3. Low-value static-asset drop (.css/images/fonts/media; JS is retained)
 //!   4. Self-referencing URL drop (extracted URL == source URL)
 //!   5. Dedup
 //!   6. Cap at `max_links_per_page`
 //!
-//! JS endpoint extraction (regex against quoted path-like strings) is
-//! deferred to v0.3.8 — high-FP without careful tuning.
-
 use once_cell::sync::OnceCell;
 use regex::Regex;
-use std::collections::HashSet;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use url::Url;
+
+const MAX_CANDIDATE_LEN: usize = 2048;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedLink {
+    pub url: String,
+    pub source: &'static str,
+}
 
 /// Built-in third-party CDN / analytics deny list. Never crawled even when
 /// `--scope *` is set. Catches the common case of `<script src>` pointing
@@ -139,43 +149,325 @@ impl Default for CrawlCfg {
 ///   - Not the source URL itself (no self-references)
 ///   - Deduplicated
 ///   - Capped at `cfg.max_links_per_page`
-pub fn extract_urls(
+pub fn extract_links(
     body: &str,
     content_type: &str,
     base_url: &str,
     cfg: &CrawlCfg,
-) -> Vec<String> {
-    let mut out: HashSet<String> = HashSet::new();
+) -> Vec<ExtractedLink> {
+    let mut out: HashMap<String, &'static str> = HashMap::new();
     let ct = content_type.to_ascii_lowercase();
+    let javascript = is_javascript_response(&ct, base_url);
+    let json = is_json_response(&ct, base_url);
+    let html_or_xml =
+        ct.contains("html") || ct.contains("xml") || (ct.is_empty() && !javascript && !json);
 
     // HTML + XML
-    if ct.contains("html") || ct.contains("xml") || ct.is_empty() {
-        out.extend(extract_html_urls(body, base_url));
+    if html_or_xml {
+        insert_urls(&mut out, extract_html_urls(body, base_url), "crawl-html");
+        for (script, script_is_json) in extract_inline_script_bodies(body) {
+            let urls = if script_is_json {
+                extract_json_urls(script, base_url)
+            } else {
+                extract_javascript_urls(script, base_url)
+            };
+            insert_urls(&mut out, urls, "crawl-inline-js");
+        }
+    }
+
+    if javascript {
+        insert_urls(
+            &mut out,
+            extract_javascript_urls(body, base_url),
+            "crawl-js",
+        );
+    }
+
+    if json {
+        insert_urls(&mut out, extract_json_urls(body, base_url), "crawl-json");
     }
 
     // robots.txt — content-type-agnostic, gated on the URL suffix
     if cfg.crawl_robots && base_url.ends_with("/robots.txt") {
-        out.extend(extract_robots_urls(body, base_url));
+        insert_urls(
+            &mut out,
+            extract_robots_urls(body, base_url),
+            "crawl-robots",
+        );
     }
 
     // sitemap.xml — XML responses or sitemap.xml suffix
     if cfg.crawl_sitemap && (base_url.ends_with("/sitemap.xml") || ct.contains("xml")) {
-        out.extend(extract_sitemap_urls(body, base_url));
+        insert_urls(
+            &mut out,
+            extract_sitemap_urls(body, base_url),
+            "crawl-sitemap",
+        );
     }
 
     // Filter pipeline
-    let mut filtered: Vec<String> = out
+    let mut filtered: Vec<ExtractedLink> = out
         .into_iter()
-        .filter(|u| u != base_url && u.trim_end_matches('/') != base_url.trim_end_matches('/'))
-        .filter(|u| in_scope(u, base_url, &cfg.scope_hosts))
-        .filter(|u| !is_static_asset(u))
+        .filter(|(url, _)| {
+            url != base_url && url.trim_end_matches('/') != base_url.trim_end_matches('/')
+        })
+        .filter(|(url, _)| in_scope(url, base_url, &cfg.scope_hosts))
+        .filter(|(url, _)| !is_static_asset(url))
+        .map(|(url, source)| ExtractedLink { url, source })
         .collect();
 
     // Sort then truncate (deterministic — same input always produces same
     // output, useful for tests + diff-friendly output)
-    filtered.sort();
+    filtered.sort_by(|a, b| a.url.cmp(&b.url));
     filtered.truncate(cfg.max_links_per_page);
     filtered
+}
+
+#[cfg(test)]
+pub fn extract_urls(body: &str, content_type: &str, base_url: &str, cfg: &CrawlCfg) -> Vec<String> {
+    extract_links(body, content_type, base_url, cfg)
+        .into_iter()
+        .map(|link| link.url)
+        .collect()
+}
+
+fn insert_urls(
+    out: &mut HashMap<String, &'static str>,
+    urls: impl IntoIterator<Item = String>,
+    source: &'static str,
+) {
+    for url in urls {
+        out.entry(url).or_insert(source);
+    }
+}
+
+fn response_path_has_extension(base_url: &str, extensions: &[&str]) -> bool {
+    let Ok(parsed) = Url::parse(base_url) else {
+        return false;
+    };
+    let path = parsed.path().to_ascii_lowercase();
+    extensions.iter().any(|ext| path.ends_with(ext))
+}
+
+fn is_javascript_response(content_type: &str, base_url: &str) -> bool {
+    content_type.contains("javascript")
+        || content_type.contains("ecmascript")
+        || response_path_has_extension(base_url, &[".js", ".mjs", ".cjs"])
+}
+
+fn is_json_response(content_type: &str, base_url: &str) -> bool {
+    content_type.contains("application/json")
+        || content_type.contains("text/json")
+        || content_type.contains("+json")
+        || response_path_has_extension(base_url, &[".json", ".map"])
+}
+
+fn extract_inline_script_bodies(body: &str) -> Vec<(&str, bool)> {
+    static RE: OnceCell<Regex> = OnceCell::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?is)<script\b([^>]*)>(.*?)</script\s*>").unwrap());
+    re.captures_iter(body)
+        .filter_map(|capture| {
+            let attrs = capture.get(1)?.as_str().to_ascii_lowercase();
+            let script = capture.get(2)?.as_str();
+            if script.trim().is_empty() {
+                return None;
+            }
+            let is_json = attrs.contains("application/json")
+                || attrs.contains("application/ld+json")
+                || attrs.contains("importmap");
+            Some((script, is_json))
+        })
+        .collect()
+}
+
+fn unescape_script_string(raw: &str) -> String {
+    raw.replace("\\/", "/")
+        .replace("\\u002f", "/")
+        .replace("\\u002F", "/")
+        .replace("\\x2f", "/")
+        .replace("\\x2F", "/")
+        .replace("\\u003a", ":")
+        .replace("\\u003A", ":")
+        .replace("\\u003f", "?")
+        .replace("\\u003F", "?")
+        .replace("\\u0026", "&")
+        .replace("\\u003d", "=")
+        .replace("\\u003D", "=")
+        .replace("&amp;", "&")
+}
+
+fn looks_like_bare_relative_path(value: &str) -> bool {
+    let first = value.split('/').next().unwrap_or("").to_ascii_lowercase();
+    value.contains('/')
+        && matches!(
+            first.as_str(),
+            "api"
+                | "rest"
+                | "graphql"
+                | "rpc"
+                | "services"
+                | "service"
+                | "oauth"
+                | "auth"
+                | "admin"
+                | "internal"
+                | "v1"
+                | "v2"
+                | "v3"
+        )
+}
+
+fn resolve_endpoint_candidate(
+    raw: &str,
+    base_url: &str,
+    allow_bare_relative: bool,
+) -> Option<String> {
+    let value = unescape_script_string(raw.trim());
+    if value.is_empty()
+        || value.len() > MAX_CANDIDATE_LEN
+        || value.chars().any(char::is_whitespace)
+        || value.contains(['<', '>', '"', '\'', '`'])
+        || value.contains("${")
+        || value.contains("{{")
+        || value.contains(['{', '}', '[', ']', '*'])
+        || value.contains("/:")
+        || value.starts_with('#')
+        || value.starts_with("data:")
+        || value.starts_with("javascript:")
+        || value.starts_with("mailto:")
+        || value.starts_with("tel:")
+    {
+        return None;
+    }
+
+    let candidate = if let Some(rest) = value.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else if let Some(rest) = value.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("//")
+        || value.starts_with('/')
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || (allow_bare_relative && looks_like_bare_relative_path(&value))
+    {
+        value
+    } else {
+        return None;
+    };
+
+    let base = Url::parse(base_url).ok()?;
+    let mut resolved = base.join(&candidate).ok()?;
+    if !matches!(resolved.scheme(), "http" | "https") {
+        return None;
+    }
+    resolved.set_fragment(None);
+    Some(resolved.to_string())
+}
+
+fn extract_javascript_urls(body: &str, base_url: &str) -> Vec<String> {
+    static STRINGS: OnceCell<Vec<Regex>> = OnceCell::new();
+    static SOURCE_MAP: OnceCell<Regex> = OnceCell::new();
+    let strings = STRINGS.get_or_init(|| {
+        [
+            r#"\"((?:\\.|[^\"\\]){1,2048})\""#,
+            r#"'((?:\\.|[^'\\]){1,2048})'"#,
+            r#"`((?:\\.|[^`\\]){1,2048})`"#,
+        ]
+        .iter()
+        .map(|pattern| Regex::new(pattern).unwrap())
+        .collect()
+    });
+    let source_map = SOURCE_MAP
+        .get_or_init(|| Regex::new(r"(?im)(?:sourceMappingURL\s*=\s*)([^\s*]+)").unwrap());
+
+    let mut out = HashSet::new();
+    for regex in strings {
+        for capture in regex.captures_iter(body) {
+            if let Some(candidate) = capture
+                .get(1)
+                .and_then(|value| resolve_endpoint_candidate(value.as_str(), base_url, false))
+            {
+                out.insert(candidate);
+            }
+        }
+    }
+    for capture in source_map.captures_iter(body) {
+        let Some(value) = capture.get(1).map(|value| value.as_str().trim()) else {
+            continue;
+        };
+        if value.starts_with("data:") {
+            continue;
+        }
+        let source_map_url = if value.starts_with("http://")
+            || value.starts_with("https://")
+            || value.starts_with("//")
+            || value.starts_with('/')
+            || value.starts_with("./")
+            || value.starts_with("../")
+        {
+            value.to_string()
+        } else {
+            format!("./{value}")
+        };
+        if let Some(candidate) = resolve_endpoint_candidate(&source_map_url, base_url, false) {
+            out.insert(candidate);
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn json_key_allows_relative_path(key: Option<&str>) -> bool {
+    let Some(key) = key else {
+        return false;
+    };
+    let key = key.to_ascii_lowercase();
+    [
+        "url", "uri", "path", "endpoint", "route", "href", "src", "action", "location",
+        "redirect", "next", "previous", "download", "upload", "api",
+    ]
+    .iter()
+    .any(|needle| key == *needle || key.ends_with(&format!("_{needle}")))
+}
+
+fn collect_json_urls(value: &Value, key: Option<&str>, base_url: &str, out: &mut HashSet<String>) {
+    match value {
+        Value::String(raw) => {
+            if key.is_some_and(|name| name.eq_ignore_ascii_case("sourcesContent")) {
+                out.extend(extract_javascript_urls(raw, base_url));
+            } else if let Some(candidate) =
+                resolve_endpoint_candidate(raw, base_url, json_key_allows_relative_path(key))
+            {
+                out.insert(candidate);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_json_urls(value, key, base_url, out);
+            }
+        }
+        Value::Object(values) => {
+            for (child_key, child_value) in values {
+                if let Some(candidate) =
+                    resolve_endpoint_candidate(child_key, base_url, key == Some("paths"))
+                {
+                    out.insert(candidate);
+                }
+                collect_json_urls(child_value, Some(child_key), base_url, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_json_urls(body: &str, base_url: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    let mut out = HashSet::new();
+    collect_json_urls(&value, None, base_url, &mut out);
+    out.into_iter().collect()
 }
 
 /// Extract HTML URLs via regex against well-known link-bearing tags. Each
@@ -547,5 +839,99 @@ Disallow: /api/v2  # inline comment too
         assert!(!urls.iter().any(|u| u.contains("evil.com")));
         // Self-reference blocked
         assert!(!urls.iter().any(|u| u == "https://target.com/"));
+    }
+
+    #[test]
+    fn javascript_extracts_routes_queries_escapes_and_source_map() {
+        let body = r##"
+            fetch("/api/bootstrap?client=web");
+            const route = "\/graph\/rubygems\/a_marmita\/latest?g=force-directed";
+            const socket = "wss://target.com/events";
+            const external = "https://evil.com/api/users";
+            const unresolved = `/api/users/${id}`;
+            const noise = "foo/bar";
+            //# sourceMappingURL=app.js.map
+        "##;
+        let links = extract_links(
+            body,
+            "application/javascript",
+            "https://target.com/assets/app.js",
+            &cfg(vec![]),
+        );
+        let urls: HashSet<_> = links.iter().map(|link| link.url.as_str()).collect();
+
+        assert!(urls.contains("https://target.com/api/bootstrap?client=web"));
+        assert!(
+            urls.contains("https://target.com/graph/rubygems/a_marmita/latest?g=force-directed")
+        );
+        assert!(urls.contains("https://target.com/events"));
+        assert!(urls.contains("https://target.com/assets/app.js.map"));
+        assert!(!urls.iter().any(|url| url.contains("evil.com")));
+        assert!(!urls.iter().any(|url| url.contains("${id}")));
+        assert!(!urls.iter().any(|url| url.ends_with("foo/bar")));
+        assert!(links.iter().all(|link| link.source == "crawl-js"));
+    }
+
+    #[test]
+    fn html_extracts_inline_javascript_and_json_scripts() {
+        let body = r#"
+            <script>fetch('/inline/start?from=html')</script>
+            <script type="application/json">{"next":"/inline/from-json"}</script>
+        "#;
+        let links = extract_links(body, "text/html", "https://target.com/start", &cfg(vec![]));
+        assert!(links.iter().any(|link| {
+            link.url == "https://target.com/inline/start?from=html"
+                && link.source == "crawl-inline-js"
+        }));
+        assert!(links.iter().any(|link| {
+            link.url == "https://target.com/inline/from-json" && link.source == "crawl-inline-js"
+        }));
+    }
+
+    #[test]
+    fn json_extracts_links_openapi_paths_and_source_content() {
+        let body = r#"{
+            "next": "/api/final?from=json",
+            "endpoint": "api/v2/users",
+            "paths": {
+                "/openapi/status": {"get": {}},
+                "/openapi/users/{id}": {"get": {}}
+            },
+            "sourcesContent": ["fetch('/api/from-map?source=map')"],
+            "description": "ordinary/value"
+        }"#;
+        let links = extract_links(
+            body,
+            "application/json",
+            "https://target.com/assets/app.js.map",
+            &cfg(vec![]),
+        );
+        let urls: HashSet<_> = links.iter().map(|link| link.url.as_str()).collect();
+
+        assert!(urls.contains("https://target.com/api/final?from=json"));
+        assert!(urls.contains("https://target.com/assets/api/v2/users"));
+        assert!(urls.contains("https://target.com/openapi/status"));
+        assert!(!urls.iter().any(|url| url.contains("openapi/users")));
+        assert!(urls.contains("https://target.com/api/from-map?source=map"));
+        assert!(!urls.iter().any(|url| url.ends_with("ordinary/value")));
+        assert!(links.iter().all(|link| link.source == "crawl-json"));
+    }
+
+    #[test]
+    fn combined_extractors_share_deterministic_page_cap() {
+        let body = r#"
+            <a href="/z-last">last</a>
+            <script>fetch('/a-first'); fetch('/m-middle')</script>
+        "#;
+        let mut c = cfg(vec![]);
+        c.max_links_per_page = 2;
+        let urls = extract_urls(body, "text/html", "https://target.com/", &c);
+        assert_eq!(
+            urls,
+            vec![
+                "https://target.com/a-first".to_string(),
+                "https://target.com/m-middle".to_string(),
+            ]
+        );
     }
 }

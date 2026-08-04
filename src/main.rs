@@ -422,7 +422,7 @@ struct Args {
     response_headers: bool,
 
     // ── Crawl (v0.3.7) ─────────────────────────────────────────────────
-    /// Discover paths from HTML, robots.txt, and sitemaps
+    /// Discover paths recursively from HTML, JavaScript, JSON, robots, and sitemaps
     #[arg(
         long = "crawl",
         value_name = "DEPTH",

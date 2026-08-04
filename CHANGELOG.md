@@ -4,6 +4,16 @@ All notable changes to **httpxer** are recorded here. Format loosely follows [Ke
 
 ## [Unreleased]
 
+### Added
+- Crawl mode now recursively extracts bounded same-scope endpoints from inline and external JavaScript, JSON responses, OpenAPI path keys, manifests, and source maps.
+
+### Fixed
+- Crawl-frontier URLs now preserve query strings while continuing to discard browser-only fragments.
+
+### Verified
+- Regression coverage exercises escaped routes, source maps, inline scripts, JSON links, scope filtering, unresolved-template rejection, and deterministic caps.
+- A loopback chain traversed HTML to JavaScript to JSON and source-map endpoints with crawl provenance and query strings intact.
+
 ## [0.6.16] — 2026-08-04
 
 ### Fixed
