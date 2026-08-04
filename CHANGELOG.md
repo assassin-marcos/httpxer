@@ -4,6 +4,8 @@ All notable changes to **httpxer** are recorded here. Format loosely follows [Ke
 
 ## [Unreleased]
 
+## [0.6.17] — 2026-08-04
+
 ### Added
 - Crawl mode now recursively extracts bounded same-scope endpoints from inline and external JavaScript, JSON responses, OpenAPI path keys, manifests, and source maps.
 

@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey.svg)]()
 
-**Current release:** [v0.6.16](https://github.com/assassin-marcos/httpxer/releases/tag/v0.6.16)
+**Current release:** [v0.6.17](https://github.com/assassin-marcos/httpxer/releases/tag/v0.6.17)
 
 ```
  _     _   _
