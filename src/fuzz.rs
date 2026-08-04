@@ -1099,6 +1099,8 @@ type PreflightSampleGroups = std::collections::HashMap<
     (String, u16, String),
     Vec<crate::wildcard::ProbeSample>,
 >;
+type PreflightRedirectGroups =
+    std::collections::HashMap<(String, u16), Vec<RedirectObservation>>;
 
 fn detect_preflight_groups(
     groups: PreflightSampleGroups,
@@ -1170,6 +1172,257 @@ impl SlashRedirectFingerprint {
     }
 }
 
+fn is_redirect_status(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RedirectObservation {
+    status: u16,
+    request_url: String,
+    target_url: String,
+}
+
+impl RedirectObservation {
+    fn from_response(request_url: &str, parsed: &ParsedResp) -> Option<Self> {
+        if !is_redirect_status(parsed.status) || parsed.location.is_empty() {
+            return None;
+        }
+        let mut request = url::Url::parse(request_url).ok()?;
+        request.set_fragment(None);
+        let resolved = crate::probe::resolve_redirect_url(request_url, &parsed.location);
+        let mut target = url::Url::parse(&resolved).ok()?;
+        target.set_fragment(None);
+        Some(Self {
+            status: parsed.status,
+            request_url: request.to_string(),
+            target_url: target.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RedirectPrefixRewrite {
+    source_origin: String,
+    source_prefix: String,
+    target_origin: String,
+    target_prefix: String,
+    target_query: Option<String>,
+}
+
+impl RedirectPrefixRewrite {
+    fn matches(&self, observation: &RedirectObservation) -> bool {
+        let Ok(request) = url::Url::parse(&observation.request_url) else {
+            return false;
+        };
+        let Ok(target) = url::Url::parse(&observation.target_url) else {
+            return false;
+        };
+        if origin_key(request.as_str()) != self.source_origin
+            || origin_key(target.as_str()) != self.target_origin
+            || target.query() != self.target_query.as_deref()
+        {
+            return false;
+        }
+        let Some(suffix) = path_suffix_after_prefix(request.path(), &self.source_prefix) else {
+            return false;
+        };
+        target.path() == join_path_prefix(&self.target_prefix, suffix)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RedirectTargetPattern {
+    Constant {
+        source_scope: String,
+        target: String,
+    },
+    PrefixRewrite(RedirectPrefixRewrite),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RedirectCatchall {
+    status: u16,
+    target: RedirectTargetPattern,
+}
+
+impl RedirectCatchall {
+    fn matches(&self, observation: &RedirectObservation) -> bool {
+        if observation.status != self.status {
+            return false;
+        }
+        match &self.target {
+            RedirectTargetPattern::Constant {
+                source_scope,
+                target,
+            } => {
+                url_is_within_scope(&observation.request_url, source_scope)
+                    && observation.target_url == *target
+            }
+            RedirectTargetPattern::PrefixRewrite(rewrite) => rewrite.matches(observation),
+        }
+    }
+
+    fn scope_label(&self) -> String {
+        match &self.target {
+            RedirectTargetPattern::Constant {
+                source_scope,
+                target,
+            } => format!("constant scope={source_scope} target={target}"),
+            RedirectTargetPattern::PrefixRewrite(rewrite) => format!(
+                "rewrite {}{} -> {}{}",
+                rewrite.source_origin,
+                rewrite.source_prefix,
+                rewrite.target_origin,
+                rewrite.target_prefix,
+            ),
+        }
+    }
+}
+
+fn path_segments(path: &str) -> Vec<&str> {
+    path.trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn path_prefix(segments: &[&str]) -> String {
+    if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    }
+}
+
+fn path_suffix_after_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    if prefix == "/" {
+        return Some(path);
+    }
+    let suffix = path.strip_prefix(prefix)?;
+    (suffix.is_empty() || suffix.starts_with('/')).then_some(suffix)
+}
+
+fn url_is_within_scope(candidate: &str, scope: &str) -> bool {
+    let Ok(candidate) = url::Url::parse(candidate) else {
+        return false;
+    };
+    let Ok(scope) = url::Url::parse(scope) else {
+        return false;
+    };
+    origin_key(candidate.as_str()) == origin_key(scope.as_str())
+        && path_suffix_after_prefix(candidate.path(), scope.path()).is_some()
+}
+
+fn join_path_prefix(prefix: &str, suffix: &str) -> String {
+    if suffix.is_empty() {
+        prefix.to_string()
+    } else if prefix == "/" {
+        suffix.to_string()
+    } else {
+        format!("{prefix}{suffix}")
+    }
+}
+
+fn derive_prefix_rewrite(observation: &RedirectObservation) -> Option<RedirectPrefixRewrite> {
+    let request = url::Url::parse(&observation.request_url).ok()?;
+    let target = url::Url::parse(&observation.target_url).ok()?;
+    let request_segments = path_segments(request.path());
+    let target_segments = path_segments(target.path());
+    let request_leaf = request_segments.last()?;
+    if target_segments.last()? != request_leaf {
+        return None;
+    }
+
+    let request_parent = &request_segments[..request_segments.len() - 1];
+    let target_parent = &target_segments[..target_segments.len() - 1];
+    let source_prefix = path_prefix(request_parent);
+    let target_prefix = path_prefix(target_parent);
+    let source_origin = origin_key(request.as_str());
+    let target_origin = origin_key(target.as_str());
+
+    // An identity redirect provides no stable rewrite evidence. Exact
+    // request -> request/ normalization is handled by the stricter slash
+    // detector before this classifier runs.
+    if source_origin == target_origin && source_prefix == target_prefix {
+        return None;
+    }
+    Some(RedirectPrefixRewrite {
+        source_origin,
+        source_prefix,
+        target_origin,
+        target_prefix,
+        target_query: target.query().map(str::to_string),
+    })
+}
+
+fn learn_redirect_catchall(observations: &[RedirectObservation]) -> Option<RedirectCatchall> {
+    if observations.len() < 2 {
+        return None;
+    }
+    let first = observations.first()?;
+    if observations
+        .iter()
+        .any(|observation| observation.status != first.status)
+    {
+        return None;
+    }
+    let distinct_requests = observations
+        .iter()
+        .map(|observation| observation.request_url.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if distinct_requests.len() < 2 {
+        return None;
+    }
+
+    if observations
+        .iter()
+        .all(|observation| observation.target_url == first.target_url)
+    {
+        let source_scope = parent_prefix(&first.request_url);
+        if !observations
+            .iter()
+            .all(|observation| parent_prefix(&observation.request_url) == source_scope)
+        {
+            return None;
+        }
+        return Some(RedirectCatchall {
+            status: first.status,
+            target: RedirectTargetPattern::Constant {
+                source_scope,
+                target: first.target_url.clone(),
+            },
+        });
+    }
+
+    let distinct_leaves = observations
+        .iter()
+        .filter_map(|observation| url::Url::parse(&observation.request_url).ok())
+        .filter_map(|request| {
+            request
+                .path()
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .map(str::to_string)
+        })
+        .collect::<std::collections::HashSet<_>>();
+    if distinct_leaves.len() < 2 {
+        return None;
+    }
+    let rewrite = derive_prefix_rewrite(first)?;
+    observations
+        .iter()
+        .all(|observation| {
+            derive_prefix_rewrite(observation).as_ref() == Some(&rewrite)
+                && rewrite.matches(observation)
+        })
+        .then_some(RedirectCatchall {
+            status: first.status,
+            target: RedirectTargetPattern::PrefixRewrite(rewrite),
+        })
+}
+
 enum PreflightOutcome {
     /// Usable for wildcard content fingerprinting.
     Sample(crate::wildcard::ProbeSample),
@@ -1182,6 +1435,10 @@ enum PreflightOutcome {
     /// random siblings under one parent prove a path-normalization catchall,
     /// not two real directories.
     SlashRedirect(SlashRedirectFingerprint),
+    /// A non-slash 3xx response. Its resolved Location is retained even when
+    /// the response body is empty so independent random controls can prove a
+    /// constant-target or stable prefix-rewrite catchall.
+    Redirect(RedirectObservation),
 }
 
 /// Learn a blanket auth response only when every planned random control
@@ -1256,6 +1513,9 @@ async fn wildcard_preflight_probe(
         return Some(PreflightOutcome::SlashRedirect(
             SlashRedirectFingerprint::from_response(&parsed),
         ));
+    }
+    if let Some(observation) = RedirectObservation::from_response(&url, &parsed) {
+        return Some(PreflightOutcome::Redirect(observation));
     }
     // Match donor: only 200-399 with body counts.
     if !matches!(parsed.status, 200..=399) {
@@ -2018,6 +2278,7 @@ pub async fn run(
     //    Disagreement on BOTH layers = path-sensitive server → no
     //    suppression, stderr warning.
     let mut wildcard_map = WildcardMap::new();
+    let mut preflight_redirects = Vec::new();
     if !matches!(wildcard_policy, WildcardPolicy::Off) {
         let n_samples = cfg.wildcard_samples.max(2) as usize;
         // Varying hex lengths give the Layer 2 slope detector different
@@ -2071,6 +2332,7 @@ pub async fn run(
             };
             let learned_auth = learn_auth_catchall(&outcomes);
             let mut sample_groups = PreflightSampleGroups::new();
+            let mut redirect_groups = PreflightRedirectGroups::new();
             let mut usable = 0usize;
             for (family, outcome) in outcomes {
                 let Some(outcome) = outcome else { continue };
@@ -2082,6 +2344,16 @@ pub async fn run(
                     }
                     PreflightOutcome::Auth(_) => {}
                     PreflightOutcome::SlashRedirect(_) => {}
+                    PreflightOutcome::Redirect(observation) => {
+                        // Only generic random paths may establish a host-wide
+                        // redirect rule. Two `.conf` controls redirecting to
+                        // login do not prove that an unrelated real `/admin`
+                        // redirect is noise.
+                        if family == "generic" {
+                            let key = (family.to_string(), observation.status);
+                            redirect_groups.entry(key).or_default().push(observation);
+                        }
+                    }
                 }
             }
 
@@ -2102,7 +2374,7 @@ pub async fn run(
             }
 
             let (eligible_groups, detected_groups) = detect_preflight_groups(sample_groups, 10);
-            let detected = detected_groups.len();
+            let mut detected = detected_groups.len();
             for (family, sample_count, sig) in detected_groups {
                 let layer = if sig.k.is_some() {
                     "L2"
@@ -2123,6 +2395,26 @@ pub async fn run(
                 );
                 wildcard_map.insert(input.clone(), sig);
             }
+            for ((family, _), observations) in redirect_groups {
+                let sample_count = observations.len();
+                let Some(signature) = learn_redirect_catchall(&observations) else {
+                    continue;
+                };
+                if preflight_redirects.contains(&signature) {
+                    continue;
+                }
+                detected += 1;
+                eprintln!(
+                    "  [redirect-wildcard] {} family={} status={} {} ({}/{} samples)",
+                    host,
+                    family,
+                    signature.status,
+                    signature.scope_label(),
+                    sample_count,
+                    total_preflight,
+                );
+                preflight_redirects.push(signature);
+            }
             if detected == 0 && eligible_groups > 0 && usable == total_preflight {
                 eprintln!(
                     "  [wildcard] {} → no stable response family detected; emitting findings",
@@ -2130,14 +2422,18 @@ pub async fn run(
                 );
             }
         }
-        if wildcard_map.is_empty() {
+        if wildcard_map.is_empty() && preflight_redirects.is_empty() {
             eprintln!("[+] wildcard pre-flight: no fingerprints recorded");
         }
     }
     let wildcards = Arc::new(wildcard_map);
     // v0.4.6 — per-directory catchall cache, learned live during the run (both
     // detectors write here). Budget scales with host count.
-    let catchall = Arc::new(Mutex::new(CatchallCache::new(hosts.len())));
+    let mut catchall_cache = CatchallCache::new(hosts.len());
+    for redirect in preflight_redirects {
+        catchall_cache.seed_redirect(redirect);
+    }
+    let catchall = Arc::new(Mutex::new(catchall_cache));
     let scoped_auth = Arc::new(Mutex::new(ScopedAuthCache::default()));
 
     // ── Concurrency ────────────────────────────────────────────────────
@@ -2796,6 +3092,16 @@ struct CatchallCache {
     /// Redirect sibling-probe count per origin, bounded independently from the
     /// 2xx content-catchall detector.
     slash_redirect_parents_used: std::collections::HashMap<String, usize>,
+    /// Confirmed constant-target and prefix-rewrite redirect catchalls. Prefix
+    /// models carry their own origin/scope and may safely cover multiple
+    /// sibling parents under one rewrite rule (for example /Umbraco -> /cms).
+    redirect_learned: Vec<RedirectCatchall>,
+    /// Non-slash redirect parents sampled to completion.
+    redirect_probed: std::collections::HashSet<String>,
+    /// Non-slash redirect sibling checks currently in flight.
+    redirect_inflight: std::collections::HashSet<String>,
+    /// Non-slash redirect sibling-probe count per origin.
+    redirect_parents_used: std::collections::HashMap<String, usize>,
 }
 
 /// Auth response learned from a random child of a confirmed protected
@@ -2994,9 +3300,141 @@ async fn slash_redirect_catchall_suppresses(
     }
 }
 
+/// Detect bodyless and body-bearing redirect catchalls without matching on
+/// status or content length alone. Two random siblings must establish either
+/// one constant resolved Location or one stable source-prefix -> target-prefix
+/// rewrite. A candidate is suppressed only when that learned model predicts
+/// its own resolved Location exactly.
+async fn redirect_catchall_suppresses(
+    scan_scope: &str,
+    full_url: &str,
+    parsed: &ParsedResp,
+    cfg: &FuzzCfg,
+    cache: &Arc<Mutex<CatchallCache>>,
+) -> bool {
+    let Some(candidate) = RedirectObservation::from_response(full_url, parsed) else {
+        return false;
+    };
+    let control_scope = redirect_control_scope(scan_scope, full_url);
+    let origin = origin_key(full_url);
+
+    enum Role {
+        Probe,
+        Wait,
+        Skip,
+    }
+
+    let role = {
+        let mut cache = cache.lock().await;
+        if cache
+            .redirect_learned
+            .iter()
+            .any(|redirect| redirect.matches(&candidate))
+        {
+            return true;
+        }
+        if cache.redirect_inflight.contains(&control_scope) {
+            Role::Wait
+        } else if !cache.redirect_probed.contains(&control_scope)
+            && cache
+                .redirect_parents_used
+                .get(&origin)
+                .copied()
+                .unwrap_or(0)
+                < MAX_CATCHALL_PARENTS_PER_HOST
+        {
+            cache.redirect_probed.insert(control_scope.clone());
+            cache.redirect_inflight.insert(control_scope.clone());
+            *cache
+                .redirect_parents_used
+                .entry(origin.clone())
+                .or_default() += 1;
+            Role::Probe
+        } else {
+            Role::Skip
+        }
+    };
+
+    match role {
+        Role::Probe => {
+            let sibling_paths = [random_hex_path(16), random_hex_path(32)];
+            let futures = sibling_paths.iter().map(|path| {
+                wildcard_preflight_probe(
+                    &control_scope,
+                    &cfg.request_limiter,
+                    cfg.body_preview_bytes,
+                    &cfg.extra_headers,
+                    cfg.initial_cookie_header.as_deref(),
+                    path,
+                )
+            });
+            let outcomes = futures::future::join_all(futures).await;
+            let observations = outcomes
+                .iter()
+                .map(|outcome| match outcome {
+                    Some(PreflightOutcome::Redirect(observation)) => Some(observation.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            let learned = observations
+                .as_deref()
+                .and_then(learn_redirect_catchall);
+            {
+                let mut cache = cache.lock().await;
+                cache.redirect_inflight.remove(&control_scope);
+                if let Some(redirect) = &learned {
+                    cache.seed_redirect(redirect.clone());
+                } else if outcomes.iter().any(Option::is_none) {
+                    // A failed control is inconclusive. Permit one later
+                    // candidate to retry the bounded sibling confirmation.
+                    cache.redirect_probed.remove(&control_scope);
+                }
+            }
+            if let Some(redirect) = &learned {
+                eprintln!(
+                    "  [redirect-catchall] {} status={} {}; matching redirects suppressed",
+                    control_scope,
+                    redirect.status,
+                    redirect.scope_label(),
+                );
+            }
+            learned
+                .as_ref()
+                .is_some_and(|redirect| redirect.matches(&candidate))
+        }
+        Role::Wait => {
+            let max_polls = (cfg.timeout_ms / 10).max(50) as usize + 50;
+            for _ in 0..max_polls {
+                {
+                    let cache = cache.lock().await;
+                    if cache
+                        .redirect_learned
+                        .iter()
+                        .any(|redirect| redirect.matches(&candidate))
+                    {
+                        return true;
+                    }
+                    if !cache.redirect_inflight.contains(&control_scope) {
+                        return false;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        }
+        Role::Skip => false,
+    }
+}
+
 impl CatchallCache {
     fn new(_host_count: usize) -> Self {
         Self::default()
+    }
+
+    fn seed_redirect(&mut self, redirect: RedirectCatchall) {
+        if !self.redirect_learned.contains(&redirect) {
+            self.redirect_learned.push(redirect);
+        }
     }
 
     /// Detector A (frequency, zero traffic). Record one 2xx response's
@@ -3114,6 +3552,28 @@ fn parent_prefix(url: &str) -> String {
     }
 }
 
+/// Choose a conservative scope for redirect controls. Recursive rounds sample
+/// directly under their expansion root. At the host root, nested candidates
+/// sample under their first path segment so a confirmed `/Umbraco/*` rewrite
+/// covers that subtree. A one-segment candidate samples root siblings instead;
+/// probing its children could hide a real `/admin -> /login` directory.
+fn redirect_control_scope(scan_scope: &str, candidate_url: &str) -> String {
+    let origin = origin_key(candidate_url);
+    let scan_scope = scan_scope.trim_end_matches('/');
+    if !scan_scope.is_empty() && scan_scope != origin {
+        return scan_scope.to_string();
+    }
+    let Ok(candidate) = url::Url::parse(candidate_url) else {
+        return origin;
+    };
+    let segments = path_segments(candidate.path());
+    if segments.len() < 2 {
+        origin
+    } else {
+        format!("{}{}", origin, path_prefix(&segments[..1]))
+    }
+}
+
 /// Return the immediate parent scope to use for a random-sibling auth probe.
 /// The root of the current fuzz expansion is intentionally not sampled: a
 /// protected root (`/api = 401`) must still expand once so an accessible child
@@ -3178,6 +3638,10 @@ async fn catchall_suppresses(
     .is_some()
     {
         return slash_redirect_catchall_suppresses(&full_url, parsed, cfg, cache).await;
+    }
+
+    if is_redirect_status(parsed.status) && !parsed.location.is_empty() {
+        return redirect_catchall_suppresses(&item.host_input, &full_url, parsed, cfg, cache).await;
     }
 
     // Content-shell detection remains limited to 2xx.
@@ -3284,7 +3748,9 @@ async fn catchall_suppresses(
                     .flatten()
                     .filter_map(|o| match o {
                         PreflightOutcome::Sample(s) => Some(s),
-                        PreflightOutcome::Auth(_) | PreflightOutcome::SlashRedirect(_) => None,
+                        PreflightOutcome::Auth(_)
+                        | PreflightOutcome::SlashRedirect(_)
+                        | PreflightOutcome::Redirect(_) => None,
                     })
                     .collect();
             // Require ≥2 agreeing samples so a single random 200 (a real page)
@@ -4774,6 +5240,164 @@ mod tests {
 
         let incomplete = vec![Some(PreflightOutcome::SlashRedirect(matching)), None];
         assert_eq!(learn_slash_redirect_catchall(&incomplete), None);
+    }
+
+    fn redirect_observation(status: u16, request: &str, target: &str) -> RedirectObservation {
+        RedirectObservation {
+            status,
+            request_url: request.into(),
+            target_url: target.into(),
+        }
+    }
+
+    #[test]
+    fn redirect_catchall_learns_constant_target_but_keeps_unique_redirects() {
+        let controls = vec![
+            redirect_observation(
+                302,
+                "https://x.test/Config/random-a",
+                "https://x.test/login",
+            ),
+            redirect_observation(
+                302,
+                "https://x.test/Config/random-b",
+                "https://x.test/login",
+            ),
+        ];
+        let learned = learn_redirect_catchall(&controls).expect("constant redirect catchall");
+
+        assert!(learned.matches(&redirect_observation(
+            302,
+            "https://x.test/Config/admin",
+            "https://x.test/login",
+        )));
+        assert!(!learned.matches(&redirect_observation(
+            302,
+            "https://x.test/admin",
+            "https://x.test/login",
+        )));
+        assert!(!learned.matches(&redirect_observation(
+            302,
+            "https://other.test/Config/admin",
+            "https://x.test/login",
+        )));
+        assert!(!learned.matches(&redirect_observation(
+            302,
+            "https://x.test/oauth/callback",
+            "https://sso.test/start",
+        )));
+        assert!(!learned.matches(&redirect_observation(
+            301,
+            "https://x.test/admin",
+            "https://x.test/login",
+        )));
+    }
+
+    #[test]
+    fn redirect_catchall_learns_and_generalizes_stable_prefix_rewrite() {
+        let controls = vec![
+            redirect_observation(
+                301,
+                "https://x.test/Umbraco/random-a",
+                "https://x.test/cms/random-a",
+            ),
+            redirect_observation(
+                301,
+                "https://x.test/Umbraco/random-b",
+                "https://x.test/cms/random-b",
+            ),
+        ];
+        let learned = learn_redirect_catchall(&controls).expect("prefix redirect catchall");
+
+        assert!(learned.matches(&redirect_observation(
+            301,
+            "https://x.test/Umbraco/Views/editor.html",
+            "https://x.test/cms/Views/editor.html",
+        )));
+        assert!(!learned.matches(&redirect_observation(
+            301,
+            "https://x.test/Umbraco/real-admin",
+            "https://x.test/account/sign-in",
+        )));
+        assert!(!learned.matches(&redirect_observation(
+            301,
+            "https://x.test/api/real-admin",
+            "https://x.test/cms/real-admin",
+        )));
+
+        let narrow = learn_redirect_catchall(&[
+            redirect_observation(
+                301,
+                "https://x.test/a/b/random-a",
+                "https://x.test/c/b/random-a",
+            ),
+            redirect_observation(
+                301,
+                "https://x.test/a/b/random-b",
+                "https://x.test/c/b/random-b",
+            ),
+        ])
+        .expect("narrow prefix redirect catchall");
+        assert!(!narrow.matches(&redirect_observation(
+            301,
+            "https://x.test/a/other/real",
+            "https://x.test/c/other/real",
+        )));
+    }
+
+    #[test]
+    fn redirect_catchall_rejects_path_sensitive_login_and_incomplete_evidence() {
+        let return_path_redirects = vec![
+            redirect_observation(
+                302,
+                "https://x.test/random-a",
+                "https://x.test/login?return=/random-a",
+            ),
+            redirect_observation(
+                302,
+                "https://x.test/random-b",
+                "https://x.test/login?return=/random-b",
+            ),
+        ];
+        assert_eq!(learn_redirect_catchall(&return_path_redirects), None);
+        assert_eq!(learn_redirect_catchall(&return_path_redirects[..1]), None);
+
+        let mixed_status = vec![
+            redirect_observation(301, "https://x.test/random-a", "https://x.test/login"),
+            redirect_observation(302, "https://x.test/random-b", "https://x.test/login"),
+        ];
+        assert_eq!(learn_redirect_catchall(&mixed_status), None);
+    }
+
+    #[test]
+    fn redirect_catchall_does_not_learn_from_duplicate_request_controls() {
+        let duplicate = vec![
+            redirect_observation(302, "https://x.test/random", "https://x.test/login"),
+            redirect_observation(302, "https://x.test/random", "https://x.test/login"),
+        ];
+        assert_eq!(learn_redirect_catchall(&duplicate), None);
+    }
+
+    #[test]
+    fn redirect_control_scope_uses_expansion_root_or_first_path_prefix() {
+        assert_eq!(
+            redirect_control_scope(
+                "https://x.test",
+                "https://x.test/Umbraco/Views/editor.html",
+            ),
+            "https://x.test/Umbraco",
+        );
+        assert_eq!(
+            redirect_control_scope("https://x.test", "https://x.test/admin"),
+            "https://x.test",
+        );
+        assert_eq!(
+            redirect_control_scope(
+                "https://x.test/Config/Lang/",
+                "https://x.test/Config/Lang/Umbraco/Views/editor.html",
+            ),
+            "https://x.test/Config/Lang",
+        );
     }
 
     #[test]

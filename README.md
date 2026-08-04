@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey.svg)]()
 
-**Current release:** [v0.7.0](https://github.com/assassin-marcos/httpxer/releases/tag/v0.7.0)
+**Current release:** [v0.7.1](https://github.com/assassin-marcos/httpxer/releases/tag/v0.7.1)
 
 ```
  _     _   _
@@ -22,7 +22,7 @@
 One tool, two jobs:
 
 - **Enrich mode** — reads a hostname list, probes each over HTTP(S), and emits DNS, CDN, Wappalyzer-style technology detection, and HTTP metadata. By default JSONL keeps one diagnostic record per input; `--live-only` removes DNS failures and hosts with no HTTP/HTTPS response. `--httpx-compat` provides the common httpx JSON field shape; exact byte-for-byte parity is not promised.
-- **Fuzz mode** — host × wordlist Cartesian probe with **recursive** dir bruteforce (incl. smart auto-recursion into protected `401` dirs and opt-in `403` recursion), **crawl** (HTML, JavaScript, JSON, source-map, robots, and sitemap endpoint extraction), **content-aware wildcard detection** (static catchall + dynamic JSON auth wall + per-request-nonce catchall + path-echo), a **native, content-confirmed `401`/`403` bypass engine**, and a live findings/progress stream showing the newest active request URL.
+- **Fuzz mode** — host × wordlist Cartesian probe with **recursive** dir bruteforce (incl. smart auto-recursion into protected `401` dirs and opt-in `403` recursion), **crawl** (HTML, JavaScript, JSON, source-map, robots, and sitemap endpoint extraction), **content-aware wildcard detection** (static catchall + dynamic JSON auth wall + per-request-nonce catchall + path-echo + Location-aware redirects), a **native, content-confirmed `401`/`403` bypass engine**, and a live findings/progress stream showing the newest active request URL.
 
 Both modes share a 16-slot **BoringSSL** browser-emulation pool. Enrich mode samples the pool per probe; fuzz mode pins one profile per host so wildcard pre-flight and wordlist probes see the same UA-dependent response. Distinct hosts are still distributed across the pool.
 
@@ -93,6 +93,9 @@ httpxer -u https://example.com/ -w admin.txt,api.txt,sensitive.txt -o out.txt
 # Exact codes, status classes, and inline exclusions
 httpxer -u https://example.com/ -w wordlist.txt --status '2xx,3xx,!429,!503'
 
+# Keep useful redirects while strict mode removes confirmed redirect catchalls
+httpxer -u https://example.com/ -w wordlist.txt --status '2xx,301,302' --wildcard strict
+
 # Recursion, crawl, or both at depth 3
 httpxer -u https://example.com/ -w wordlist.txt --recurse 3 -o recurse.txt
 httpxer -u https://example.com/ -w wordlist.txt --crawl 3 -o crawl.txt
@@ -154,6 +157,7 @@ Most directory bruteforcers drown in false positives on CDN-fronted / SPA / soft
 - **Layer 1b — content-aware catchall**: when no path-echo model fits, the catchall body may still vary per request (for example, a request ID, timestamp, or Nginx status counter). UUIDs, long hex/digit runs and timestamps are normalized before hashing; the dynamic Nginx status body is canonicalized only when its complete native grammar matches. Bounded drift uses normalized-content and token-similarity guards; wide length drift additionally requires the normalized first 2 KiB to agree exactly. Matching is content-aware, never size-only.
 - **Bodyless catchall**: the host answers **`2xx` with zero bytes** for *every* path. There is no body to fingerprint, so every layer above is blind to it by construction. `200` + no body across **3 distinct paths** is itself the signature — httpxer learns it per `(host, status, content_type)` and suppresses from then on. A *lone* legitimate empty `200` (a `/ping`-style endpoint) stays below the threshold and is still emitted.
 - **Auth wildcard**: a blanket `401`/`403` is learned only when every generic and extension-shaped random control completes with the same status, content type, body hash, and bounded content length. Mixed responses or failed controls are inconclusive. `strict` suppresses matches before recursion, crawl, or bypass traffic; a distinguishable protected endpoint remains eligible for normal output, recursion, and bypass checks.
+- **Redirect wildcard**: `301`/`302`/`303`/`307`/`308` catchalls are learned from the resolved `Location`, including zero-byte responses. Two random controls must prove either one constant destination or one exact source-prefix to target-prefix rewrite with the same status. Fingerprints remain bound to the confirmed origin and path scope; mixed statuses, failed controls, extension-only behavior, dynamic return-path redirects, distinct destinations, and exact `path -> path/` directory redirects remain unsuppressed.
 
 This closes the case where a constant-size catchall with a per-request token used to emit *every* wordlist hit as a fake `200`. The host fingerprint also applies under **recursed directories** (so catchall noise doesn't reappear one level down).
 
@@ -163,11 +167,13 @@ This closes the case where a constant-size catchall with a per-request token use
 | `--wildcard mark` | Emit them tagged `is_wildcard:true` for later review |
 | `--wildcard off` | Skip wildcard pre-flight and suppression |
 
+`strict` removes responses that are indistinguishable from confirmed random controls. Use `mark` when every candidate must remain in JSONL for manual review; matching records are emitted with `is_wildcard:true` instead of being dropped.
+
 ## Recursion + crawl
 
 Use `--recurse N`, `--crawl N`, or `--deep N` to turn the host × wordlist single pass into a multi-round orchestrator:
 
-- **Recursion** — response-aware directory classification accepts exact trailing-slash redirects after two bounded random-sibling controls reject prefix-wide slash-normalization catchalls. Redirects with a distinct status and response fingerprint remain eligible. With `--recurse-on-200`, autoindex content, directory MIME, matching `Content-Location`, or an explicit trailing-slash route can also prove a directory. File-like paths, common `/.well-known/` leaf resources, attachments, and terminal/static MIME types remain reportable findings but never become full-wordlist recursion roots.
+- **Recursion** — response-aware directory classification accepts exact trailing-slash redirects after two bounded random-sibling controls reject prefix-wide slash-normalization catchalls. Redirects whose resolved `Location` differs from a confirmed constant-target or prefix-rewrite rule remain eligible. With `--recurse-on-200`, autoindex content, directory MIME, matching `Content-Location`, or an explicit trailing-slash route can also prove a directory. File-like paths, common `/.well-known/` leaf resources, attachments, and terminal/static MIME types remain reportable findings but never become full-wordlist recursion roots.
 - **Auth-dir recursion** — a `401` on a plausible directory path (e.g. `/api`, `/.well-known`, or `/v1.2`, not `/x.php`) is descended into so accessible children behind a protected parent are found (the classic `/api` = 401 → `/api/actuator` = 200). Random-sibling and random-child checks reject nested prefix auth walls before they multiply the wordlist. `403` recursion is off by default because WAF path rules produce noisy false directories; use `--recurse-on-403` when exhaustive 403 expansion is intentional. Omitting `401`/`403` from `--status` hides parents without disabling discovery. Bounded by `--max-dirs-per-host`.
 - **Crawl** — response bodies are parsed for HTML `<a/link/script/img/form/iframe>`, inline and external JavaScript route literals, JSON URL fields and OpenAPI path keys, source maps, robots.txt `Disallow/Allow/Sitemap`, and sitemap.xml `<loc>`. Every same-scope discovery is queued for the next crawl round, enabling HTML → JavaScript → JSON → endpoint chains. Query strings remain part of the request identity. Discovery happens before output status/size filters. A `3xx` stays attached to its requested path while its `Location` is queued separately, so crawling cannot change wildcard identity.
 

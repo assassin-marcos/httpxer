@@ -4,6 +4,18 @@ All notable changes to **httpxer** are recorded here. Format loosely follows [Ke
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-08-04
+
+### Fixed
+- Bodyless and body-bearing redirect catchalls now use resolved `Location` evidence instead of falling through content-only wildcard detection.
+- Constant redirect targets and stable path-prefix rewrites require two agreeing random controls with the same status before strict suppression.
+- Redirect fingerprints remain bound to their confirmed origin and path scope; mixed, failed, extension-only, and dynamic return-path controls stay visible.
+- Unique redirects and exact trailing-slash directory redirects remain reportable and eligible for normal crawl or recursion discovery.
+
+### Verified
+- Regression coverage preserves unrelated login redirects, cross-origin findings, path-sensitive redirects, and narrowly scoped prefix behavior.
+- Controlled host-wide and prefix-scoped scans suppressed redirect floods while retaining a unique redirect, a real directory, and its recursively discovered child.
+
 ## [0.7.0] — 2026-08-04
 
 ### Fixed

@@ -272,6 +272,28 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 self._send(200, b"redirect source", "text/plain")
             return
 
+        if mode == "redirect_wildcard":
+            if path == "/real-dir":
+                self._send(301, b"", headers={"Location": "/real-dir/"})
+            elif path == "/real-dir/child":
+                self._send(200, b"REAL child behind redirect directory", "text/plain")
+            elif path == "/real-dir/":
+                self._send(200, b"REAL directory", "text/plain")
+            elif path == "/unique":
+                self._send(302, b"", headers={"Location": "/special"})
+            elif path == "/special":
+                self._send(200, b"REAL unique redirect target", "text/plain")
+            elif path.startswith("/constant/"):
+                self._send(302, b"", headers={"Location": "/login"})
+            elif path.startswith("/rewrite/"):
+                suffix = path.removeprefix("/rewrite/")
+                self._send(301, b"", headers={"Location": f"/cms/{suffix}"})
+            elif path == "/login":
+                self._send(200, b"login", "text/plain")
+            else:
+                self._send(404, b"not found", "text/plain")
+            return
+
         if mode == "capture":
             self._send(200, b"captured", "text/plain")
             return
@@ -283,7 +305,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--modes",
-        default="mixed,echo,status,auth,auth_selective,flow,crawl_chain,backup,cross_a,cross_b,redirect,capture",
+        default="mixed,echo,status,auth,auth_selective,flow,crawl_chain,backup,cross_a,cross_b,redirect,redirect_wildcard,capture",
     )
     args = parser.parse_args()
 
